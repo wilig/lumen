@@ -21,7 +21,12 @@ pub struct Token {
 /// appear in a Lumen source file.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
-    // --- Keywords (17) -----------------------------------------------------
+    // --- Keywords (15 true keywords) ---------------------------------------
+    // The 17 reserved words in the spec include `io` and `pure`, but those
+    // are treated as *contextual* keywords by the parser — they still lex
+    // as plain identifiers so they can be used as module names (`std/io`)
+    // and stdlib identifiers (`io.println(...)`). The parser recognizes them
+    // positionally after a fn return type.
     Fn,
     Let,
     Var,
@@ -34,8 +39,6 @@ pub enum TokenKind {
     In,
     Return,
     As,
-    Io,
-    Pure,
     True,
     False,
     Unit,
@@ -331,8 +334,6 @@ impl<'a> Lexer<'a> {
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
             "as" => TokenKind::As,
-            "io" => TokenKind::Io,
-            "pure" => TokenKind::Pure,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "unit" => TokenKind::Unit,
@@ -580,8 +581,10 @@ mod tests {
     }
 
     #[test]
-    fn all_seventeen_keywords() {
-        let src = "fn let var type import if else match for in return as io pure true false unit";
+    fn all_true_keywords() {
+        // `io` and `pure` are contextual — they lex as idents. The 15 true
+        // keywords below have dedicated token kinds.
+        let src = "fn let var type import if else match for in return as true false unit";
         assert_eq!(
             kinds(src),
             vec![
@@ -597,11 +600,21 @@ mod tests {
                 TokenKind::In,
                 TokenKind::Return,
                 TokenKind::As,
-                TokenKind::Io,
-                TokenKind::Pure,
                 TokenKind::True,
                 TokenKind::False,
                 TokenKind::Unit,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn io_and_pure_lex_as_identifiers() {
+        assert_eq!(
+            kinds("io pure"),
+            vec![
+                TokenKind::Ident("io".into()),
+                TokenKind::Ident("pure".into()),
                 TokenKind::Eof,
             ]
         );
@@ -900,8 +913,9 @@ fn main(): Result<unit, unit> io {
 
         assert!(only_kinds.contains(&&TokenKind::Import));
         assert!(only_kinds.contains(&&TokenKind::Fn));
-        assert!(only_kinds.contains(&&TokenKind::Io));
         assert!(only_kinds.contains(&&TokenKind::Unit));
+        // `io` should appear as an Ident, not a keyword.
+        assert!(only_kinds.iter().any(|k| matches!(k, TokenKind::Ident(s) if s == "io")));
         assert!(only_kinds.iter().any(|k| matches!(
             k,
             TokenKind::StringLit(s) if s == "hello, world"

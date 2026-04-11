@@ -165,8 +165,12 @@ digit           = "0" | ... | "9" ;
 (* of the enclosing block. The parser recovers via block braces.            *)
 
 (* ========================================================================= *)
-(* Reserved keywords (17)                                                     *)
+(* Reserved keywords (17; `io` and `pure` are contextual)                    *)
 (* ========================================================================= *)
 
 (* fn let var type import if else match for in return as io pure              *)
 (* true false unit                                                             *)
+(* Note: `io` and `pure` lex as plain identifiers. They are only recognized  *)
+(* as effect annotations when they appear between a `fn` return type and the *)
+(* opening brace of the function body. This keeps `std/io` and `io.println`  *)
+(* usable as a module name and qualified identifier, respectively.           *)

@@ -56,7 +56,7 @@ Lumen exists because the primary author of code is now an AI agent, not a human.
 
 `fn`, `let`, `var`, `type`, `import`, `if`, `else`, `match`, `for`, `in`, `return`, `as`, `io`, `pure`, `true`, `false`, `unit`
 
-Constructors (`Ok`, `Err`, `Some`, `None`) are stdlib identifiers, not keywords. `Result`, `Option` are built-in type names, not keywords. That's **17 keywords**.
+Constructors (`Ok`, `Err`, `Some`, `None`) are stdlib identifiers, not keywords. `Result`, `Option` are built-in type names, not keywords. That's **17 reserved words** — although `io` and `pure` are actually *contextual* keywords: they lex as plain identifiers and are only recognized as effect annotations when they appear between a `fn` return type and the opening brace of its body. That concession exists because `io` is also the name of the stdlib module (`import std/io`, `io.println(...)`). Fifteen of the seventeen have dedicated token kinds; two are contextual.
 
 `let` declares an immutable binding. `var` declares a mutable one that can be re-assigned with `name = expr`. Shadowing is forbidden either way. The `var` form exists because [fluency validation](fluency-validation.md) found that accumulation loops — the most common numeric pattern LLMs reach for — are unwritable without it.
 
