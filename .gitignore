@@ -1,0 +1,8 @@
+target/
+Cargo.lock
+*.wasm
+*.cwasm
+.DS_Store
+
+# Keep beads DB under version control? Yes — tracks issue state across sessions.
+# !.beads/

@@ -1,0 +1,152 @@
+(* Lumen v0.1 — Formal Grammar (EBNF)                                       *)
+(* Notation: { X } = zero or more X, [ X ] = optional X, | = alternation,    *)
+(*           "..." = literal terminal, UPPER_CASE = token class.             *)
+
+(* ========================================================================= *)
+(* Top level                                                                  *)
+(* ========================================================================= *)
+
+module          = { import } , { item } ;
+
+import          = "import" , module_path ;
+module_path     = IDENT , { "/" , IDENT } ;
+
+item            = fn_decl | type_decl ;
+
+(* ========================================================================= *)
+(* Function declarations                                                      *)
+(* ========================================================================= *)
+
+fn_decl         = "fn" , IDENT , "(" , [ param_list ] , ")" ,
+                  ":" , type , [ effect ] , block ;
+
+param_list      = param , { "," , param } ;
+param           = IDENT , ":" , type ;
+
+effect          = "io" | "pure" ;    (* default: pure if omitted *)
+
+(* ========================================================================= *)
+(* Type declarations                                                          *)
+(* ========================================================================= *)
+
+type_decl       = "type" , IDENT , "=" , ( struct_body | sum_body ) ;
+
+struct_body     = "{" , [ field_list ] , "}" ;
+field_list      = field , { "," , field } , [ "," ] ;
+field           = IDENT , ":" , type ;
+
+sum_body        = variant , { "|" , variant } ;
+variant         = IDENT , [ "(" , [ field_list ] , ")" ] ;
+
+(* ========================================================================= *)
+(* Types                                                                      *)
+(* ========================================================================= *)
+
+type            = named_type | builtin_type ;
+
+named_type      = IDENT , [ type_args ] ;
+type_args       = "<" , type , { "," , type } , ">" ;
+
+builtin_type    = "i32" | "i64" | "u32" | "u64" | "f64"
+                | "bool" | "string" | "unit" ;
+
+(* Note: "Option", "Result", and "List" are named_type IDENTs resolved by    *)
+(* the compiler as built-ins. They are not reserved words.                    *)
+
+(* ========================================================================= *)
+(* Statements and blocks                                                      *)
+(* ========================================================================= *)
+
+block           = "{" , { stmt } , [ tail_expr ] , "}" ;
+
+stmt            = let_stmt | expr_stmt | for_stmt | return_stmt ;
+
+let_stmt        = "let" , IDENT , [ ":" , type ] , "=" , expr ;
+expr_stmt       = expr ;
+for_stmt        = "for" , IDENT , "in" , expr , block ;
+return_stmt     = "return" , [ expr ] ;
+
+tail_expr       = expr ;   (* final expression is the block's value *)
+
+(* ========================================================================= *)
+(* Expressions (precedence from low to high)                                  *)
+(* ========================================================================= *)
+
+expr            = if_expr | match_expr | or_expr ;
+
+if_expr         = "if" , expr , block , "else" , block ;
+
+match_expr      = "match" , expr , "{" , match_arm , { "," , match_arm } ,
+                  [ "," ] , "}" ;
+match_arm       = pattern , "=>" , expr ;
+
+or_expr         = and_expr , { "||" , and_expr } ;
+and_expr        = eq_expr , { "&&" , eq_expr } ;
+eq_expr         = rel_expr , { ( "==" | "!=" ) , rel_expr } ;
+rel_expr        = add_expr , { ( "<" | "<=" | ">" | ">=" ) , add_expr } ;
+add_expr        = mul_expr , { ( "+" | "-" ) , mul_expr } ;
+mul_expr        = cast_expr , { ( "*" | "/" | "%" ) , cast_expr } ;
+cast_expr       = unary_expr , [ "as" , builtin_type ] ;
+unary_expr      = ( "-" | "!" ) , unary_expr | postfix_expr ;
+
+postfix_expr    = primary , { postfix } ;
+postfix         = "." , IDENT                      (* field access *)
+                | "." , IDENT , call_args           (* method call  *)
+                | call_args                         (* fn call      *)
+                | "?" ;                             (* try propagation *)
+
+call_args       = "(" , [ arg_list ] , ")" ;
+arg_list        = arg , { "," , arg } ;
+arg             = [ IDENT , ":" ] , expr ;          (* optional named args *)
+
+primary         = literal
+                | IDENT
+                | "(" , expr , ")"
+                | block
+                | struct_lit ;
+
+struct_lit      = IDENT , "{" , [ field_init_list ] , "}" ;
+field_init_list = field_init , { "," , field_init } , [ "," ] ;
+field_init      = IDENT , ":" , expr ;
+
+(* ========================================================================= *)
+(* Patterns                                                                   *)
+(* ========================================================================= *)
+
+pattern         = wildcard_pat | literal_pat | binding_pat | variant_pat ;
+wildcard_pat    = "_" ;
+literal_pat     = literal ;
+binding_pat     = IDENT ;                           (* binds the value *)
+variant_pat     = IDENT , [ "(" , [ pat_field_list ] , ")" ] ;
+pat_field_list  = pat_field , { "," , pat_field } ;
+pat_field       = IDENT , ":" , pattern ;           (* named subpattern *)
+
+(* ========================================================================= *)
+(* Literals                                                                   *)
+(* ========================================================================= *)
+
+literal         = INT_LIT | FLOAT_LIT | STRING_LIT | BOOL_LIT | "unit" ;
+BOOL_LIT        = "true" | "false" ;
+
+(* Integer literals may carry a type suffix: 42i32, 7u64, etc. Default i32. *)
+(* Float literals always contain a "." or "e". Default f64.                  *)
+(* String literals are double-quoted UTF-8 with C-style escapes.             *)
+
+(* ========================================================================= *)
+(* Lexical                                                                    *)
+(* ========================================================================= *)
+
+IDENT           = ( letter | "_" ) , { letter | digit | "_" } ;
+letter          = "a" | ... | "z" | "A" | ... | "Z" ;
+digit           = "0" | ... | "9" ;
+
+(* Comments: `//` to end of line. No block comments in v1. *)
+(* Whitespace is insignificant except as a token separator.  *)
+(* Semicolons are NOT used. Statements are separated by newlines or EOF    *)
+(* of the enclosing block. The parser recovers via block braces.            *)
+
+(* ========================================================================= *)
+(* Reserved keywords (16)                                                     *)
+(* ========================================================================= *)
+
+(* fn let type import if else match for in return as io pure true false unit *)
