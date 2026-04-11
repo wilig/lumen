@@ -14,14 +14,24 @@
 //! the two payloads in with `memory.copy`. The built-in `string_len(s)`
 //! function reads the length word at `offset=0`.
 //!
+//! ## Struct representation
+//!
+//! A struct value is a single `i32` pointer into linear memory. Each
+//! struct type gets a deterministic layout: fields are laid out in
+//! declaration order, with `i64`/`u64`/`f64` aligned to 8 bytes and
+//! everything else aligned to 4 bytes. The layout is computed once per
+//! module during the pre-pass and reused by struct literals (for
+//! `store`s) and field access (for `load`s). Struct literals allocate
+//! via the same bump pointer as strings.
+//!
 //! ## Scope
 //!
 //! This module currently covers numerics, bool, unit, control flow, user
-//! function calls (phase 1, `lumen-awl`), plus strings + string concat +
-//! string_len (phase 2a, `lumen-tne`). Still deferred: structs
-//! (`lumen-ci2`), sum types + match (`lumen-mmx`), Option/Result + `?`
-//! (`lumen-rvp`), for-loops (`lumen-w0g`), error frames (`lumen-x4a`),
-//! WASI IO (`lumen-nwf`).
+//! function calls (phase 1, `lumen-awl`), strings + concat + `string_len`
+//! (phase 2a, `lumen-tne`), and structs + field access + struct literals
+//! (phase 2b, `lumen-ci2`). Still deferred: sum types + match
+//! (`lumen-mmx`), Option/Result + `?` (`lumen-rvp`), for-loops
+//! (`lumen-w0g`), error frames (`lumen-x4a`), WASI IO (`lumen-nwf`).
 
 use std::collections::HashMap;
 
@@ -34,7 +44,7 @@ use wasm_encoder::{
 use crate::ast::{self, BinOp, Expr, ExprKind, FnDecl, Item, StmtKind, UnaryOp};
 use crate::lexer::IntSuffix;
 use crate::span::Span;
-use crate::types::{ModuleInfo, Ty};
+use crate::types::{ModuleInfo, Ty, TypeInfo};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -104,9 +114,30 @@ struct Codegen<'a> {
     /// string literal observed in the module. Built during pre-pass so the
     /// data section is known before bodies emit.
     string_offsets: HashMap<String, u32>,
+    /// Deterministic per-type layout for every user struct. Computed once
+    /// during the pre-pass and read by struct literal codegen (for stores)
+    /// and field access (for loads).
+    struct_layouts: HashMap<String, StructLayout>,
     /// First free byte after all the literal data segments — the initial
     /// value of the bump-pointer global.
     heap_ptr: u32,
+}
+
+#[derive(Clone, Debug)]
+struct StructLayout {
+    fields: Vec<StructFieldLayout>,
+    total_size: u32,
+}
+
+#[derive(Clone, Debug)]
+struct StructFieldLayout {
+    name: String,
+    ty: Ty,
+    offset: u32,
+    /// Wasm `MemArg.align` is log2 of the natural byte alignment. We store
+    /// the alignment here in that already-encoded form.
+    align_log2: u32,
+    wasm_ty: ValType,
 }
 
 impl<'a> Codegen<'a> {
@@ -122,11 +153,21 @@ impl<'a> Codegen<'a> {
             exports: ExportSection::new(),
             code: CodeSection::new(),
             string_offsets: HashMap::new(),
+            struct_layouts: HashMap::new(),
             heap_ptr: HEAP_START,
         }
     }
 
     fn compile_module(&mut self, module: &ast::Module) -> Result<(), CodegenError> {
+        // Pass A0: compute a layout for every user struct so that struct
+        // literals and field accesses can emit stable offsets.
+        for (name, info) in &self.info.types {
+            if let TypeInfo::Struct { fields, .. } = info {
+                let layout = compute_struct_layout(fields)?;
+                self.struct_layouts.insert(name.clone(), layout);
+            }
+        }
+
         // Pass A: intern every string literal into a deterministic offset
         // and emit the data section payloads. Do this before signatures so
         // the heap pointer is known by the time we emit the bump global.
@@ -461,6 +502,11 @@ struct FnBuilder<'a, 'b> {
     /// what `Function::new_with_locals_types` wants.
     extra_locals_types: Vec<ValType>,
     num_params: u32,
+    /// Struct literals need a scratch i32 local to hold the freshly-
+    /// allocated pointer while the fields are being written. Keyed by the
+    /// struct-lit expression's `span.start` so emit-time lookups find the
+    /// slot the pre-pass allocated.
+    struct_lit_slots: HashMap<u32, u32>,
 }
 
 impl<'a, 'b> FnBuilder<'a, 'b> {
@@ -472,7 +518,18 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             local_types: Vec::new(),
             extra_locals_types: Vec::new(),
             num_params: 0,
+            struct_lit_slots: HashMap::new(),
         }
+    }
+
+    /// Allocate an anonymous i32 scratch local for internal codegen use
+    /// (e.g., holding a struct-literal pointer while its fields are being
+    /// written). Returns the local's index.
+    fn alloc_scratch_i32(&mut self) -> u32 {
+        let idx = self.local_types.len() as u32;
+        self.local_types.push(Ty::I32);
+        self.extra_locals_types.push(ValType::I32);
+        idx
     }
 
     fn register_param(&mut self, name: &str, ty: Ty) {
@@ -556,6 +613,10 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 }
             }
             ExprKind::StructLit { fields, .. } => {
+                // Reserve a scratch i32 for this literal up front so the
+                // emit pass can hand the freshly-allocated pointer around.
+                let slot = self.alloc_scratch_i32();
+                self.struct_lit_slots.insert(expr.span.start, slot);
                 for fi in fields {
                     self.walk_expr(&fi.value)?;
                 }
@@ -651,10 +712,41 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     Ty::Unit
                 }
             }
+            ExprKind::StructLit { name, .. } => Ty::User(name.clone()),
+            ExprKind::Field { receiver, name } => {
+                let recv_ty = self.infer_value_ty(receiver)?;
+                let type_name = match recv_ty {
+                    Ty::User(n) => n,
+                    _ => {
+                        return Err(CodegenError {
+                            span: expr.span,
+                            message: "field access on a non-struct".into(),
+                        });
+                    }
+                };
+                let layout = self
+                    .cg
+                    .struct_layouts
+                    .get(&type_name)
+                    .ok_or_else(|| CodegenError {
+                        span: expr.span,
+                        message: format!("no layout for struct `{type_name}`"),
+                    })?;
+                layout
+                    .fields
+                    .iter()
+                    .find(|f| f.name == *name)
+                    .ok_or_else(|| CodegenError {
+                        span: expr.span,
+                        message: format!("struct `{type_name}` has no field `{name}`"),
+                    })?
+                    .ty
+                    .clone()
+            }
             _ => {
                 return Err(CodegenError {
                     span: expr.span,
-                    message: "expression kind not supported by phase-1 codegen".into(),
+                    message: "expression kind not supported by current codegen".into(),
                 });
             }
         })
@@ -873,13 +965,139 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 }
                 f.instruction(&Instruction::End);
             }
+            ExprKind::StructLit { name, fields, .. } => {
+                self.compile_struct_lit(name, fields, expr.span, f)?;
+            }
+            ExprKind::Field { receiver, name } => {
+                self.compile_field_access(receiver, name, f)?;
+            }
             _ => {
                 return Err(CodegenError {
                     span: expr.span,
-                    message: "expression kind not supported by phase-1 codegen".into(),
+                    message: "expression kind not supported by current codegen".into(),
                 });
             }
         }
+        Ok(())
+    }
+
+    fn compile_struct_lit(
+        &self,
+        name: &str,
+        fields: &[ast::FieldInit],
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let layout = self
+            .cg
+            .struct_layouts
+            .get(name)
+            .ok_or_else(|| CodegenError {
+                span,
+                message: format!("no layout for struct `{name}`"),
+            })?;
+        let slot = *self
+            .struct_lit_slots
+            .get(&span.start)
+            .expect("walk_expr should have reserved a scratch slot");
+
+        // Allocate a fresh block: slot = bump_ptr; bump_ptr += total (align 4).
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(slot));
+
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(layout.total_size as i32));
+        f.instruction(&Instruction::I32Add);
+        // Align up to 4: `(x + 3) & ~3`.
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(-4));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // Write each field in declaration order — the typechecker has
+        // already verified every required field is present and well-typed.
+        for layout_field in &layout.fields {
+            let init = fields
+                .iter()
+                .find(|fi| fi.name == layout_field.name)
+                .ok_or_else(|| CodegenError {
+                    span,
+                    message: format!(
+                        "internal: struct literal for `{name}` is missing field `{}` \
+                         (should have been caught by the typechecker)",
+                        layout_field.name
+                    ),
+                })?;
+
+            // Push the base pointer, then the field value, then store.
+            f.instruction(&Instruction::LocalGet(slot));
+            self.compile_expr(&init.value, f)?;
+            let mem_arg = MemArg {
+                offset: layout_field.offset as u64,
+                align: layout_field.align_log2,
+                memory_index: 0,
+            };
+            let instr = match layout_field.wasm_ty {
+                ValType::I32 => Instruction::I32Store(mem_arg),
+                ValType::I64 => Instruction::I64Store(mem_arg),
+                ValType::F64 => Instruction::F64Store(mem_arg),
+                _ => unreachable!("struct fields lower to i32/i64/f64"),
+            };
+            f.instruction(&instr);
+        }
+
+        // Leave the struct pointer on the stack as the expression value.
+        f.instruction(&Instruction::LocalGet(slot));
+        Ok(())
+    }
+
+    fn compile_field_access(
+        &self,
+        receiver: &Expr,
+        field: &str,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let recv_ty = self.infer_value_ty(receiver)?;
+        let type_name = match recv_ty {
+            Ty::User(n) => n,
+            _ => {
+                return Err(CodegenError {
+                    span: receiver.span,
+                    message: "field access on a non-struct".into(),
+                });
+            }
+        };
+        let layout = self
+            .cg
+            .struct_layouts
+            .get(&type_name)
+            .ok_or_else(|| CodegenError {
+                span: receiver.span,
+                message: format!("no layout for struct `{type_name}`"),
+            })?;
+        let field_layout = layout
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .ok_or_else(|| CodegenError {
+                span: receiver.span,
+                message: format!("struct `{type_name}` has no field `{field}`"),
+            })?;
+
+        self.compile_expr(receiver, f)?;
+        let mem_arg = MemArg {
+            offset: field_layout.offset as u64,
+            align: field_layout.align_log2,
+            memory_index: 0,
+        };
+        let instr = match field_layout.wasm_ty {
+            ValType::I32 => Instruction::I32Load(mem_arg),
+            ValType::I64 => Instruction::I64Load(mem_arg),
+            ValType::F64 => Instruction::F64Load(mem_arg),
+            _ => unreachable!("struct fields lower to i32/i64/f64"),
+        };
+        f.instruction(&instr);
         Ok(())
     }
 
@@ -1023,18 +1241,61 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
 
 fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
     Ok(match ty {
-        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::String => ValType::I32,
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::String | Ty::User(_) => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
         other => {
             return Err(CodegenError {
                 span,
                 message: format!(
-                    "codegen does not yet support type {} (structs/sum types land with lumen-ci2 / lumen-mmx)",
+                    "codegen does not yet support type {} (sum types land with lumen-mmx, Option/Result with lumen-rvp)",
                     other.display()
                 ),
             });
         }
+    })
+}
+
+/// Byte size of a value of this type in linear memory. Scalars are 4 or 8;
+/// composite types that live behind a pointer (strings, user structs) take
+/// 4 bytes for the i32 handle.
+fn sizeof(ty: &Ty) -> u32 {
+    match ty {
+        Ty::I64 | Ty::U64 | Ty::F64 => 8,
+        _ => 4,
+    }
+}
+
+/// Natural byte alignment.
+fn alignof(ty: &Ty) -> u32 {
+    match ty {
+        Ty::I64 | Ty::U64 | Ty::F64 => 8,
+        _ => 4,
+    }
+}
+
+fn compute_struct_layout(fields: &[(String, Ty)]) -> Result<StructLayout, CodegenError> {
+    let mut offset: u32 = 0;
+    let mut laid_out = Vec::with_capacity(fields.len());
+    for (name, ty) in fields {
+        let align = alignof(ty);
+        // Round `offset` up to `align`.
+        offset = (offset + align - 1) & !(align - 1);
+        let wasm_ty = wasm_val_type(ty, Span::DUMMY)?;
+        laid_out.push(StructFieldLayout {
+            name: name.clone(),
+            ty: ty.clone(),
+            offset,
+            align_log2: align.trailing_zeros(),
+            wasm_ty,
+        });
+        offset += sizeof(ty);
+    }
+    // Round total size up to 4 bytes so allocations stay i32-aligned.
+    let total_size = (offset + 3) & !3;
+    Ok(StructLayout {
+        fields: laid_out,
+        total_size,
     })
 }
 
@@ -1336,6 +1597,84 @@ mod tests {
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "a"), 2);
         assert_eq!(run_i32(&wasm, "b"), 2);
+    }
+
+    // --- Structs -----------------------------------------------------------
+
+    #[test]
+    fn run_struct_literal_and_field_access() {
+        let src = r#"
+            type Point = { x: i32, y: i32 }
+
+            fn make_and_read(): i32 {
+                let p = Point { x: 3, y: 4 }
+                p.x + p.y
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "make_and_read"), 7);
+    }
+
+    #[test]
+    fn run_struct_with_mixed_field_widths() {
+        // i64 field forces 8-byte alignment; make sure the layout holds.
+        let src = r#"
+            type Mixed = { tag: i32, big: i64, small: i32 }
+
+            fn sum(): i64 {
+                let m = Mixed { tag: 1, big: 100i64, small: 2 }
+                m.big
+            }
+
+            fn tag(): i32 {
+                let m = Mixed { tag: 7, big: 0i64, small: 0 }
+                m.tag + m.small
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i64(&wasm, "sum"), 100);
+        assert_eq!(run_i32(&wasm, "tag"), 7);
+    }
+
+    #[test]
+    fn run_struct_as_argument_and_return() {
+        let src = r#"
+            type Point = { x: i32, y: i32 }
+
+            fn origin(): Point {
+                Point { x: 0, y: 0 }
+            }
+
+            fn translate(p: Point, dx: i32, dy: i32): Point {
+                Point { x: p.x + dx, y: p.y + dy }
+            }
+
+            fn manhattan(): i32 {
+                let p = translate(origin(), 3, 4)
+                p.x + p.y
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "manhattan"), 7);
+    }
+
+    #[test]
+    fn run_struct_with_string_field() {
+        // Make sure the string field's i32 pointer layout interacts with
+        // the bump allocator without corrupting itself.
+        let src = r#"
+            type Greet = { prefix: string }
+
+            fn greeting_len(): i32 {
+                let g = Greet { prefix: "hello" }
+                string_len(g.prefix)
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "greeting_len"), 5);
     }
 
     #[test]
