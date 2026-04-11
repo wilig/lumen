@@ -1,34 +1,33 @@
-//! AST → Wasm codegen. See `lumen-awl`.
+//! AST → Wasm codegen. See `lumen-awl` (phase 1) and `lumen-tne` (strings).
 //!
 //! Targets Wasmtime + WASI. Memory model: a single linear memory with a
-//! bump allocator (no free). Strings are `(ptr: i32, len: i32)` pairs held
-//! as two i32s on the Wasm stack. Structs and sum-type payloads live in
-//! linear memory, pointed to by an i32.
+//! bump allocator (no free).
 //!
-//! ## Scope of this module (phase 1)
+//! ## String representation
 //!
-//! This file implements the core, memory-free slice of codegen:
+//! A `string` value is a single `i32` that points to a block in linear
+//! memory laid out as `[len: i32 | bytes...]`. String literals are
+//! interned into a data section at compile time at deterministic offsets,
+//! and the bump pointer starts just past the last literal. `string +
+//! string` is lowered to a call into the auto-emitted `string_concat`
+//! helper, which allocates a fresh block via the bump pointer and copies
+//! the two payloads in with `memory.copy`. The built-in `string_len(s)`
+//! function reads the length word at `offset=0`.
 //!
-//! - All five numeric types (`i32`, `i64`, `u32`, `u64`, `f64`), with the
-//!   arithmetic/comparison/logical operators routed to the correct
-//!   signed/unsigned Wasm opcode.
-//! - `bool` and `unit` (both lowered to `i32`).
-//! - User-defined monomorphic functions, calls between them, and
-//!   parameters + local variables from `let`/`var` with `var` re-assignment.
-//! - `if`/`else` expressions and blocks.
-//! - `return` statements.
-//! - `as` casts between any two numeric types.
-//! - `main` and all other top-level functions are exported.
+//! ## Scope
 //!
-//! Deferred to follow-up codegen issues and not yet handled here:
-//!
-//! - Strings, structs, sum types, `match`, `Option`/`Result`, `?`, linear
-//!   memory, and `for` loops.
+//! This module currently covers numerics, bool, unit, control flow, user
+//! function calls (phase 1, `lumen-awl`), plus strings + string concat +
+//! string_len (phase 2a, `lumen-tne`). Still deferred: structs
+//! (`lumen-ci2`), sum types + match (`lumen-mmx`), Option/Result + `?`
+//! (`lumen-rvp`), for-loops (`lumen-w0g`), error frames (`lumen-x4a`),
+//! WASI IO (`lumen-nwf`).
 
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+    CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType, Module,
     TypeSection, ValType,
 };
 
@@ -73,16 +72,41 @@ pub fn compile(module: &ast::Module, info: &ModuleInfo) -> Result<Vec<u8>, Codeg
 // Codegen state
 // ---------------------------------------------------------------------------
 
+/// Fixed index assigned to the auto-emitted `string_concat` helper. The
+/// helper is always emitted (even for programs that don't use strings) so
+/// fn index assignment is stable and simple.
+const STRING_CONCAT_FN_INDEX: u32 = 0;
+/// Reserve the first 8 bytes of linear memory as an unused null zone so an
+/// all-zeros pointer (commonly the uninitialized value of a memory slot)
+/// never names a real block.
+const HEAP_START: u32 = 8;
+/// Memory argument used for all of our 4-byte (i32-sized) loads and stores.
+const I32_MEM_ARG: MemArg = MemArg {
+    offset: 0,
+    align: 2,
+    memory_index: 0,
+};
+
 struct Codegen<'a> {
     info: &'a ModuleInfo,
-    /// Fn name → Wasm function index (== type index; we don't dedupe types
-    /// in this pass).
+    /// Fn name → Wasm function index. Lumen fn `f` gets index
+    /// `1 + position_in_module`, because helper index 0 is reserved for
+    /// `string_concat`.
     fn_indices: HashMap<String, u32>,
     types: TypeSection,
     functions: FunctionSection,
+    memory: MemorySection,
+    globals: GlobalSection,
+    data: DataSection,
     exports: ExportSection,
     code: CodeSection,
-    next_index: u32,
+    /// Offset in linear memory → `[len: i32 | bytes...]` for every unique
+    /// string literal observed in the module. Built during pre-pass so the
+    /// data section is known before bodies emit.
+    string_offsets: HashMap<String, u32>,
+    /// First free byte after all the literal data segments — the initial
+    /// value of the bump-pointer global.
+    heap_ptr: u32,
 }
 
 impl<'a> Codegen<'a> {
@@ -92,16 +116,32 @@ impl<'a> Codegen<'a> {
             fn_indices: HashMap::new(),
             types: TypeSection::new(),
             functions: FunctionSection::new(),
+            memory: MemorySection::new(),
+            globals: GlobalSection::new(),
+            data: DataSection::new(),
             exports: ExportSection::new(),
             code: CodeSection::new(),
-            next_index: 0,
+            string_offsets: HashMap::new(),
+            heap_ptr: HEAP_START,
         }
     }
 
     fn compile_module(&mut self, module: &ast::Module) -> Result<(), CodegenError> {
-        // Pass 1: assign a function + type index to every `fn` item and add
-        // its signature to the type section. This needs to finish before
-        // body codegen so that forward calls resolve.
+        // Pass A: intern every string literal into a deterministic offset
+        // and emit the data section payloads. Do this before signatures so
+        // the heap pointer is known by the time we emit the bump global.
+        self.intern_string_literals(module);
+
+        // Pass B: emit helper signatures first so their indices are fixed.
+        // string_concat has type index 0 and fn index 0.
+        self.types
+            .ty()
+            .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+        self.functions.function(0);
+
+        // Pass C: assign a function + type index to every user `fn` item.
+        // User fn `i` lives at fn index `1 + i` (helper = 0).
+        let mut next_index = 1u32;
         for item in &module.items {
             if let Item::Fn(f) = item {
                 let sig = self
@@ -109,8 +149,8 @@ impl<'a> Codegen<'a> {
                     .fns
                     .get(&f.name)
                     .expect("type checker should have populated this fn");
-                let idx = self.next_index;
-                self.next_index += 1;
+                let idx = next_index;
+                next_index += 1;
                 self.fn_indices.insert(f.name.clone(), idx);
 
                 let params_val: Vec<ValType> = sig
@@ -129,7 +169,30 @@ impl<'a> Codegen<'a> {
             }
         }
 
-        // Pass 2: emit each function body.
+        // Pass D: emit the linear memory (1 page = 64 KiB to start) and the
+        // bump pointer global, initialized just past the last string
+        // literal.
+        self.memory.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        self.globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(self.heap_ptr as i32),
+        );
+        self.exports.export("memory", ExportKind::Memory, 0);
+
+        // Pass E: emit the string_concat helper body.
+        self.code.function(&self.emit_string_concat_helper());
+
+        // Pass F: emit each user function body.
         for item in &module.items {
             if let Item::Fn(f) = item {
                 let func = self.compile_fn(f)?;
@@ -140,12 +203,213 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// Walk the AST and assign a linear-memory offset to every distinct
+    /// string literal. The data section payload is `[len: i32 little-endian
+    /// | bytes...]` so `string_len(s)` can just `i32.load` at `offset=0`.
+    fn intern_string_literals(&mut self, module: &ast::Module) {
+        let mut seen: Vec<String> = Vec::new();
+        for item in &module.items {
+            if let Item::Fn(f) = item {
+                self.scan_string_lits_in_block(&f.body, &mut seen);
+            }
+        }
+        for s in seen {
+            if self.string_offsets.contains_key(&s) {
+                continue;
+            }
+            let offset = self.heap_ptr;
+            self.string_offsets.insert(s.clone(), offset);
+
+            let bytes = s.as_bytes();
+            let len = bytes.len() as u32;
+            let mut payload: Vec<u8> = Vec::with_capacity(4 + bytes.len());
+            payload.extend_from_slice(&len.to_le_bytes());
+            payload.extend_from_slice(bytes);
+
+            self.data
+                .active(0, &ConstExpr::i32_const(offset as i32), payload);
+            self.heap_ptr += 4 + len;
+            // Keep the bump pointer i32-aligned so future allocations stay
+            // aligned for i32 loads/stores.
+            while !self.heap_ptr.is_multiple_of(4) {
+                self.heap_ptr += 1;
+            }
+        }
+    }
+
+    fn scan_string_lits_in_block(&self, block: &ast::Block, acc: &mut Vec<String>) {
+        for stmt in &block.stmts {
+            self.scan_string_lits_in_stmt(stmt, acc);
+        }
+        if let Some(tail) = &block.tail {
+            self.scan_string_lits_in_expr(tail, acc);
+        }
+    }
+
+    fn scan_string_lits_in_stmt(&self, stmt: &ast::Stmt, acc: &mut Vec<String>) {
+        match &stmt.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Var { value, .. }
+            | StmtKind::Assign { value, .. } => self.scan_string_lits_in_expr(value, acc),
+            StmtKind::Expr(e) => self.scan_string_lits_in_expr(e, acc),
+            StmtKind::For { iter, body, .. } => {
+                self.scan_string_lits_in_expr(iter, acc);
+                self.scan_string_lits_in_block(body, acc);
+            }
+            StmtKind::Return(Some(e)) => self.scan_string_lits_in_expr(e, acc),
+            StmtKind::Return(None) => {}
+        }
+    }
+
+    fn scan_string_lits_in_expr(&self, expr: &Expr, acc: &mut Vec<String>) {
+        match &expr.kind {
+            ExprKind::StringLit(s) => {
+                if !acc.iter().any(|existing| existing == s) {
+                    acc.push(s.clone());
+                }
+            }
+            ExprKind::Paren(e) => self.scan_string_lits_in_expr(e, acc),
+            ExprKind::Unary { rhs, .. } => self.scan_string_lits_in_expr(rhs, acc),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.scan_string_lits_in_expr(lhs, acc);
+                self.scan_string_lits_in_expr(rhs, acc);
+            }
+            ExprKind::Cast { expr, .. } => self.scan_string_lits_in_expr(expr, acc),
+            ExprKind::Call { callee, args } => {
+                self.scan_string_lits_in_expr(callee, acc);
+                for a in args {
+                    self.scan_string_lits_in_expr(&a.value, acc);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.scan_string_lits_in_expr(receiver, acc);
+                for a in args {
+                    self.scan_string_lits_in_expr(&a.value, acc);
+                }
+            }
+            ExprKind::Field { receiver, .. } => self.scan_string_lits_in_expr(receiver, acc),
+            ExprKind::Try(inner) => self.scan_string_lits_in_expr(inner, acc),
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.scan_string_lits_in_expr(cond, acc);
+                self.scan_string_lits_in_block(then_block, acc);
+                self.scan_string_lits_in_block(else_block, acc);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.scan_string_lits_in_expr(scrutinee, acc);
+                for arm in arms {
+                    self.scan_string_lits_in_expr(&arm.body, acc);
+                }
+            }
+            ExprKind::Block(b) => self.scan_string_lits_in_block(b, acc),
+            ExprKind::StructLit { fields, .. } => {
+                for fi in fields {
+                    self.scan_string_lits_in_expr(&fi.value, acc);
+                }
+            }
+            ExprKind::IntLit { .. }
+            | ExprKind::FloatLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::UnitLit
+            | ExprKind::Ident(_) => {}
+        }
+    }
+
+    /// Emit the body of the `string_concat(a: i32, b: i32) -> i32` helper.
+    /// Allocates a new `[len | bytes]` block at the bump pointer and
+    /// `memory.copy`s the two source payloads into place.
+    fn emit_string_concat_helper(&self) -> Function {
+        // Local layout: 0=a, 1=b (params), 2=len_a, 3=len_b, 4=result.
+        let mut f = Function::new_with_locals_types(vec![
+            ValType::I32, // len_a
+            ValType::I32, // len_b
+            ValType::I32, // result
+        ]);
+
+        // len_a = i32.load(a)
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+        f.instruction(&Instruction::LocalSet(2));
+
+        // len_b = i32.load(b)
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+        f.instruction(&Instruction::LocalSet(3));
+
+        // result = bump_ptr
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(4));
+
+        // bump_ptr = bump_ptr + 4 + len_a + len_b (keep i32 alignment by
+        // rounding up to the next multiple of 4 inline).
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        // Align up to 4: x = (x + 3) & ~3
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(-4));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // *result = len_a + len_b
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // memory.copy(dst = result + 4, src = a + 4, len = len_a)
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // memory.copy(dst = result + 4 + len_a, src = b + 4, len = len_b)
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // Return result
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::End);
+
+        f
+    }
+
     fn finish(self) -> Vec<u8> {
         let mut module = Module::new();
         module.section(&self.types);
         module.section(&self.functions);
+        module.section(&self.memory);
+        module.section(&self.globals);
         module.section(&self.exports);
         module.section(&self.code);
+        module.section(&self.data);
         module.finish()
     }
 
@@ -331,12 +595,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             ExprKind::FloatLit(_) => Ty::F64,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::UnitLit => Ty::Unit,
-            ExprKind::StringLit(_) => {
-                return Err(CodegenError {
-                    span: expr.span,
-                    message: "string literals are not supported by phase-1 codegen yet".into(),
-                });
-            }
+            ExprKind::StringLit(_) => Ty::String,
             ExprKind::Ident(name) => {
                 if let Some(&idx) = self.locals.get(name) {
                     self.local_types[idx as usize].clone()
@@ -368,7 +627,9 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             ExprKind::Cast { to, .. } => resolve_builtin_numeric(to)?,
             ExprKind::Call { callee, .. } => {
                 if let ExprKind::Ident(name) = &callee.kind {
-                    if let Some(sig) = self.cg.info.fns.get(name) {
+                    if name == "string_len" {
+                        Ty::I32
+                    } else if let Some(sig) = self.cg.info.fns.get(name) {
                         sig.ret.clone()
                     } else {
                         return Err(CodegenError {
@@ -490,6 +751,14 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             ExprKind::UnitLit => {
                 f.instruction(&Instruction::I32Const(0));
             }
+            ExprKind::StringLit(s) => {
+                let offset = *self
+                    .cg
+                    .string_offsets
+                    .get(s)
+                    .expect("string literal should have been interned in pass A");
+                f.instruction(&Instruction::I32Const(offset as i32));
+            }
             ExprKind::Ident(name) => {
                 let idx = *self.locals.get(name).ok_or_else(|| CodegenError {
                     span: expr.span,
@@ -550,6 +819,24 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                         });
                     }
                 };
+
+                // Built-in `string_len(s)` = `i32.load` of the length word
+                // at offset 0 of the string payload.
+                if name == "string_len" {
+                    if args.len() != 1 {
+                        return Err(CodegenError {
+                            span: expr.span,
+                            message: format!(
+                                "string_len expects 1 argument, found {}",
+                                args.len()
+                            ),
+                        });
+                    }
+                    self.compile_expr(&args[0].value, f)?;
+                    f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+                    return Ok(());
+                }
+
                 for a in args {
                     self.compile_expr(&a.value, f)?;
                 }
@@ -616,6 +903,16 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         }
 
         let lt = self.infer_value_ty(lhs)?;
+
+        // String + string → call into the auto-emitted string_concat
+        // helper. Matches the typechecker's special case.
+        if matches!(op, BinOp::Add) && matches!(lt, Ty::String) {
+            self.compile_expr(lhs, f)?;
+            self.compile_expr(rhs, f)?;
+            f.instruction(&Instruction::Call(STRING_CONCAT_FN_INDEX));
+            return Ok(());
+        }
+
         self.compile_expr(lhs, f)?;
         self.compile_expr(rhs, f)?;
 
@@ -726,14 +1023,14 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
 
 fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
     Ok(match ty {
-        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => ValType::I32,
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::String => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
         other => {
             return Err(CodegenError {
                 span,
                 message: format!(
-                    "phase-1 codegen only supports numeric / bool / unit; got {}",
+                    "codegen does not yet support type {} (structs/sum types land with lumen-ci2 / lumen-mmx)",
                     other.display()
                 ),
             });
@@ -990,6 +1287,55 @@ mod tests {
         let instance = Instance::new(&mut store, &module, &[]).unwrap();
         let f = instance.get_typed_func::<i32, i64>(&mut store, "widen").unwrap();
         assert_eq!(f.call(&mut store, 42).unwrap(), 42i64);
+    }
+
+    #[test]
+    fn run_string_literal_length() {
+        let src = r#"fn hello_len(): i32 { string_len("hello") }"#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "hello_len"), 5);
+    }
+
+    #[test]
+    fn run_string_concat_length() {
+        // The star criterion: string concat compiles and runs end-to-end.
+        let src = r#"fn total(): i32 { string_len("hello, " + "world") }"#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "total"), 12);
+    }
+
+    #[test]
+    fn run_string_concat_three_way() {
+        let src = r#"fn total(): i32 { string_len("a" + "bc" + "def") }"#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "total"), 6);
+    }
+
+    #[test]
+    fn run_string_concat_with_variable() {
+        let src = r#"
+            fn greet(): i32 {
+                let greeting = "hello, " + "world"
+                string_len(greeting)
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "greet"), 12);
+    }
+
+    #[test]
+    fn run_string_literal_deduplicated() {
+        // Using the same literal twice should not crash — the scanner
+        // de-dupes by content before assigning offsets.
+        let src = r#"
+            fn a(): i32 { string_len("hi") }
+            fn b(): i32 { string_len("hi") }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "a"), 2);
+        assert_eq!(run_i32(&wasm, "b"), 2);
     }
 
     #[test]

@@ -871,6 +871,7 @@ impl<'a> FnChecker<'a> {
                     return Ty::Option(Box::new(Ty::Error));
                 }
                 "range" => return self.check_range_call(args, whole_span),
+                "string_len" => return self.check_string_len_call(args, whole_span),
                 _ => {}
             }
 
@@ -972,6 +973,21 @@ impl<'a> FnChecker<'a> {
         }
         let inner = self.infer_expr(&args[0].value);
         Ty::Option(Box::new(inner))
+    }
+
+    fn check_string_len_call(&mut self, args: &[Arg], call_span: Span) -> Ty {
+        // Built-in `string_len(s: string) -> i32`. Not in the stdlib yet;
+        // this is the minimal way to get a length out of a string without
+        // waiting on lumen-l64 / proper method call resolution.
+        if args.len() != 1 {
+            self.errors.push(TypeError {
+                span: call_span,
+                message: format!("`string_len` expects 1 argument, found {}", args.len()),
+            });
+            return Ty::I32;
+        }
+        self.check_expr(&args[0].value, &Ty::String);
+        Ty::I32
     }
 
     fn check_range_call(&mut self, args: &[Arg], call_span: Span) -> Ty {
