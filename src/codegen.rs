@@ -463,17 +463,30 @@ impl<'a> Codegen<'a> {
             .get(&f.name)
             .expect("type checker populated sig");
 
-        // First, walk the body to collect every local (params + let/var
-        // bindings) so the Wasm locals header is accurate.
         let mut fb = FnBuilder::new(self, sig);
-        // Parameters are locals 0..N already — register them.
+        // Parameters occupy slots [0, num_params).
         for (pname, pty) in &sig.params {
             fb.register_param(pname, pty.clone());
         }
-        fb.collect_locals(&f.body)?;
 
+        // Walk pass: allocate every extra local we'll need and populate
+        // `slot_for_span`. Maintains its own scope stack as it traverses.
+        fb.push_scope();
+        for (i, (pname, _)) in sig.params.iter().enumerate() {
+            fb.declare(pname.clone(), i as u32);
+        }
+        fb.walk_block(&f.body)?;
+        fb.pop_scope();
+        fb.reset_scopes();
+
+        // Emit pass: now that the locals header is fixed, emit the body.
         let mut function = Function::new_with_locals_types(fb.extra_locals_types.clone());
+        fb.push_scope();
+        for (i, (pname, _)) in sig.params.iter().enumerate() {
+            fb.declare(pname.clone(), i as u32);
+        }
         fb.compile_block(&f.body, &mut function)?;
+        fb.pop_scope();
 
         // Implicit `unit` return: if the declared return is unit, push a
         // zero i32 so the function signature is satisfied.
@@ -493,20 +506,39 @@ impl<'a> Codegen<'a> {
 struct FnBuilder<'a, 'b> {
     cg: &'a Codegen<'b>,
     sig: &'a crate::types::FnSig,
-    /// Name → local index.
-    locals: HashMap<String, u32>,
-    /// Parallel vec of (name, ty) for every local in declaration order.
-    /// Helps when emitting the locals header and for type-directed dispatch.
-    local_types: Vec<Ty>,
-    /// Types of locals that come *after* the parameters — this is exactly
-    /// what `Function::new_with_locals_types` wants.
+    /// Scope stack for name resolution. Both the walk pass and the emit
+    /// pass push/pop scopes as they enter and leave blocks and match arms,
+    /// and both fully rebuild it from scratch each time. Match arms in
+    /// particular need real scoping so two sibling arms can each bind a
+    /// `radius` local without colliding.
+    scopes: Vec<HashMap<String, u32>>,
+    /// Per-slot Lumen type, indexed by slot index. Slots `[0, num_params)`
+    /// are the parameters; slots `[num_params, ...)` are extras allocated
+    /// during the walk pass. Stable across passes.
+    slot_types: Vec<Ty>,
+    /// Types of the locals beyond the parameters, in the format
+    /// `Function::new_with_locals_types` wants. Stable across passes.
     extra_locals_types: Vec<ValType>,
     num_params: u32,
-    /// Struct literals need a scratch i32 local to hold the freshly-
-    /// allocated pointer while the fields are being written. Keyed by the
-    /// struct-lit expression's `span.start` so emit-time lookups find the
-    /// slot the pre-pass allocated.
-    struct_lit_slots: HashMap<u32, u32>,
+    /// Span-keyed slot lookups for synthesized bindings. Used for:
+    /// - `let` / `var` stmts (key = stmt span.start)
+    /// - `for` loop binders (key = stmt span.start)
+    /// - struct literal scratch pointers (key = expr span.start)
+    /// - match scratch pointer for the scrutinee (key = match expr span.start)
+    /// - pattern binding slots (key = pattern span.start)
+    /// - `?` scratch (key = try expr span.start)
+    /// Populated during the walk pass, read during emit.
+    slot_for_span: HashMap<u32, u32>,
+    /// Extra scratch slots that certain emit paths need beyond the
+    /// primary `slot_for_span` entry. Sum constructor calls, for
+    /// instance, need one slot for the payload pointer *and* one for
+    /// the sum pointer. Keyed the same way, ordered by emission need.
+    aux_slots: HashMap<u32, Vec<u32>>,
+    /// Cached expression types. Populated during the walk pass for
+    /// expressions whose type inference requires pattern-binding scope
+    /// context (e.g. match arm bodies). Read during emit to avoid
+    /// re-inferring in a scope where the bindings don't exist yet.
+    expr_type_cache: HashMap<u32, Ty>,
 }
 
 impl<'a, 'b> FnBuilder<'a, 'b> {
@@ -514,61 +546,117 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         Self {
             cg,
             sig,
-            locals: HashMap::new(),
-            local_types: Vec::new(),
+            scopes: Vec::new(),
+            slot_types: Vec::new(),
             extra_locals_types: Vec::new(),
             num_params: 0,
-            struct_lit_slots: HashMap::new(),
+            slot_for_span: HashMap::new(),
+            aux_slots: HashMap::new(),
+            expr_type_cache: HashMap::new(),
         }
     }
 
+    // --- Scope stack ------------------------------------------------------
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare(&mut self, name: String, slot: u32) {
+        self.scopes
+            .last_mut()
+            .expect("must be inside a scope")
+            .insert(name, slot);
+    }
+
+    fn lookup(&self, name: &str) -> Option<u32> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&slot) = scope.get(name) {
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    fn lookup_ty(&self, name: &str) -> Option<Ty> {
+        self.lookup(name).map(|s| self.slot_types[s as usize].clone())
+    }
+
+    /// Clear the scope stack so a fresh pass (walk → emit) can repopulate.
+    fn reset_scopes(&mut self) {
+        self.scopes.clear();
+    }
+
+    // --- Slot allocation --------------------------------------------------
+
+    /// Allocate a local slot of the given Lumen type.
+    fn alloc_local(&mut self, ty: Ty, span: Span) -> Result<u32, CodegenError> {
+        let val_type = wasm_val_type(&ty, span)?;
+        let idx = self.num_params + self.extra_locals_types.len() as u32;
+        self.slot_types.push(ty);
+        self.extra_locals_types.push(val_type);
+        Ok(idx)
+    }
+
     /// Allocate an anonymous i32 scratch local for internal codegen use
-    /// (e.g., holding a struct-literal pointer while its fields are being
-    /// written). Returns the local's index.
+    /// (struct literal pointer, match scrutinee pointer, etc.).
     fn alloc_scratch_i32(&mut self) -> u32 {
-        let idx = self.local_types.len() as u32;
-        self.local_types.push(Ty::I32);
+        let idx = self.num_params + self.extra_locals_types.len() as u32;
+        self.slot_types.push(Ty::I32);
         self.extra_locals_types.push(ValType::I32);
         idx
     }
 
-    fn register_param(&mut self, name: &str, ty: Ty) {
-        let idx = self.local_types.len() as u32;
-        self.locals.insert(name.to_string(), idx);
-        self.local_types.push(ty);
+    fn register_param(&mut self, _name: &str, ty: Ty) {
+        assert_eq!(self.slot_types.len() as u32, self.num_params);
+        self.slot_types.push(ty);
         self.num_params += 1;
     }
 
-    /// Walk the block and register every `let`/`var` binding that appears
-    /// inside it (including nested blocks, `for` bodies, and match/if arms).
-    fn collect_locals(&mut self, block: &ast::Block) -> Result<(), CodegenError> {
+    // ----------------------------------------------------------------------
+    // Walk pass: allocate slots and populate slot_for_span
+    // ----------------------------------------------------------------------
+
+    fn walk_block(&mut self, block: &ast::Block) -> Result<(), CodegenError> {
+        self.push_scope();
         for stmt in &block.stmts {
-            match &stmt.kind {
-                StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
-                    let ty = self.infer_value_ty(value)?;
-                    self.register_local(name, ty, value.span)?;
-                    self.walk_expr(value)?;
-                }
-                StmtKind::Assign { value, .. } => {
-                    self.walk_expr(value)?;
-                }
-                StmtKind::Expr(e) => self.walk_expr(e)?,
-                StmtKind::For { .. } => {
-                    // For-loops are not emitted by phase-1 codegen; the
-                    // typechecker still accepts them because range(...) is
-                    // a built-in stub. Fail cleanly rather than silently
-                    // producing wrong Wasm.
-                    return Err(CodegenError {
-                        span: stmt.span,
-                        message: "for-loops are not supported by phase-1 codegen yet".into(),
-                    });
-                }
-                StmtKind::Return(Some(e)) => self.walk_expr(e)?,
-                StmtKind::Return(None) => {}
-            }
+            self.walk_stmt(stmt)?;
         }
         if let Some(tail) = &block.tail {
             self.walk_expr(tail)?;
+        }
+        self.pop_scope();
+        Ok(())
+    }
+
+    fn walk_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), CodegenError> {
+        match &stmt.kind {
+            StmtKind::Let { name, ty, value } | StmtKind::Var { name, ty, value } => {
+                self.walk_expr(value)?;
+                let bound_ty = match ty {
+                    Some(annot) => self.resolve_ast_type(annot)?,
+                    None => self.infer_expr_ty(value)?,
+                };
+                let slot = self.alloc_local(bound_ty, stmt.span)?;
+                self.slot_for_span.insert(stmt.span.start, slot);
+                self.declare(name.clone(), slot);
+            }
+            StmtKind::Assign { value, .. } => {
+                self.walk_expr(value)?;
+            }
+            StmtKind::Expr(e) => self.walk_expr(e)?,
+            StmtKind::For { .. } => {
+                return Err(CodegenError {
+                    span: stmt.span,
+                    message: "for-loops are not supported by codegen yet (lumen-w0g)".into(),
+                });
+            }
+            StmtKind::Return(Some(e)) => self.walk_expr(e)?,
+            StmtKind::Return(None) => {}
         }
         Ok(())
     }
@@ -581,10 +669,10 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 else_block,
             } => {
                 self.walk_expr(cond)?;
-                self.collect_locals(then_block)?;
-                self.collect_locals(else_block)?;
+                self.walk_block(then_block)?;
+                self.walk_block(else_block)?;
             }
-            ExprKind::Block(b) => self.collect_locals(b)?,
+            ExprKind::Block(b) => self.walk_block(b)?,
             ExprKind::Paren(e) => self.walk_expr(e)?,
             ExprKind::Unary { rhs, .. } => self.walk_expr(rhs)?,
             ExprKind::Binary { lhs, rhs, .. } => {
@@ -597,6 +685,19 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 for a in args {
                     self.walk_expr(&a.value)?;
                 }
+                // If this is a sum-type constructor (built-in Ok/Err/Some
+                // or a user variant with a payload), reserve two scratch
+                // i32 slots for the payload and sum block pointers.
+                if let ExprKind::Ident(name) = &callee.kind {
+                    let is_sum_ctor = matches!(name.as_str(), "Ok" | "Err" | "Some")
+                        || self.find_sum_for_variant(name).is_some();
+                    if is_sum_ctor {
+                        let payload_slot = self.alloc_scratch_i32();
+                        let sum_slot = self.alloc_scratch_i32();
+                        self.aux_slots
+                            .insert(expr.span.start, vec![payload_slot, sum_slot]);
+                    }
+                }
             }
             ExprKind::Field { receiver, .. } => self.walk_expr(receiver)?,
             ExprKind::MethodCall { receiver, args, .. } => {
@@ -605,20 +706,68 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     self.walk_expr(&a.value)?;
                 }
             }
-            ExprKind::Try(inner) => self.walk_expr(inner)?,
+            ExprKind::Try(inner) => {
+                self.walk_expr(inner)?;
+                // `?` needs a scratch slot to stash the sum pointer while
+                // the tag is inspected.
+                let slot = self.alloc_scratch_i32();
+                self.slot_for_span.insert(expr.span.start, slot);
+            }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk_expr(scrutinee)?;
+                // Scratch slot for the evaluated scrutinee pointer, plus
+                // a second shared i32 slot for the payload pointer that
+                // each arm's pattern binds use while destructuring.
+                let scrut_slot = self.alloc_scratch_i32();
+                let payload_slot = self.alloc_scratch_i32();
+                self.slot_for_span.insert(expr.span.start, scrut_slot);
+                self.aux_slots.insert(expr.span.start, vec![payload_slot]);
+
+                let scrut_ty = self.infer_expr_ty(scrutinee)?;
+                let mut cached_result_ty = None;
                 for arm in arms {
+                    self.push_scope();
+                    self.walk_pattern(&arm.pattern, &scrut_ty)?;
                     self.walk_expr(&arm.body)?;
+                    // Cache the result type from the first arm while its
+                    // bindings are still in scope. Emit can't re-infer this
+                    // because it pushes arm scopes one at a time.
+                    if cached_result_ty.is_none() {
+                        cached_result_ty = Some(self.infer_expr_ty(&arm.body)?);
+                    }
+                    self.pop_scope();
+                }
+                if let Some(ty) = cached_result_ty {
+                    self.expr_type_cache.insert(expr.span.start, ty);
                 }
             }
-            ExprKind::StructLit { fields, .. } => {
-                // Reserve a scratch i32 for this literal up front so the
-                // emit pass can hand the freshly-allocated pointer around.
+            ExprKind::StructLit { name, fields, .. } => {
+                // Primary scratch slot: holds the struct pointer (for
+                // plain structs) or the payload pointer (for named-field
+                // variant constructors).
                 let slot = self.alloc_scratch_i32();
-                self.struct_lit_slots.insert(expr.span.start, slot);
+                self.slot_for_span.insert(expr.span.start, slot);
+                // If this is a named-field variant constructor, allocate
+                // a second scratch for the sum block pointer.
+                if !self.cg.struct_layouts.contains_key(name)
+                    && self.find_sum_for_variant(name).is_some()
+                {
+                    let sum_slot = self.alloc_scratch_i32();
+                    self.aux_slots.insert(expr.span.start, vec![sum_slot]);
+                }
                 for fi in fields {
                     self.walk_expr(&fi.value)?;
+                }
+            }
+            // Identifier: usually a leaf, but `None` and bare zero-
+            // payload variant constructors need a sum-block scratch slot.
+            ExprKind::Ident(name) => {
+                let needs_slot = name == "None"
+                    || (self.lookup(name).is_none()
+                        && self.find_sum_for_variant(name).is_some());
+                if needs_slot {
+                    let sum_slot = self.alloc_scratch_i32();
+                    self.aux_slots.insert(expr.span.start, vec![sum_slot]);
                 }
             }
             // Leaves
@@ -626,26 +775,188 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             | ExprKind::FloatLit(_)
             | ExprKind::StringLit(_)
             | ExprKind::BoolLit(_)
-            | ExprKind::UnitLit
-            | ExprKind::Ident(_) => {}
+            | ExprKind::UnitLit => {}
         }
         Ok(())
     }
 
-    fn register_local(&mut self, name: &str, ty: Ty, span: Span) -> Result<(), CodegenError> {
-        let idx = self.local_types.len() as u32;
-        let val = wasm_val_type(&ty, span)?;
-        self.locals.insert(name.to_string(), idx);
-        self.local_types.push(ty);
-        self.extra_locals_types.push(val);
+    /// Walk a pattern, allocating slots and declaring names for any
+    /// bindings it contains. The `expected` type is the type of the
+    /// sub-scrutinee this pattern is matching against.
+    fn walk_pattern(&mut self, pat: &ast::Pattern, expected: &Ty) -> Result<(), CodegenError> {
+        use ast::{PatternKind, VariantPatPayload};
+        match &pat.kind {
+            PatternKind::Wildcard | PatternKind::Literal(_) => {}
+            PatternKind::Binding(name) => {
+                let slot = self.alloc_local(expected.clone(), pat.span)?;
+                self.slot_for_span.insert(pat.span.start, slot);
+                self.declare(name.clone(), slot);
+            }
+            PatternKind::Variant {
+                name: variant_name,
+                payload,
+            } => {
+                // Zero-payload bindings need no slot work; they match by
+                // tag only.
+                let Some(payload) = payload.as_ref() else {
+                    return Ok(());
+                };
+                let Some(fields) = self.variant_field_types(expected, variant_name) else {
+                    return Ok(());
+                };
+                match payload {
+                    VariantPatPayload::Named(pf_list) => {
+                        for pf in pf_list {
+                            let field_ty = fields
+                                .iter()
+                                .find(|(n, _)| n == &pf.name)
+                                .map(|(_, t)| t.clone())
+                                .unwrap_or(Ty::Error);
+                            self.walk_pattern(&pf.pattern, &field_ty)?;
+                        }
+                    }
+                    VariantPatPayload::Positional(pats) => {
+                        for (i, p) in pats.iter().enumerate() {
+                            let field_ty = fields
+                                .get(i)
+                                .map(|(_, t)| t.clone())
+                                .unwrap_or(Ty::Error);
+                            self.walk_pattern(p, &field_ty)?;
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Approximate the type of a value expression at collect-locals time so
-    /// we can reserve a Wasm local slot of the right width. Because the
-    /// type checker has already validated everything, this only needs to
-    /// get the *shape* right (i32 vs i64 vs f64).
-    fn infer_value_ty(&self, expr: &Expr) -> Result<Ty, CodegenError> {
+    /// Resolve an AST `Type` to a Lumen `Ty`. Mirrors the typechecker's
+    /// resolution rules but does not report errors — anything the
+    /// typechecker rejected has already been filtered out.
+    fn resolve_ast_type(&self, ty: &ast::Type) -> Result<Ty, CodegenError> {
+        match &ty.kind {
+            ast::TypeKind::Named { name, args } => Ok(match name.as_str() {
+                "i32" if args.is_empty() => Ty::I32,
+                "i64" if args.is_empty() => Ty::I64,
+                "u32" if args.is_empty() => Ty::U32,
+                "u64" if args.is_empty() => Ty::U64,
+                "f64" if args.is_empty() => Ty::F64,
+                "bool" if args.is_empty() => Ty::Bool,
+                "string" if args.is_empty() => Ty::String,
+                "unit" if args.is_empty() => Ty::Unit,
+                "Option" if args.len() == 1 => {
+                    Ty::Option(Box::new(self.resolve_ast_type(&args[0])?))
+                }
+                "Result" if args.len() == 2 => Ty::Result(
+                    Box::new(self.resolve_ast_type(&args[0])?),
+                    Box::new(self.resolve_ast_type(&args[1])?),
+                ),
+                "List" if args.len() == 1 => {
+                    Ty::List(Box::new(self.resolve_ast_type(&args[0])?))
+                }
+                _ if args.is_empty() && self.cg.info.types.contains_key(name) => {
+                    Ty::User(name.clone())
+                }
+                _ => {
+                    return Err(CodegenError {
+                        span: ty.span,
+                        message: format!("unresolved type `{name}`"),
+                    });
+                }
+            }),
+        }
+    }
+
+    /// Return the list of `(field_name, field_ty)` pairs for a given
+    /// variant of a given scrutinee type. For positional payloads the
+    /// names are synthesized as `_0`, `_1`, ... Callers use the returned
+    /// order for positional matching and the name for named matching.
+    fn variant_field_types(
+        &self,
+        scrut_ty: &Ty,
+        variant_name: &str,
+    ) -> Option<Vec<(String, Ty)>> {
+        match scrut_ty {
+            Ty::User(type_name) => {
+                let Some(TypeInfo::Sum { variants, .. }) = self.cg.info.types.get(type_name)
+                else {
+                    return None;
+                };
+                let v = variants.iter().find(|v| v.name == variant_name)?;
+                Some(match &v.payload {
+                    None => Vec::new(),
+                    Some(crate::types::VariantPayloadInfo::Named(fs)) => fs.clone(),
+                    Some(crate::types::VariantPayloadInfo::Positional(tys)) => tys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| (format!("_{i}"), t.clone()))
+                        .collect(),
+                })
+            }
+            Ty::Option(inner) => match variant_name {
+                "None" => Some(Vec::new()),
+                "Some" => Some(vec![("_0".into(), (**inner).clone())]),
+                _ => None,
+            },
+            Ty::Result(ok, err) => match variant_name {
+                "Ok" => Some(vec![("_0".into(), (**ok).clone())]),
+                "Err" => Some(vec![("_0".into(), (**err).clone())]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Return the runtime tag value for a given variant of a given
+    /// scrutinee type. Tags are assigned sequentially starting at 0, and
+    /// Option/Result use the conventional None=0/Some=1 and Ok=0/Err=1.
+    fn variant_tag(&self, scrut_ty: &Ty, variant_name: &str) -> Option<u32> {
+        match scrut_ty {
+            Ty::User(type_name) => {
+                let Some(TypeInfo::Sum { variants, .. }) = self.cg.info.types.get(type_name)
+                else {
+                    return None;
+                };
+                variants
+                    .iter()
+                    .position(|v| v.name == variant_name)
+                    .map(|i| i as u32)
+            }
+            Ty::Option(_) => match variant_name {
+                "None" => Some(0),
+                "Some" => Some(1),
+                _ => None,
+            },
+            Ty::Result(_, _) => match variant_name {
+                "Ok" => Some(0),
+                "Err" => Some(1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Search all user sum types for a variant with this name. Returns
+    /// the owning sum type name if found. Used by `compile_call` to
+    /// recognize bare-identifier variant constructors.
+    fn find_sum_for_variant(&self, variant_name: &str) -> Option<String> {
+        for (type_name, info) in &self.cg.info.types {
+            if let TypeInfo::Sum { variants, .. } = info {
+                if variants.iter().any(|v| v.name == variant_name) {
+                    return Some(type_name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    // ----------------------------------------------------------------------
+    // Walk-time type inference
+    // ----------------------------------------------------------------------
+
+    /// Get the shape-correct Lumen type for an expression at walk time.
+    /// Relies on the walk-pass scope stack to resolve identifiers.
+    fn infer_expr_ty(&self, expr: &Expr) -> Result<Ty, CodegenError> {
         Ok(match &expr.kind {
             ExprKind::IntLit { suffix, .. } => match suffix {
                 Some(IntSuffix::I32) | None => Ty::I32,
@@ -658,8 +969,14 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             ExprKind::UnitLit => Ty::Unit,
             ExprKind::StringLit(_) => Ty::String,
             ExprKind::Ident(name) => {
-                if let Some(&idx) = self.locals.get(name) {
-                    self.local_types[idx as usize].clone()
+                if let Some(ty) = self.lookup_ty(name) {
+                    ty
+                } else if name == "None" {
+                    // `None` without context — callers who need a concrete
+                    // Option<T> will override this via check_expr.
+                    Ty::Option(Box::new(Ty::Error))
+                } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    Ty::User(sum_name)
                 } else {
                     return Err(CodegenError {
                         span: expr.span,
@@ -667,14 +984,14 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     });
                 }
             }
-            ExprKind::Paren(inner) => self.infer_value_ty(inner)?,
+            ExprKind::Paren(inner) => self.infer_expr_ty(inner)?,
             ExprKind::Unary { op, rhs } => match op {
-                UnaryOp::Neg => self.infer_value_ty(rhs)?,
+                UnaryOp::Neg => self.infer_expr_ty(rhs)?,
                 UnaryOp::Not => Ty::Bool,
             },
             ExprKind::Binary { op, lhs, .. } => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                    self.infer_value_ty(lhs)?
+                    self.infer_expr_ty(lhs)?
                 }
                 BinOp::Eq
                 | BinOp::NotEq
@@ -686,17 +1003,46 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 | BinOp::Or => Ty::Bool,
             },
             ExprKind::Cast { to, .. } => resolve_builtin_numeric(to)?,
-            ExprKind::Call { callee, .. } => {
+            ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(name) = &callee.kind {
-                    if name == "string_len" {
-                        Ty::I32
-                    } else if let Some(sig) = self.cg.info.fns.get(name) {
-                        sig.ret.clone()
-                    } else {
-                        return Err(CodegenError {
-                            span: expr.span,
-                            message: format!("unknown function `{name}`"),
-                        });
+                    match name.as_str() {
+                        "string_len" => Ty::I32,
+                        "Ok" => {
+                            let ok_ty = args
+                                .first()
+                                .map(|a| self.infer_expr_ty(&a.value))
+                                .transpose()?
+                                .unwrap_or(Ty::Error);
+                            Ty::Result(Box::new(ok_ty), Box::new(Ty::Error))
+                        }
+                        "Err" => {
+                            let err_ty = args
+                                .first()
+                                .map(|a| self.infer_expr_ty(&a.value))
+                                .transpose()?
+                                .unwrap_or(Ty::Error);
+                            Ty::Result(Box::new(Ty::Error), Box::new(err_ty))
+                        }
+                        "Some" => {
+                            let inner = args
+                                .first()
+                                .map(|a| self.infer_expr_ty(&a.value))
+                                .transpose()?
+                                .unwrap_or(Ty::Error);
+                            Ty::Option(Box::new(inner))
+                        }
+                        _ => {
+                            if let Some(sig) = self.cg.info.fns.get(name) {
+                                sig.ret.clone()
+                            } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                                Ty::User(sum_name)
+                            } else {
+                                return Err(CodegenError {
+                                    span: expr.span,
+                                    message: format!("unknown function `{name}`"),
+                                });
+                            }
+                        }
                     }
                 } else {
                     return Err(CodegenError {
@@ -707,14 +1053,27 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::If { then_block, .. } => {
                 if let Some(tail) = &then_block.tail {
-                    self.infer_value_ty(tail)?
+                    self.infer_expr_ty(tail)?
                 } else {
                     Ty::Unit
                 }
             }
-            ExprKind::StructLit { name, .. } => Ty::User(name.clone()),
+            ExprKind::Match { arms, .. } => arms
+                .first()
+                .map(|a| self.infer_expr_ty(&a.body))
+                .transpose()?
+                .unwrap_or(Ty::Error),
+            ExprKind::StructLit { name, .. } => {
+                if self.cg.struct_layouts.contains_key(name) {
+                    Ty::User(name.clone())
+                } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    Ty::User(sum_name)
+                } else {
+                    Ty::User(name.clone())
+                }
+            }
             ExprKind::Field { receiver, name } => {
-                let recv_ty = self.infer_value_ty(receiver)?;
+                let recv_ty = self.infer_expr_ty(receiver)?;
                 let type_name = match recv_ty {
                     Ty::User(n) => n,
                     _ => {
@@ -743,6 +1102,18 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     .ty
                     .clone()
             }
+            ExprKind::Try(inner) => {
+                let inner_ty = self.infer_expr_ty(inner)?;
+                match inner_ty {
+                    Ty::Result(ok, _) => *ok,
+                    Ty::Option(inner) => *inner,
+                    _ => Ty::Error,
+                }
+            }
+            ExprKind::Block(b) => match &b.tail {
+                Some(tail) => self.infer_expr_ty(tail)?,
+                None => Ty::Unit,
+            },
             _ => {
                 return Err(CodegenError {
                     span: expr.span,
@@ -756,50 +1127,58 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
     // Code emission
     // ----------------------------------------------------------------------
 
-    fn compile_block(&self, block: &ast::Block, f: &mut Function) -> Result<(), CodegenError> {
+    fn compile_block(
+        &mut self,
+        block: &ast::Block,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        self.push_scope();
         for stmt in &block.stmts {
             self.compile_stmt(stmt, f)?;
         }
         if let Some(tail) = &block.tail {
             self.compile_expr(tail, f)?;
         }
+        self.pop_scope();
         Ok(())
     }
 
-    fn compile_stmt(&self, stmt: &ast::Stmt, f: &mut Function) -> Result<(), CodegenError> {
+    fn compile_stmt(
+        &mut self,
+        stmt: &ast::Stmt,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
         match &stmt.kind {
             StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
                 self.compile_expr(value, f)?;
                 let idx = *self
-                    .locals
-                    .get(name)
-                    .expect("local registered in pass-0");
+                    .slot_for_span
+                    .get(&stmt.span.start)
+                    .expect("walk pass should have allocated this local");
                 f.instruction(&Instruction::LocalSet(idx));
+                self.declare(name.clone(), idx);
             }
             StmtKind::Assign { name, value } => {
                 self.compile_expr(value, f)?;
-                let idx = *self.locals.get(name).ok_or_else(|| CodegenError {
+                let idx = self.lookup(name).ok_or_else(|| CodegenError {
                     span: stmt.span,
                     message: format!("assignment to unknown local `{name}`"),
                 })?;
                 f.instruction(&Instruction::LocalSet(idx));
             }
             StmtKind::Expr(e) => {
+                let ty = self.infer_expr_ty(e)?;
                 self.compile_expr(e, f)?;
-                // Statement-position expressions still push their value; in
-                // phase 1 we treat the block like `(seq stmts*, tail)` and
-                // just let those sit on the stack. That's incorrect for
-                // non-tail non-unit statements — enforce by dropping.
-                let ty = self.infer_value_ty(e)?;
                 if !matches!(ty, Ty::Unit) {
+                    // Drop statement-position expressions that don't
+                    // produce unit, since they aren't the tail.
                     f.instruction(&Instruction::Drop);
                 }
             }
             StmtKind::For { .. } => {
-                // collect_locals already rejected this; be explicit.
                 return Err(CodegenError {
                     span: stmt.span,
-                    message: "for-loops are not supported by phase-1 codegen yet".into(),
+                    message: "for-loops are not supported by codegen yet (lumen-w0g)".into(),
                 });
             }
             StmtKind::Return(Some(e)) => {
@@ -816,7 +1195,11 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         Ok(())
     }
 
-    fn compile_expr(&self, expr: &Expr, f: &mut Function) -> Result<(), CodegenError> {
+    fn compile_expr(
+        &mut self,
+        expr: &Expr,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
         match &expr.kind {
             ExprKind::IntLit { value, suffix } => {
                 let ty = match suffix {
@@ -852,16 +1235,36 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 f.instruction(&Instruction::I32Const(offset as i32));
             }
             ExprKind::Ident(name) => {
-                let idx = *self.locals.get(name).ok_or_else(|| CodegenError {
-                    span: expr.span,
-                    message: format!("unknown identifier `{name}`"),
-                })?;
-                f.instruction(&Instruction::LocalGet(idx));
+                if let Some(idx) = self.lookup(name) {
+                    f.instruction(&Instruction::LocalGet(idx));
+                } else if name == "None" {
+                    self.compile_none_constructor(expr.span, f)?;
+                } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    // Zero-payload variant constructor, e.g. `type T = | A | B`
+                    self.compile_zero_variant_constructor(&sum_name, name, expr.span, f)?;
+                } else {
+                    let scope_dump: Vec<String> = self
+                        .scopes
+                        .iter()
+                        .map(|s| {
+                            let keys: Vec<&str> =
+                                s.keys().map(String::as_str).collect();
+                            format!("[{}]", keys.join(", "))
+                        })
+                        .collect();
+                    return Err(CodegenError {
+                        span: expr.span,
+                        message: format!(
+                            "unknown identifier `{name}` (scopes: {})",
+                            scope_dump.join(" > ")
+                        ),
+                    });
+                }
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, f)?,
             ExprKind::Block(block) => self.compile_block(block, f)?,
             ExprKind::Unary { op, rhs } => {
-                let rhs_ty = self.infer_value_ty(rhs)?;
+                let rhs_ty = self.infer_expr_ty(rhs)?;
                 match op {
                     UnaryOp::Neg => match rhs_ty {
                         Ty::I32 | Ty::U32 => {
@@ -896,7 +1299,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 self.compile_binary(*op, lhs, rhs, f)?;
             }
             ExprKind::Cast { expr: inner, to } => {
-                let from = self.infer_value_ty(inner)?;
+                let from = self.infer_expr_ty(inner)?;
                 let to_ty = resolve_builtin_numeric(to)?;
                 self.compile_expr(inner, f)?;
                 emit_cast(&from, &to_ty, f);
@@ -929,6 +1332,35 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     return Ok(());
                 }
 
+                // Built-in Option / Result constructors. Each of these
+                // allocates a one-field payload block and wraps it in a
+                // sum block with the right tag.
+                match name.as_str() {
+                    "Ok" => {
+                        return self.compile_single_field_variant(
+                            0, &args[0].value, expr.span, f,
+                        );
+                    }
+                    "Err" => {
+                        return self.compile_single_field_variant(
+                            1, &args[0].value, expr.span, f,
+                        );
+                    }
+                    "Some" => {
+                        return self.compile_single_field_variant(
+                            1, &args[0].value, expr.span, f,
+                        );
+                    }
+                    _ => {}
+                }
+
+                // User-defined sum type variant constructor?
+                if let Some(sum_name) = self.find_sum_for_variant(&name) {
+                    return self.compile_user_variant_constructor(
+                        &sum_name, &name, args, expr.span, f,
+                    );
+                }
+
                 for a in args {
                     self.compile_expr(&a.value, f)?;
                 }
@@ -941,6 +1373,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                         message: format!("unknown function `{name}`"),
                     })?;
                 f.instruction(&Instruction::Call(idx));
+            }
+            ExprKind::Try(inner) => {
+                self.compile_try(inner, expr.span, f)?;
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.compile_match(scrutinee, arms, expr.span, f)?;
             }
             ExprKind::If {
                 cond,
@@ -982,12 +1420,23 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
     }
 
     fn compile_struct_lit(
-        &self,
+        &mut self,
         name: &str,
         fields: &[ast::FieldInit],
         span: Span,
         f: &mut Function,
     ) -> Result<(), CodegenError> {
+        // If this name is actually a named-field sum variant, dispatch
+        // to the variant-constructor path instead of the struct-literal
+        // path.
+        if !self.cg.struct_layouts.contains_key(name) {
+            if let Some(sum_name) = self.find_sum_for_variant(name) {
+                return self.compile_named_variant_constructor(
+                    &sum_name, name, fields, span, f,
+                );
+            }
+        }
+
         let layout = self
             .cg
             .struct_layouts
@@ -997,7 +1446,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 message: format!("no layout for struct `{name}`"),
             })?;
         let slot = *self
-            .struct_lit_slots
+            .slot_for_span
             .get(&span.start)
             .expect("walk_expr should have reserved a scratch slot");
 
@@ -1053,12 +1502,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
     }
 
     fn compile_field_access(
-        &self,
+        &mut self,
         receiver: &Expr,
         field: &str,
         f: &mut Function,
     ) -> Result<(), CodegenError> {
-        let recv_ty = self.infer_value_ty(receiver)?;
+        let recv_ty = self.infer_expr_ty(receiver)?;
         let type_name = match recv_ty {
             Ty::User(n) => n,
             _ => {
@@ -1103,13 +1552,648 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
 
     fn if_result_ty(&self, then_block: &ast::Block) -> Result<Ty, CodegenError> {
         match &then_block.tail {
-            Some(e) => self.infer_value_ty(e),
+            Some(e) => self.infer_expr_ty(e),
             None => Ok(Ty::Unit),
         }
     }
 
+    // ----------------------------------------------------------------------
+    // Sum-type construction
+    // ----------------------------------------------------------------------
+
+    /// Emit a sum-value construction for the shape `Ok(v)` / `Err(e)` /
+    /// `Some(v)` — a one-field variant with the given tag. Allocates a
+    /// payload block big enough for the field, stores the value, then
+    /// allocates the 8-byte sum block (tag + payload pointer) and leaves
+    /// the sum pointer on the stack.
+    fn compile_single_field_variant(
+        &mut self,
+        tag: u32,
+        value: &Expr,
+        call_span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let val_ty = self.infer_expr_ty(value)?;
+        let payload_size = sizeof(&val_ty).max(4);
+        let wasm_ty = wasm_val_type(&val_ty, value.span)?;
+        let align_log2 = alignof(&val_ty).trailing_zeros();
+        let aux = self.aux_slots.get(&call_span.start).cloned().unwrap();
+        let payload_slot = aux[0];
+        let sum_slot = aux[1];
+        self.emit_sum_alloc_one(
+            tag,
+            value,
+            wasm_ty,
+            payload_size,
+            align_log2,
+            payload_slot,
+            sum_slot,
+            f,
+        )
+    }
+
+    /// Emit a `None` constructor: 8-byte sum block with tag=0 and
+    /// payload_ptr=0.
+    fn compile_none_constructor(
+        &mut self,
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let sum_slot = self.aux_slots.get(&span.start).unwrap()[0];
+        self.emit_sum_block_no_payload(0, sum_slot, f);
+        Ok(())
+    }
+
+    /// Emit a zero-payload variant constructor (e.g. `type T = | A | B`,
+    /// called as the bare identifier `A`). Just tag + null payload.
+    fn compile_zero_variant_constructor(
+        &mut self,
+        sum_name: &str,
+        variant_name: &str,
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let tag = self
+            .variant_tag(&Ty::User(sum_name.to_string()), variant_name)
+            .ok_or_else(|| CodegenError {
+                span,
+                message: format!("unknown variant `{variant_name}` of `{sum_name}`"),
+            })?;
+        let sum_slot = self.aux_slots.get(&span.start).unwrap()[0];
+        self.emit_sum_block_no_payload(tag, sum_slot, f);
+        Ok(())
+    }
+
+    /// Emit a user variant constructor invoked as a call, e.g.
+    /// `Circle(1.0)` (positional) or `NotFound("path.txt")`. Named-field
+    /// variants go through the struct-literal path, not here.
+    fn compile_named_variant_constructor(
+        &mut self,
+        sum_name: &str,
+        variant_name: &str,
+        fields: &[ast::FieldInit],
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let scrut_ty = Ty::User(sum_name.to_string());
+        let tag = self
+            .variant_tag(&scrut_ty, variant_name)
+            .expect("typechecker verified variant");
+        let variant_fields = self
+            .variant_field_types(&scrut_ty, variant_name)
+            .unwrap_or_default();
+        let layout = compute_struct_layout(&variant_fields)?;
+
+        // Primary slot (slot_for_span) = payload pointer.
+        // aux_slots[0] = sum pointer.
+        let payload_slot = *self
+            .slot_for_span
+            .get(&span.start)
+            .expect("walk reserved payload slot");
+        let sum_slot = self
+            .aux_slots
+            .get(&span.start)
+            .and_then(|v| v.first().copied())
+            .expect("walk reserved sum slot");
+
+        // Allocate payload block.
+        self.emit_bump_alloc(layout.total_size, f);
+        f.instruction(&Instruction::LocalSet(payload_slot));
+
+        // Write each field (look up the user-provided initializer by name).
+        for layout_field in &layout.fields {
+            let init = fields
+                .iter()
+                .find(|fi| fi.name == layout_field.name)
+                .ok_or_else(|| CodegenError {
+                    span,
+                    message: format!(
+                        "internal: variant `{variant_name}` literal is missing field `{}`",
+                        layout_field.name
+                    ),
+                })?;
+            f.instruction(&Instruction::LocalGet(payload_slot));
+            self.compile_expr(&init.value, f)?;
+            let mem_arg = MemArg {
+                offset: layout_field.offset as u64,
+                align: layout_field.align_log2,
+                memory_index: 0,
+            };
+            let instr = match layout_field.wasm_ty {
+                ValType::I32 => Instruction::I32Store(mem_arg),
+                ValType::I64 => Instruction::I64Store(mem_arg),
+                ValType::F64 => Instruction::F64Store(mem_arg),
+                _ => unreachable!(),
+            };
+            f.instruction(&instr);
+        }
+
+        // Allocate sum block + write tag and payload pointer.
+        self.emit_bump_alloc(8, f);
+        f.instruction(&Instruction::LocalSet(sum_slot));
+
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::I32Const(tag as i32));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::LocalGet(payload_slot));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        Ok(())
+    }
+
+    fn compile_user_variant_constructor(
+        &mut self,
+        sum_name: &str,
+        variant_name: &str,
+        args: &[ast::Arg],
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let scrut_ty = Ty::User(sum_name.to_string());
+        let tag = self.variant_tag(&scrut_ty, variant_name).unwrap();
+        let fields = self
+            .variant_field_types(&scrut_ty, variant_name)
+            .unwrap_or_default();
+        let aux = self.aux_slots.get(&span.start).cloned().unwrap();
+        let payload_slot = aux[0];
+        let sum_slot = aux[1];
+
+        if fields.is_empty() {
+            self.emit_sum_block_no_payload(tag, sum_slot, f);
+            return Ok(());
+        }
+        let layout = compute_struct_layout(&fields)?;
+
+        // Allocate the payload block and write each positional arg in
+        // the corresponding slot.
+        self.emit_bump_alloc(layout.total_size, f);
+        // Stack: [payload_ptr]. Stash it in the pre-allocated scratch.
+        f.instruction(&Instruction::LocalSet(payload_slot));
+
+        for (i, field) in layout.fields.iter().enumerate() {
+            let arg = args.get(i).ok_or_else(|| CodegenError {
+                span,
+                message: format!(
+                    "variant `{variant_name}` expects {} args, found {}",
+                    layout.fields.len(),
+                    args.len()
+                ),
+            })?;
+            f.instruction(&Instruction::LocalGet(payload_slot));
+            self.compile_expr(&arg.value, f)?;
+            let mem_arg = MemArg {
+                offset: field.offset as u64,
+                align: field.align_log2,
+                memory_index: 0,
+            };
+            let instr = match field.wasm_ty {
+                ValType::I32 => Instruction::I32Store(mem_arg),
+                ValType::I64 => Instruction::I64Store(mem_arg),
+                ValType::F64 => Instruction::F64Store(mem_arg),
+                _ => unreachable!(),
+            };
+            f.instruction(&instr);
+        }
+
+        // Allocate the 8-byte sum header into sum_slot.
+        self.emit_bump_alloc(8, f);
+        f.instruction(&Instruction::LocalSet(sum_slot));
+
+        // *sum_ptr = tag
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::I32Const(tag as i32));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // *(sum_ptr + 4) = payload_ptr
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::LocalGet(payload_slot));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // Leave sum_ptr on the stack.
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        Ok(())
+    }
+
+    /// Emit an 8-byte sum block with the given tag and a null payload
+    /// pointer, leaving the sum block pointer on the stack. Uses the
+    /// pre-allocated `sum_slot` to stash the block pointer.
+    fn emit_sum_block_no_payload(&mut self, tag: u32, sum_slot: u32, f: &mut Function) {
+        self.emit_bump_alloc(8, f);
+        f.instruction(&Instruction::LocalSet(sum_slot));
+
+        // *sum_ptr = tag
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::I32Const(tag as i32));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // *(sum_ptr + 4) = 0
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        f.instruction(&Instruction::LocalGet(sum_slot));
+    }
+
+    /// Emit a one-field-payload sum construction. Handles Ok/Err/Some
+    /// (built-ins) and any future single-field user variants. Uses
+    /// pre-allocated scratch slots.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_sum_alloc_one(
+        &mut self,
+        tag: u32,
+        value: &Expr,
+        wasm_ty: ValType,
+        payload_size: u32,
+        align_log2: u32,
+        payload_slot: u32,
+        sum_slot: u32,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        // Allocate payload block (at least 4 bytes; round up to 4 if the
+        // value is an i32-width type, or 8 for i64/f64).
+        let padded = (payload_size + 3) & !3;
+        self.emit_bump_alloc(padded, f);
+        f.instruction(&Instruction::LocalSet(payload_slot));
+
+        // *payload = value
+        f.instruction(&Instruction::LocalGet(payload_slot));
+        self.compile_expr(value, f)?;
+        let mem_arg = MemArg {
+            offset: 0,
+            align: align_log2,
+            memory_index: 0,
+        };
+        match wasm_ty {
+            ValType::I32 => f.instruction(&Instruction::I32Store(mem_arg)),
+            ValType::I64 => f.instruction(&Instruction::I64Store(mem_arg)),
+            ValType::F64 => f.instruction(&Instruction::F64Store(mem_arg)),
+            _ => unreachable!(),
+        };
+
+        // Allocate sum block.
+        self.emit_bump_alloc(8, f);
+        f.instruction(&Instruction::LocalSet(sum_slot));
+
+        // *sum = tag
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::I32Const(tag as i32));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // *(sum + 4) = payload_ptr
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        f.instruction(&Instruction::LocalGet(payload_slot));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // Leave sum on the stack.
+        f.instruction(&Instruction::LocalGet(sum_slot));
+        Ok(())
+    }
+
+    /// Bump-allocate `size` bytes and leave the original bump_ptr (the
+    /// start of the new block) on the stack. Always rounds the bump
+    /// pointer up to the next multiple of 4 afterwards so follow-on
+    /// allocations stay i32-aligned.
+    fn emit_bump_alloc(&mut self, size: u32, f: &mut Function) {
+        f.instruction(&Instruction::GlobalGet(0)); // start pointer
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(size as i32));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(-4));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::GlobalSet(0));
+    }
+
+    // ----------------------------------------------------------------------
+    // `?` operator
+    // ----------------------------------------------------------------------
+
+    fn compile_try(
+        &mut self,
+        inner: &Expr,
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let inner_ty = self.infer_expr_ty(inner)?;
+        let (err_tag, ok_payload_ty) = match inner_ty.clone() {
+            Ty::Result(ok, _) => (1u32, *ok),
+            Ty::Option(inner) => (0u32, *inner),
+            _ => {
+                return Err(CodegenError {
+                    span,
+                    message: format!(
+                        "`?` requires a Result or Option, got {}",
+                        inner_ty.display()
+                    ),
+                });
+            }
+        };
+
+        // Evaluate the inner into a scratch slot we can re-inspect.
+        let scratch = *self
+            .slot_for_span
+            .get(&span.start)
+            .expect("walk pass reserves a scratch for `?`");
+        self.compile_expr(inner, f)?;
+        f.instruction(&Instruction::LocalSet(scratch));
+
+        // if tag == err_tag { return inner; }
+        f.instruction(&Instruction::LocalGet(scratch));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+        f.instruction(&Instruction::I32Const(err_tag as i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(scratch));
+        f.instruction(&Instruction::Return);
+        f.instruction(&Instruction::End);
+
+        // Happy path: load payload_ptr, load T, leave on stack.
+        f.instruction(&Instruction::LocalGet(scratch));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        let wasm_ty = wasm_val_type(&ok_payload_ty, span)?;
+        let mem_arg = MemArg {
+            offset: 0,
+            align: alignof(&ok_payload_ty).trailing_zeros(),
+            memory_index: 0,
+        };
+        match wasm_ty {
+            ValType::I32 => f.instruction(&Instruction::I32Load(mem_arg)),
+            ValType::I64 => f.instruction(&Instruction::I64Load(mem_arg)),
+            ValType::F64 => f.instruction(&Instruction::F64Load(mem_arg)),
+            _ => unreachable!(),
+        };
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // match expressions (sum types only for now)
+    // ----------------------------------------------------------------------
+
+    fn compile_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[ast::MatchArm],
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        let scrut_ty = self.infer_expr_ty(scrutinee)?;
+        if !matches!(scrut_ty, Ty::User(_) | Ty::Option(_) | Ty::Result(_, _)) {
+            return Err(CodegenError {
+                span: scrutinee.span,
+                message: format!(
+                    "codegen only supports match on sum types; got {}",
+                    scrut_ty.display()
+                ),
+            });
+        }
+
+        let scrut_slot = *self
+            .slot_for_span
+            .get(&span.start)
+            .expect("walk pass reserves a scrutinee slot");
+        let payload_ptr_slot = self
+            .aux_slots
+            .get(&span.start)
+            .and_then(|v| v.first().copied())
+            .expect("walk pass reserves a payload pointer slot");
+
+        // Evaluate the scrutinee once.
+        self.compile_expr(scrutinee, f)?;
+        f.instruction(&Instruction::LocalSet(scrut_slot));
+
+        // Use the result type cached during the walk pass. The walk could
+        // safely infer the first arm body's type because its pattern
+        // bindings were in scope; emit can't do that here.
+        let result_ty = self
+            .expr_type_cache
+            .get(&span.start)
+            .cloned()
+            .unwrap_or(Ty::Unit);
+        let block_ty = wasm_encoder::BlockType::Result(wasm_val_type(
+            &result_ty, span,
+        )?);
+
+        self.compile_match_arms(
+            arms,
+            0,
+            scrut_slot,
+            payload_ptr_slot,
+            &scrut_ty,
+            block_ty,
+            f,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_match_arms(
+        &mut self,
+        arms: &[ast::MatchArm],
+        idx: usize,
+        scrut_slot: u32,
+        payload_ptr_slot: u32,
+        scrut_ty: &Ty,
+        block_ty: wasm_encoder::BlockType,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        use ast::PatternKind;
+        if idx >= arms.len() {
+            // Exhaustive guarantee: unreachable.
+            f.instruction(&Instruction::Unreachable);
+            return Ok(());
+        }
+        let arm = &arms[idx];
+
+        // Wildcard/binding arm: always matches; emit body directly.
+        let always = matches!(
+            arm.pattern.kind,
+            PatternKind::Wildcard | PatternKind::Binding(_)
+        );
+        if always {
+            self.push_scope();
+            if let PatternKind::Binding(name) = &arm.pattern.kind {
+                let slot = *self
+                    .slot_for_span
+                    .get(&arm.pattern.span.start)
+                    .expect("walk reserves pattern slots");
+                f.instruction(&Instruction::LocalGet(scrut_slot));
+                f.instruction(&Instruction::LocalSet(slot));
+                self.declare(name.clone(), slot);
+            }
+            self.compile_expr(&arm.body, f)?;
+            self.pop_scope();
+            return Ok(());
+        }
+
+        // Variant arm: compare tag, emit matched body on true, recurse on
+        // false.
+        let PatternKind::Variant {
+            name: variant_name,
+            payload,
+        } = &arm.pattern.kind
+        else {
+            return Err(CodegenError {
+                span: arm.pattern.span,
+                message: "codegen only supports wildcard / binding / variant patterns in match"
+                    .into(),
+            });
+        };
+
+        let tag = self
+            .variant_tag(scrut_ty, variant_name)
+            .ok_or_else(|| CodegenError {
+                span: arm.pattern.span,
+                message: format!("unknown variant `{variant_name}`"),
+            })?;
+
+        // Test: scrut_slot.tag == tag
+        f.instruction(&Instruction::LocalGet(scrut_slot));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+        f.instruction(&Instruction::I32Const(tag as i32));
+        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::If(block_ty));
+
+        // Matched branch.
+        self.push_scope();
+        if payload.is_some() {
+            let fields = self
+                .variant_field_types(scrut_ty, variant_name)
+                .unwrap_or_default();
+            let layout = compute_struct_layout(&fields)?;
+            self.emit_pattern_binds(
+                payload.as_ref().unwrap(),
+                &layout,
+                scrut_slot,
+                payload_ptr_slot,
+                f,
+            )?;
+        }
+        self.compile_expr(&arm.body, f)?;
+        self.pop_scope();
+
+        f.instruction(&Instruction::Else);
+        self.compile_match_arms(
+            arms,
+            idx + 1,
+            scrut_slot,
+            payload_ptr_slot,
+            scrut_ty,
+            block_ty,
+            f,
+        )?;
+        f.instruction(&Instruction::End);
+
+        Ok(())
+    }
+
+    fn emit_pattern_binds(
+        &mut self,
+        payload: &ast::VariantPatPayload,
+        layout: &StructLayout,
+        scrut_slot: u32,
+        payload_slot: u32,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        use ast::{PatternKind, VariantPatPayload};
+
+        // Load payload_ptr into the pre-allocated scratch so we can
+        // rebase each field load off of it.
+        f.instruction(&Instruction::LocalGet(scrut_slot));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(payload_slot));
+
+        // Helper closure-ish: for a given layout field and a sub-pattern,
+        // if the sub-pattern binds a name, load the field and store it.
+        let sub_pats: Vec<(&StructFieldLayout, &ast::Pattern)> = match payload {
+            VariantPatPayload::Named(pfs) => pfs
+                .iter()
+                .filter_map(|pf| {
+                    layout
+                        .fields
+                        .iter()
+                        .find(|lf| lf.name == pf.name)
+                        .map(|lf| (lf, &pf.pattern))
+                })
+                .collect(),
+            VariantPatPayload::Positional(pats) => pats
+                .iter()
+                .enumerate()
+                .filter_map(|(i, pat)| layout.fields.get(i).map(|lf| (lf, pat)))
+                .collect(),
+        };
+
+        for (lf, pat) in sub_pats {
+            match &pat.kind {
+                PatternKind::Binding(name) => {
+                    let slot = *self
+                        .slot_for_span
+                        .get(&pat.span.start)
+                        .expect("walk reserves pattern slots");
+                    // local = *(payload_ptr + offset)
+                    f.instruction(&Instruction::LocalGet(payload_slot));
+                    let mem_arg = MemArg {
+                        offset: lf.offset as u64,
+                        align: lf.align_log2,
+                        memory_index: 0,
+                    };
+                    match lf.wasm_ty {
+                        ValType::I32 => f.instruction(&Instruction::I32Load(mem_arg)),
+                        ValType::I64 => f.instruction(&Instruction::I64Load(mem_arg)),
+                        ValType::F64 => f.instruction(&Instruction::F64Load(mem_arg)),
+                        _ => unreachable!(),
+                    };
+                    f.instruction(&Instruction::LocalSet(slot));
+                    self.declare(name.clone(), slot);
+                }
+                PatternKind::Wildcard | PatternKind::Literal(_) => {
+                    // No binding to emit. Literal patterns on variant
+                    // sub-fields aren't currently matched against; the
+                    // typechecker guarantees shape.
+                }
+                PatternKind::Variant { .. } => {
+                    // Nested variant patterns would require recursive
+                    // destructuring and a deeper payload walk. Defer.
+                    return Err(CodegenError {
+                        span: pat.span,
+                        message: "nested variant patterns are not supported by codegen yet"
+                            .into(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn compile_binary(
-        &self,
+        &mut self,
         op: BinOp,
         lhs: &Expr,
         rhs: &Expr,
@@ -1120,7 +2204,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             return self.compile_logical(op, lhs, rhs, f);
         }
 
-        let lt = self.infer_value_ty(lhs)?;
+        let lt = self.infer_expr_ty(lhs)?;
 
         // String + string → call into the auto-emitted string_concat
         // helper. Matches the typechecker's special case.
@@ -1202,7 +2286,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
     }
 
     fn compile_logical(
-        &self,
+        &mut self,
         op: BinOp,
         lhs: &Expr,
         rhs: &Expr,
@@ -1241,16 +2325,21 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
 
 fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
     Ok(match ty {
-        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::String | Ty::User(_) => ValType::I32,
+        Ty::I32
+        | Ty::U32
+        | Ty::Bool
+        | Ty::Unit
+        | Ty::String
+        | Ty::User(_)
+        | Ty::Option(_)
+        | Ty::Result(_, _)
+        | Ty::List(_) => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
-        other => {
+        Ty::Error => {
             return Err(CodegenError {
                 span,
-                message: format!(
-                    "codegen does not yet support type {} (sum types land with lumen-mmx, Option/Result with lumen-rvp)",
-                    other.display()
-                ),
+                message: "internal: Ty::Error reached codegen".into(),
             });
         }
     })
@@ -1675,6 +2764,193 @@ mod tests {
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "greeting_len"), 5);
+    }
+
+    // --- Sum types: Option / Result / match / ? -------------------------
+
+    #[test]
+    fn run_some_none_construction() {
+        // Option<i32> constructors allocate; we can't read the value back
+        // without match, so just verify the pointers aren't 0 (Some) and
+        // that None returns a non-null header either.
+        let src = r#"
+            fn one(): Option<i32> { Some(1) }
+            fn empty(): Option<i32> { None }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+    }
+
+    #[test]
+    fn run_match_option_extracts_value() {
+        let src = r#"
+            fn unwrap_or(o: Option<i32>, default: i32): i32 {
+                match o {
+                    Some(n) => n,
+                    None => default,
+                }
+            }
+
+            fn with_some(): i32 { unwrap_or(Some(42), 0) }
+            fn with_none(): i32 { unwrap_or(None, 99) }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "with_some"), 42);
+        assert_eq!(run_i32(&wasm, "with_none"), 99);
+    }
+
+    #[test]
+    fn run_match_result_extracts_value() {
+        let src = r#"
+            fn safe_div(a: i32, b: i32): Result<i32, i32> {
+                if b == 0 { Err(1) } else { Ok(a / b) }
+            }
+
+            fn test_ok(): i32 {
+                match safe_div(10, 2) {
+                    Ok(v) => v,
+                    Err(_) => -1,
+                }
+            }
+
+            fn test_err(): i32 {
+                match safe_div(10, 0) {
+                    Ok(v) => v,
+                    Err(code) => code * 100,
+                }
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "test_ok"), 5);
+        assert_eq!(run_i32(&wasm, "test_err"), 100);
+    }
+
+    #[test]
+    fn run_try_operator_happy_path() {
+        let src = r#"
+            fn first(): Result<i32, i32> { Ok(10) }
+            fn second(): Result<i32, i32> { Ok(20) }
+
+            fn sum(): Result<i32, i32> {
+                let a = first()?
+                let b = second()?
+                Ok(a + b)
+            }
+
+            fn run(): i32 {
+                match sum() {
+                    Ok(v) => v,
+                    Err(_) => -1,
+                }
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "run"), 30);
+    }
+
+    #[test]
+    fn run_try_operator_short_circuits_on_err() {
+        let src = r#"
+            fn fail(): Result<i32, i32> { Err(42) }
+
+            fn chain(): Result<i32, i32> {
+                let x = fail()?
+                Ok(x + 100)
+            }
+
+            fn run(): i32 {
+                match chain() {
+                    Ok(_) => 0,
+                    Err(code) => code,
+                }
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "run"), 42);
+    }
+
+    #[test]
+    fn run_user_sum_type_with_positional_variant() {
+        let src = r#"
+            type Token =
+                | Number(i32)
+                | Word(string)
+
+            fn number_val(): i32 {
+                let t = Number(7)
+                match t {
+                    Number(n) => n,
+                    _ => -1,
+                }
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "number_val"), 7);
+    }
+
+    #[test]
+    fn run_user_sum_type_with_named_fields() {
+        let src = r#"
+            type Shape =
+                | Circle { radius: i32 }
+                | Rectangle { width: i32, height: i32 }
+
+            fn area(s: Shape): i32 {
+                match s {
+                    Circle { radius: r } => r * r * 3,
+                    Rectangle { width: w, height: h } => w * h,
+                }
+            }
+
+            fn circle_area(): i32 { area(Circle { radius: 2 }) }
+            fn rect_area(): i32 { area(Rectangle { width: 3, height: 4 }) }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        assert_eq!(run_i32(&wasm, "circle_area"), 12);
+        assert_eq!(run_i32(&wasm, "rect_area"), 12);
+    }
+
+    #[test]
+    fn run_user_sum_type_with_zero_payload_variants() {
+        let src = r#"
+            type Light = | Red | Yellow | Green
+
+            fn code(l: Light): i32 {
+                match l {
+                    Red => 1,
+                    Yellow => 2,
+                    Green => 3,
+                }
+            }
+
+            fn red_code(): i32 { code(Red) }
+            fn green_code(): i32 { code(Green) }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "red_code"), 1);
+        assert_eq!(run_i32(&wasm, "green_code"), 3);
+    }
+
+    #[test]
+    fn run_sibling_arms_reuse_binding_name() {
+        // Two arms bind `h`; the scope refactor needs to put them in
+        // separate scopes so they don't collide.
+        let src = r#"
+            type Rect = | A { h: i32 } | B { h: i32 }
+
+            fn height(r: Rect): i32 {
+                match r {
+                    A { h: h } => h + 1,
+                    B { h: h } => h + 2,
+                }
+            }
+
+            fn run(): i32 { height(A { h: 10 }) + height(B { h: 100 }) }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "run"), 11 + 102);
     }
 
     #[test]

@@ -578,6 +578,20 @@ impl<'a> FnChecker<'a> {
                     // we can't infer T here. If called in a check context,
                     // `check_expr` will accept it against an Option<T>.
                     Ty::Option(Box::new(Ty::Error))
+                } else if let Some((ty_name, variant)) = self.find_variant(name) {
+                    // Bare zero-payload variant constructor, e.g.
+                    // `type T = | A | B` called as `A`.
+                    if variant.payload.is_none() {
+                        Ty::User(ty_name)
+                    } else {
+                        self.errors.push(TypeError {
+                            span: expr.span,
+                            message: format!(
+                                "variant `{name}` has a payload; call it with arguments"
+                            ),
+                        });
+                        Ty::Error
+                    }
                 } else {
                     self.errors.push(TypeError {
                         span: expr.span,
@@ -797,24 +811,63 @@ impl<'a> FnChecker<'a> {
         fields: &[FieldInit],
         whole_span: Span,
     ) -> Ty {
-        let Some(TypeInfo::Struct {
+        // First try: a regular user struct type.
+        if let Some(TypeInfo::Struct {
             fields: def_fields,
             ..
         }) = self.module.types.get(name)
-        else {
-            // Could also be a variant constructor like `Ok { ... }` — but
-            // the grammar puts variant constructors through `Call`, so a
-            // struct-lit-shaped node that doesn't match a struct type is
-            // just an error.
-            self.errors.push(TypeError {
-                span: name_span,
-                message: format!("`{name}` is not a struct type"),
-            });
-            return Ty::Error;
-        };
+        {
+            let def_fields: Vec<(String, Ty)> = def_fields.clone();
+            return self.check_struct_lit_fields(name, name_span, fields, whole_span, def_fields);
+        }
 
-        // Clone to detach from the borrow on self.module.
-        let def_fields: Vec<(String, Ty)> = def_fields.clone();
+        // Second try: a sum-type variant constructor with named fields,
+        // e.g. `Circle { radius: 1.0 }` for `type Shape = | Circle { ... }`.
+        if let Some((sum_name, variant_def_fields)) = self.find_named_variant(name) {
+            self.check_struct_lit_fields(
+                name,
+                name_span,
+                fields,
+                whole_span,
+                variant_def_fields,
+            );
+            return Ty::User(sum_name);
+        }
+
+        self.errors.push(TypeError {
+            span: name_span,
+            message: format!("`{name}` is not a struct type or named-field variant"),
+        });
+        Ty::Error
+    }
+
+    /// Look up `variant_name` in every user sum type, returning the
+    /// owning type's name and the variant's named fields if it has that
+    /// shape.
+    fn find_named_variant(&self, variant_name: &str) -> Option<(String, Vec<(String, Ty)>)> {
+        for (type_name, info) in &self.module.types {
+            if let TypeInfo::Sum { variants, .. } = info {
+                for v in variants {
+                    if v.name == variant_name {
+                        if let Some(VariantPayloadInfo::Named(fields)) = &v.payload {
+                            return Some((type_name.clone(), fields.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn check_struct_lit_fields(
+        &mut self,
+        name: &str,
+        name_span: Span,
+        fields: &[FieldInit],
+        whole_span: Span,
+        def_fields: Vec<(String, Ty)>,
+    ) -> Ty {
+        let _ = name_span;
 
         // Check every provided field, collect names.
         let mut provided: HashMap<&str, &Expr> = HashMap::new();
@@ -1162,10 +1215,39 @@ impl<'a> FnChecker<'a> {
             self.pop_scope();
         }
 
-        if let Ty::User(name) = &scrut_ty {
-            if let Some(TypeInfo::Sum { variants, .. }) = self.module.types.get(name) {
-                self.check_exhaustiveness(variants, arms, span);
+        match &scrut_ty {
+            Ty::User(name) => {
+                if let Some(TypeInfo::Sum { variants, .. }) = self.module.types.get(name) {
+                    self.check_exhaustiveness(variants, arms, span);
+                }
             }
+            Ty::Option(_) => {
+                let synthetic = vec![
+                    VariantInfo {
+                        name: "None".into(),
+                        payload: None,
+                    },
+                    VariantInfo {
+                        name: "Some".into(),
+                        payload: Some(VariantPayloadInfo::Positional(vec![Ty::Error])),
+                    },
+                ];
+                self.check_exhaustiveness(&synthetic, arms, span);
+            }
+            Ty::Result(_, _) => {
+                let synthetic = vec![
+                    VariantInfo {
+                        name: "Ok".into(),
+                        payload: Some(VariantPayloadInfo::Positional(vec![Ty::Error])),
+                    },
+                    VariantInfo {
+                        name: "Err".into(),
+                        payload: Some(VariantPayloadInfo::Positional(vec![Ty::Error])),
+                    },
+                ];
+                self.check_exhaustiveness(&synthetic, arms, span);
+            }
+            _ => {}
         }
 
         arm_ty.unwrap_or(Ty::Error)
@@ -1214,6 +1296,19 @@ impl<'a> FnChecker<'a> {
         expected: &Ty,
         span: Span,
     ) {
+        // Built-in Option / Result patterns.
+        match expected {
+            Ty::Option(inner) => {
+                self.check_builtin_option_pattern(name, payload, inner, span);
+                return;
+            }
+            Ty::Result(ok, err) => {
+                self.check_builtin_result_pattern(name, payload, ok, err, span);
+                return;
+            }
+            _ => {}
+        }
+
         let ty_name = match expected {
             Ty::User(n) => n.clone(),
             Ty::Error => return,
@@ -1310,6 +1405,59 @@ impl<'a> FnChecker<'a> {
                     ),
                 });
             }
+        }
+    }
+
+    fn check_builtin_option_pattern(
+        &mut self,
+        name: &str,
+        payload: Option<&VariantPatPayload>,
+        inner: &Ty,
+        span: Span,
+    ) {
+        match (name, payload) {
+            ("None", None) => {}
+            ("None", Some(_)) => self.errors.push(TypeError {
+                span,
+                message: "`None` has no payload".into(),
+            }),
+            ("Some", Some(VariantPatPayload::Positional(pats))) if pats.len() == 1 => {
+                self.check_pattern(&pats[0], inner);
+            }
+            ("Some", _) => self.errors.push(TypeError {
+                span,
+                message: "`Some(x)` expects one positional sub-pattern".into(),
+            }),
+            (other, _) => self.errors.push(TypeError {
+                span,
+                message: format!("`Option` has no variant `{other}` (expected Some or None)"),
+            }),
+        }
+    }
+
+    fn check_builtin_result_pattern(
+        &mut self,
+        name: &str,
+        payload: Option<&VariantPatPayload>,
+        ok: &Ty,
+        err: &Ty,
+        span: Span,
+    ) {
+        match (name, payload) {
+            ("Ok", Some(VariantPatPayload::Positional(pats))) if pats.len() == 1 => {
+                self.check_pattern(&pats[0], ok);
+            }
+            ("Err", Some(VariantPatPayload::Positional(pats))) if pats.len() == 1 => {
+                self.check_pattern(&pats[0], err);
+            }
+            ("Ok" | "Err", _) => self.errors.push(TypeError {
+                span,
+                message: format!("`{name}(x)` expects one positional sub-pattern"),
+            }),
+            (other, _) => self.errors.push(TypeError {
+                span,
+                message: format!("`Result` has no variant `{other}` (expected Ok or Err)"),
+            }),
         }
     }
 
