@@ -1,0 +1,30 @@
+[package]
+name = "lumen"
+version = "0.1.0"
+edition = "2021"
+description = "Lumen — a statically-typed, AI-first language compiling to Wasm"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[lib]
+name = "lumen"
+path = "src/lib.rs"
+
+[dependencies]
+wasm-encoder = "0.246"
+
+[dev-dependencies]
+wasmparser = "0.246"
+wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = "43"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

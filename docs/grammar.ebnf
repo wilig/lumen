@@ -35,8 +35,10 @@ struct_body     = "{" , [ field_list ] , "}" ;
 field_list      = field , { "," , field } , [ "," ] ;
 field           = IDENT , ":" , type ;
 
-sum_body        = variant , { "|" , variant } ;
-variant         = IDENT , [ "(" , [ field_list ] , ")" ] ;
+sum_body        = [ "|" ] , variant , { "|" , variant } ;   (* leading "|" is optional, Rust-style *)
+variant         = IDENT , [ variant_payload ] ;
+variant_payload = "{" , [ field_list ] , "}"            (* named fields *)
+                | "(" , type , { "," , type } , ")" ;   (* positional  *)
 
 (* ========================================================================= *)
 (* Types                                                                      *)
@@ -59,14 +61,22 @@ builtin_type    = "i32" | "i64" | "u32" | "u64" | "f64"
 
 block           = "{" , { stmt } , [ tail_expr ] , "}" ;
 
-stmt            = let_stmt | expr_stmt | for_stmt | return_stmt ;
+stmt            = let_stmt | var_stmt | assign_stmt
+                | expr_stmt | for_stmt | return_stmt ;
 
-let_stmt        = "let" , IDENT , [ ":" , type ] , "=" , expr ;
+let_stmt        = "let" , IDENT , [ ":" , type ] , "=" , expr ;   (* immutable *)
+var_stmt        = "var" , IDENT , [ ":" , type ] , "=" , expr ;   (* mutable   *)
+assign_stmt     = IDENT , "=" , expr ;    (* rebind an existing `var` binding *)
 expr_stmt       = expr ;
 for_stmt        = "for" , IDENT , "in" , expr , block ;
 return_stmt     = "return" , [ expr ] ;
 
 tail_expr       = expr ;   (* final expression is the block's value *)
+
+(* Note: `let` bindings are immutable; `var` bindings are mutable and may be  *)
+(* re-assigned via `assign_stmt`. Shadowing is forbidden either way.           *)
+(* The parser disambiguates assign_stmt from expr_stmt by looking ahead for   *)
+(* `IDENT =` at the start of a statement.                                      *)
 
 (* ========================================================================= *)
 (* Expressions (precedence from low to high)                                  *)
@@ -85,6 +95,8 @@ and_expr        = eq_expr , { "&&" , eq_expr } ;
 eq_expr         = rel_expr , { ( "==" | "!=" ) , rel_expr } ;
 rel_expr        = add_expr , { ( "<" | "<=" | ">" | ">=" ) , add_expr } ;
 add_expr        = mul_expr , { ( "+" | "-" ) , mul_expr } ;
+(* Note: `+` on two `string` operands is special-cased by the typechecker to *)
+(* desugar to `string.concat(a, b)`. There is no general operator overloading.*)
 mul_expr        = cast_expr , { ( "*" | "/" | "%" ) , cast_expr } ;
 cast_expr       = unary_expr , [ "as" , builtin_type ] ;
 unary_expr      = ( "-" | "!" ) , unary_expr | postfix_expr ;
@@ -109,6 +121,10 @@ struct_lit      = IDENT , "{" , [ field_init_list ] , "}" ;
 field_init_list = field_init , { "," , field_init } , [ "," ] ;
 field_init      = IDENT , ":" , expr ;
 
+(* Note: `struct_lit` with `{}` is also the constructor syntax for named-field *)
+(* sum-type variants. E.g., `Circle { radius: 1.0 }`. Positional variant       *)
+(* constructors use the regular `call_args` form: `NotFound("missing.txt")`.    *)
+
 (* ========================================================================= *)
 (* Patterns                                                                   *)
 (* ========================================================================= *)
@@ -117,8 +133,11 @@ pattern         = wildcard_pat | literal_pat | binding_pat | variant_pat ;
 wildcard_pat    = "_" ;
 literal_pat     = literal ;
 binding_pat     = IDENT ;                           (* binds the value *)
-variant_pat     = IDENT , [ "(" , [ pat_field_list ] , ")" ] ;
-pat_field_list  = pat_field , { "," , pat_field } ;
+variant_pat     = IDENT , [ variant_pat_payload ] ;
+variant_pat_payload
+                = "{" , [ pat_field_list ] , "}"    (* named subpatterns *)
+                | "(" , pattern , { "," , pattern } , ")" ; (* positional *)
+pat_field_list  = pat_field , { "," , pat_field } , [ "," ] ;
 pat_field       = IDENT , ":" , pattern ;           (* named subpattern *)
 
 (* ========================================================================= *)
@@ -146,7 +165,8 @@ digit           = "0" | ... | "9" ;
 (* of the enclosing block. The parser recovers via block braces.            *)
 
 (* ========================================================================= *)
-(* Reserved keywords (16)                                                     *)
+(* Reserved keywords (17)                                                     *)
 (* ========================================================================= *)
 
-(* fn let type import if else match for in return as io pure true false unit *)
+(* fn let var type import if else match for in return as io pure              *)
+(* true false unit                                                             *)

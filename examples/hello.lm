@@ -1,0 +1,9 @@
+// The traditional first program. Exercises: import, fn, io effect,
+// Result<unit, unit>, and the Ok constructor from the Result built-in.
+
+import std/io
+
+fn main(): Result<unit, unit> io {
+    io.println("hello, world")
+    Ok(unit)
+}

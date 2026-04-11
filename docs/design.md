@@ -44,6 +44,9 @@ Lumen exists because the primary author of code is now an AI agent, not a human.
 | Integers | `i32`, `i64`, `u32`, `u64`, `f64` — explicit `as` conversions |
 | Effects | `pure` / `io`, surfaced in signatures, checked |
 | Loops | `for x in iter` only. Recursion for unbounded. No `while`. No `break`/`continue` in v1. |
+| Mutability | `let` = immutable, `var` = mutable (re-assigned with `name = expr`). No shadowing. |
+| String concat | `string + string` is a typechecker special case → `string.concat(a, b)`. No other overloading. |
+| Variant syntax | Named-field variants use `{}` (both patterns and constructors). Positional variants use `()`. |
 | Errors | `Result<T, E>` + `?`. Frames auto-captured on Err path. |
 | Generics | v1: none for users. `Option` and `Result` are built-ins, specialized at call site. |
 | Concurrency | None in v1. |
@@ -51,9 +54,11 @@ Lumen exists because the primary author of code is now an AI agent, not a human.
 
 ## Keyword budget (target: 18–22)
 
-`fn`, `let`, `type`, `import`, `if`, `else`, `match`, `for`, `in`, `return`, `as`, `io`, `pure`, `true`, `false`, `unit`
+`fn`, `let`, `var`, `type`, `import`, `if`, `else`, `match`, `for`, `in`, `return`, `as`, `io`, `pure`, `true`, `false`, `unit`
 
-Constructors (`Ok`, `Err`, `Some`, `None`) are stdlib identifiers, not keywords. `Result`, `Option` are built-in type names, not keywords. That's **16 keywords**.
+Constructors (`Ok`, `Err`, `Some`, `None`) are stdlib identifiers, not keywords. `Result`, `Option` are built-in type names, not keywords. That's **17 keywords**.
+
+`let` declares an immutable binding. `var` declares a mutable one that can be re-assigned with `name = expr`. Shadowing is forbidden either way. The `var` form exists because [fluency validation](fluency-validation.md) found that accumulation loops — the most common numeric pattern LLMs reach for — are unwritable without it.
 
 ## The error-frame design (the novel piece)
 
@@ -97,6 +102,21 @@ The Ok path is untouched. Only the Err branch walks the frame-push code, so the 
 ```
 
 No IR, no optimizer. Wasmtime's JIT handles optimization. Total compiler target size: ~3000–4000 LOC of Rust.
+
+## Stdlib layout (v1)
+
+Modules are imported as `import std/<name>`. No relative imports, no user modules, no star imports. Every stdlib function lives in a module — primitive type names (`i32`, `string`, ...) are **not** namespaces, so `i32.parse(s)` is not a thing; use `std/int.parse_i32(s)` instead.
+
+| Module | Contents |
+|---|---|
+| `std/io` | `println(s: string)`, `read_file(path: string): Result<string, IoError>`, `write_file(path: string, content: string): Result<unit, IoError>`. All marked `io`. |
+| `std/env` | `args(): List<string>` — command-line arguments passed from the Wasmtime host. Marked `io`. |
+| `std/list` | Built-in generic `List<T>`: `new()`, `push`, `get: Option<T>`, `len`, `iter`, `map`, `filter`. |
+| `std/string` | `concat(a, b)`, `split(s, sep): List<string>`, `len`, `chars`. `+` on two strings desugars to `concat`. |
+| `std/int` | `parse_i32(s): Result<i32, ParseError>`, `parse_i64`, `parse_u32`, `parse_u64`, plus `to_string_i32(n): string` and siblings. |
+| `std/math` | `pi`, `e`, `sqrt`, `pow`, `abs`. |
+
+Numeric parsing and `to_string` deliberately live in `std/int` (not as methods on type names) because the fluency check found LLMs reach for `int.parse_i32` more naturally than `i32.parse`, and it keeps the rule "type names are types, modules are namespaces" crisp.
 
 ## Open questions (deferred past v1)
 
