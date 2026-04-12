@@ -74,6 +74,12 @@ struct NativeCodegen<'a> {
     helper_rc_alloc: FuncId,
     helper_rc_incr: FuncId,
     helper_rc_decr: FuncId,
+    rt_send: FuncId,
+    rt_ask: FuncId,
+    rt_drain: FuncId,
+    rt_yield: FuncId,
+    /// Per-actor dispatch function IDs (actor_name → FuncId).
+    dispatch_fns: HashMap<String, FuncId>,
 
     /// DataId for the heap buffer (a large static byte array).
     heap_data: DataId,
@@ -204,6 +210,40 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_rc_decr", Linkage::Local, &rc_decr_sig)
             .unwrap();
 
+        // --- Actor runtime functions (from runtime/rt.c) ---
+        // lumen_rt_send(cell: ptr, dispatch: ptr, kind: i32, arg0: i64)
+        let mut rt_send_sig = obj.make_signature();
+        rt_send_sig.params.push(AbiParam::new(PTR)); // cell
+        rt_send_sig.params.push(AbiParam::new(PTR)); // dispatch fn ptr
+        rt_send_sig.params.push(AbiParam::new(cl_types::I32)); // msg_kind
+        rt_send_sig.params.push(AbiParam::new(cl_types::I64)); // arg0
+        let rt_send = obj
+            .declare_function("lumen_rt_send", Linkage::Import, &rt_send_sig)
+            .unwrap();
+
+        // lumen_rt_ask(...) -> i64
+        let mut rt_ask_sig = obj.make_signature();
+        rt_ask_sig.params.push(AbiParam::new(PTR));
+        rt_ask_sig.params.push(AbiParam::new(PTR));
+        rt_ask_sig.params.push(AbiParam::new(cl_types::I32));
+        rt_ask_sig.params.push(AbiParam::new(cl_types::I64));
+        rt_ask_sig.returns.push(AbiParam::new(cl_types::I64));
+        let rt_ask = obj
+            .declare_function("lumen_rt_ask", Linkage::Import, &rt_ask_sig)
+            .unwrap();
+
+        // lumen_rt_drain()
+        let rt_drain_sig = obj.make_signature();
+        let rt_drain = obj
+            .declare_function("lumen_rt_drain", Linkage::Import, &rt_drain_sig)
+            .unwrap();
+
+        // lumen_rt_yield()
+        let rt_yield_sig = obj.make_signature();
+        let rt_yield = obj
+            .declare_function("lumen_rt_yield", Linkage::Import, &rt_yield_sig)
+            .unwrap();
+
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -224,6 +264,11 @@ impl<'a> NativeCodegen<'a> {
             helper_rc_alloc,
             helper_rc_incr,
             helper_rc_decr,
+            rt_send,
+            rt_ask,
+            rt_drain,
+            rt_yield,
+            dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
             frame_chain_data,
@@ -283,6 +328,13 @@ impl<'a> NativeCodegen<'a> {
         self.define_rc_alloc_helper()?;
         self.define_rc_incr_helper()?;
         self.define_rc_decr_helper()?;
+
+        // Emit per-actor dispatch functions BEFORE user function bodies
+        // (user fns reference dispatch via send/ask).
+        let actors: Vec<String> = self.info.actors.keys().cloned().collect();
+        for actor_name in &actors {
+            self.emit_actor_dispatch(actor_name, module)?;
+        }
 
         // Define user function bodies.
         let fn_ids = self.fn_ids.clone();
@@ -606,6 +658,107 @@ impl<'a> NativeCodegen<'a> {
         Ok(())
     }
 
+    /// Emit a dispatch function for an actor type:
+    /// `dispatch(cell: ptr, kind: i32, arg0: i64, reply: ptr)`
+    /// Loads state from cell, dispatches on kind to the right handler,
+    /// stores new state back, writes reply if the handler is a query.
+    fn emit_actor_dispatch(
+        &mut self,
+        actor_name: &str,
+        _module: &ast::Module,
+    ) -> Result<(), NativeError> {
+        let dispatch_name = format!("{}_dispatch", actor_name);
+        let mut sig = self.obj.make_signature();
+        sig.params.push(AbiParam::new(PTR)); // cell
+        sig.params.push(AbiParam::new(cl_types::I32)); // kind
+        sig.params.push(AbiParam::new(cl_types::I64)); // arg0
+        sig.params.push(AbiParam::new(PTR)); // reply ptr
+        let func_id = self
+            .obj
+            .declare_function(&dispatch_name, Linkage::Export, &sig)
+            .unwrap();
+        self.dispatch_fns.insert(actor_name.to_string(), func_id);
+
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+
+        let cell = builder.block_params(entry)[0];
+        let kind = builder.block_params(entry)[1];
+        let arg0 = builder.block_params(entry)[2];
+        let reply_ptr = builder.block_params(entry)[3];
+        let flags = MemFlags::new();
+
+        // Load current state from cell.
+        let state = builder.ins().load(PTR, flags, cell, 0);
+
+        // Dispatch: for each msg handler, if kind == N, call handler.
+        let msgs = self.info.actors.get(actor_name).cloned().unwrap_or_default();
+        let exit_bb = builder.create_block();
+
+        for (i, msg) in msgs.iter().enumerate() {
+            let fn_name = format!("{}_{}", actor_name, msg.name);
+            let handler_id = *self.fn_ids.get(&fn_name).unwrap();
+            let handler_ref = self.obj.declare_func_in_func(handler_id, builder.func);
+
+            let match_bb = builder.create_block();
+            let next_bb = builder.create_block();
+
+            let kind_val = builder.ins().iconst(cl_types::I32, i as i64);
+            let matches = builder.ins().icmp(IntCC::Equal, kind, kind_val);
+            builder.ins().brif(matches, match_bb, &[], next_bb, &[]);
+
+            builder.switch_to_block(match_bb);
+            // Build args: (state, arg0 truncated to the right type).
+            let is_mutation = matches!(msg.ret, Ty::User(ref n) if n == actor_name);
+            let mut call_args = vec![state];
+            if !msg.params.is_empty() {
+                // Truncate arg0 to the param type.
+                let (_, pty) = &msg.params[0];
+                let arg = match lumen_to_cl(pty) {
+                    cl_types::I32 => builder.ins().ireduce(cl_types::I32, arg0),
+                    cl_types::F64 => builder.ins().bitcast(cl_types::F64, flags, arg0),
+                    _ => arg0, // PTR = i64, same
+                };
+                call_args.push(arg);
+            }
+            let call = builder.ins().call(handler_ref, &call_args);
+            let result = builder.inst_results(call)[0];
+
+            if is_mutation {
+                // Store new state in cell.
+                builder.ins().store(flags, result, cell, 0);
+            } else {
+                // Write result as reply.
+                let reply_val = match lumen_to_cl(&msg.ret) {
+                    cl_types::I32 => builder.ins().sextend(cl_types::I64, result),
+                    cl_types::F64 => builder.ins().bitcast(cl_types::I64, flags, result),
+                    _ => result,
+                };
+                builder.ins().store(flags, reply_val, reply_ptr, 0);
+            }
+            builder.ins().jump(exit_bb, &[]);
+
+            builder.switch_to_block(next_bb);
+        }
+        // Fallthrough (unknown kind): just jump to exit.
+        builder.ins().jump(exit_bb, &[]);
+
+        builder.switch_to_block(exit_bb);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj.define_function(func_id, &mut ctx).unwrap();
+        Ok(())
+    }
+
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
         let sig = &self.info.fns[&f.name];
         let cl_sig = self.build_sig(&f.name);
@@ -646,10 +799,17 @@ impl<'a> NativeCodegen<'a> {
                 }
             }
 
-            // Compile body. The block's cleanup pass handles rc_decr
-            // for let bindings AND params. The block rc_incr's the tail
-            // expression to protect it from the cleanup pass.
+            // Compile body. (Yield points are at loop headers only —
+            // function-entry yield causes recursive dispatch issues.)
             let result = fb.compile_block_with_cleanup(&f.body, param_cleanup)?;
+
+            // If this is main, drain the message queue before returning.
+            if f.name == "main" {
+                let drain_ref = fb.cg.obj.declare_func_in_func(
+                    fb.cg.rt_drain, fb.builder.func,
+                );
+                fb.builder.ins().call(drain_ref, &[]);
+            }
 
             // Return.
             fb.builder.ins().return_(&[result]);
@@ -1430,6 +1590,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.builder.ins().jump(header_bb, &[]);
 
         self.builder.switch_to_block(header_bb);
+        // Yield point at loop header: cooperative scheduling.
+        let yield_ref = self.cg.obj.declare_func_in_func(
+            self.cg.rt_yield, self.builder.func,
+        );
+        self.builder.ins().call(yield_ref, &[]);
+
         let counter = self.builder.use_var(counter_var);
         let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, counter, end);
         self.builder.ins().brif(done, exit_bb, &[], body_bb, &[]);
@@ -2221,59 +2387,54 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let actor_name = match &handle_ty {
             Ty::Handle(inner) => match inner.as_ref() {
                 Ty::User(n) => n.clone(),
-                _ => {
-                    return Err(NativeError {
-                        span,
-                        message: "expected actor handle".into(),
-                    })
-                }
+                _ => return Err(NativeError { span, message: "expected actor handle".into() }),
             },
-            _ => {
-                return Err(NativeError {
-                    span,
-                    message: "expected actor handle".into(),
-                })
-            }
+            _ => return Err(NativeError { span, message: "expected actor handle".into() }),
         };
 
         let cell = self.compile_expr(handle)?;
-        // Load current state from the cell.
-        let state = self.builder.ins().load(PTR, MemFlags::new(), cell, 0);
 
-        // Build arg values.
-        let mut call_args = vec![state]; // self is the first param
-        for a in args {
-            call_args.push(self.compile_expr(&a.value)?);
-        }
+        // Find the msg_kind index for this method.
+        let msgs = self.cg.info.actors.get(&actor_name).cloned().unwrap_or_default();
+        let msg_kind = msgs.iter().position(|m| m.name == method).unwrap_or(0) as i64;
+        let kind_val = self.builder.ins().iconst(cl_types::I32, msg_kind);
 
-        // Call the handler function.
-        let fn_name = format!("{}_{}", actor_name, method);
-        let func_id = self.cg.fn_ids.get(&fn_name).ok_or_else(|| NativeError {
-            span,
-            message: format!("unknown msg handler `{fn_name}`"),
-        })?;
-        let func_ref = self
-            .cg
-            .obj
-            .declare_func_in_func(*func_id, self.builder.func);
-        let call = self.builder.ins().call(func_ref, &call_args);
-        let result = self.builder.inst_results(call)[0];
-
-        // If the handler returns the actor type (mutation), store the
-        // new state back in the cell.
-        let ret_ty = self.cg.info.fns.get(&fn_name).map(|s| s.ret.clone());
-        if let Some(Ty::User(ret_name)) = &ret_ty {
-            if ret_name == &actor_name {
-                self.builder.ins().store(MemFlags::new(), result, cell, 0);
-                if !return_result {
-                    return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-                }
+        // Encode arg0 as i64.
+        let arg0 = if let Some(a) = args.first() {
+            let v = self.compile_expr(&a.value)?;
+            let ty = self.infer_ty(&a.value)?;
+            match lumen_to_cl(&ty) {
+                cl_types::I32 => self.builder.ins().sextend(cl_types::I64, v),
+                cl_types::F64 => self.builder.ins().bitcast(cl_types::I64, MemFlags::new(), v),
+                _ => v, // PTR is already i64
             }
-        }
+        } else {
+            self.builder.ins().iconst(cl_types::I64, 0)
+        };
+
+        // Get the dispatch function pointer.
+        let dispatch_id = self.cg.dispatch_fns.get(&actor_name).ok_or_else(|| {
+            NativeError { span, message: format!("no dispatch for actor `{actor_name}`") }
+        })?;
+        let dispatch_ref = self.cg.obj.declare_func_in_func(*dispatch_id, self.builder.func);
+        let dispatch_addr = self.builder.ins().func_addr(PTR, dispatch_ref);
 
         if return_result {
-            Ok(result)
+            // ask: call lumen_rt_ask(cell, dispatch, kind, arg0) -> i64
+            let rt_ref = self.cg.obj.declare_func_in_func(self.cg.rt_ask, self.builder.func);
+            let call = self.builder.ins().call(rt_ref, &[cell, dispatch_addr, kind_val, arg0]);
+            let result_i64 = self.builder.inst_results(call)[0];
+            // Truncate to the handler's return type.
+            let fn_name = format!("{}_{}", actor_name, method);
+            let ret_ty = self.cg.info.fns.get(&fn_name).map(|s| &s.ret);
+            Ok(match ret_ty.map(|t| lumen_to_cl(t)) {
+                Some(cl_types::I32) => self.builder.ins().ireduce(cl_types::I32, result_i64),
+                _ => result_i64,
+            })
         } else {
+            // send: call lumen_rt_send(cell, dispatch, kind, arg0)
+            let rt_ref = self.cg.obj.declare_func_in_func(self.cg.rt_send, self.builder.func);
+            self.builder.ins().call(rt_ref, &[cell, dispatch_addr, kind_val, arg0]);
             Ok(self.builder.ins().iconst(cl_types::I32, 0))
         }
     }

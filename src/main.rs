@@ -63,11 +63,29 @@ fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
     let obj_path = format!("{stem}.o");
     let exe_path = stem.to_string();
     std::fs::write(&obj_path, obj_bytes).map_err(|e| format!("write {obj_path}: {e}"))?;
+
+    // Compile the Lumen runtime (runtime/rt.c) if present.
+    let rt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime");
+    let rt_src = rt_dir.join("rt.c");
+    let rt_obj = format!("{stem}_rt.o");
+    let mut link_args = vec![obj_path.clone(), "-o".to_string(), exe_path.clone(), "-lc".to_string()];
+    if rt_src.exists() {
+        let cc_status = std::process::Command::new("cc")
+            .args(["-c", "-O2", rt_src.to_str().unwrap(), "-o", &rt_obj])
+            .status()
+            .map_err(|e| format!("failed to compile runtime: {e}"))?;
+        if !cc_status.success() {
+            return Err("runtime compilation failed".into());
+        }
+        link_args.insert(1, rt_obj.clone());
+    }
+
     let status = std::process::Command::new("cc")
-        .args([&obj_path, "-o", &exe_path, "-lc"])
+        .args(&link_args)
         .status()
         .map_err(|e| format!("failed to run cc: {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&rt_obj);
     if !status.success() {
         return Err(format!("linker failed with {status}"));
     }
