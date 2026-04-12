@@ -78,6 +78,17 @@ struct NativeCodegen<'a> {
     rt_ask: FuncId,
     rt_drain: FuncId,
     rt_yield: FuncId,
+    /// TCP socket helpers (from runtime/rt.c).
+    net_tcp_listen: FuncId,
+    net_tcp_accept: FuncId,
+    net_tcp_read: FuncId,
+    net_tcp_write: FuncId,
+    net_tcp_close: FuncId,
+    /// HTTP parsing/formatting helpers (from runtime/rt.c).
+    http_parse_method: FuncId,
+    http_parse_path: FuncId,
+    http_parse_body: FuncId,
+    http_format_response: FuncId,
     /// Per-actor dispatch function IDs (actor_name → FuncId).
     dispatch_fns: HashMap<String, FuncId>,
 
@@ -244,6 +255,81 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_rt_yield", Linkage::Import, &rt_yield_sig)
             .unwrap();
 
+        // --- TCP socket helpers (from runtime/rt.c) ---
+        // lumen_tcp_listen(port: i32) -> i32
+        let mut tcp_listen_sig = obj.make_signature();
+        tcp_listen_sig.params.push(AbiParam::new(cl_types::I32));
+        tcp_listen_sig.returns.push(AbiParam::new(cl_types::I32));
+        let net_tcp_listen = obj
+            .declare_function("lumen_tcp_listen", Linkage::Import, &tcp_listen_sig)
+            .unwrap();
+
+        // lumen_tcp_accept(server_fd: i32) -> i32
+        let mut tcp_accept_sig = obj.make_signature();
+        tcp_accept_sig.params.push(AbiParam::new(cl_types::I32));
+        tcp_accept_sig.returns.push(AbiParam::new(cl_types::I32));
+        let net_tcp_accept = obj
+            .declare_function("lumen_tcp_accept", Linkage::Import, &tcp_accept_sig)
+            .unwrap();
+
+        // lumen_tcp_read(fd: i32, max: i32) -> i64 (ptr to bytes)
+        let mut tcp_read_sig = obj.make_signature();
+        tcp_read_sig.params.push(AbiParam::new(cl_types::I32));
+        tcp_read_sig.params.push(AbiParam::new(cl_types::I32));
+        tcp_read_sig.returns.push(AbiParam::new(PTR));
+        let net_tcp_read = obj
+            .declare_function("lumen_tcp_read", Linkage::Import, &tcp_read_sig)
+            .unwrap();
+
+        // lumen_tcp_write(fd: i32, bytes_ptr: i64) -> i64
+        let mut tcp_write_sig = obj.make_signature();
+        tcp_write_sig.params.push(AbiParam::new(cl_types::I32));
+        tcp_write_sig.params.push(AbiParam::new(PTR));
+        tcp_write_sig.returns.push(AbiParam::new(PTR));
+        let net_tcp_write = obj
+            .declare_function("lumen_tcp_write", Linkage::Import, &tcp_write_sig)
+            .unwrap();
+
+        // lumen_tcp_close(fd: i32)
+        let mut tcp_close_sig = obj.make_signature();
+        tcp_close_sig.params.push(AbiParam::new(cl_types::I32));
+        let net_tcp_close = obj
+            .declare_function("lumen_tcp_close", Linkage::Import, &tcp_close_sig)
+            .unwrap();
+
+        // lumen_http_parse_method(raw: ptr) -> ptr
+        let mut http_pm_sig = obj.make_signature();
+        http_pm_sig.params.push(AbiParam::new(PTR));
+        http_pm_sig.returns.push(AbiParam::new(PTR));
+        let http_parse_method = obj
+            .declare_function("lumen_http_parse_method", Linkage::Import, &http_pm_sig)
+            .unwrap();
+
+        // lumen_http_parse_path(raw: ptr) -> ptr
+        let mut http_pp_sig = obj.make_signature();
+        http_pp_sig.params.push(AbiParam::new(PTR));
+        http_pp_sig.returns.push(AbiParam::new(PTR));
+        let http_parse_path = obj
+            .declare_function("lumen_http_parse_path", Linkage::Import, &http_pp_sig)
+            .unwrap();
+
+        // lumen_http_parse_body(raw: ptr) -> ptr
+        let mut http_pb_sig = obj.make_signature();
+        http_pb_sig.params.push(AbiParam::new(PTR));
+        http_pb_sig.returns.push(AbiParam::new(PTR));
+        let http_parse_body = obj
+            .declare_function("lumen_http_parse_body", Linkage::Import, &http_pb_sig)
+            .unwrap();
+
+        // lumen_http_format_response(status: i32, body: ptr) -> ptr
+        let mut http_fr_sig = obj.make_signature();
+        http_fr_sig.params.push(AbiParam::new(cl_types::I32));
+        http_fr_sig.params.push(AbiParam::new(PTR));
+        http_fr_sig.returns.push(AbiParam::new(PTR));
+        let http_format_response = obj
+            .declare_function("lumen_http_format_response", Linkage::Import, &http_fr_sig)
+            .unwrap();
+
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -268,6 +354,15 @@ impl<'a> NativeCodegen<'a> {
             rt_ask,
             rt_drain,
             rt_yield,
+            net_tcp_listen,
+            net_tcp_accept,
+            net_tcp_read,
+            net_tcp_write,
+            net_tcp_close,
+            http_parse_method,
+            http_parse_path,
+            http_parse_body,
+            http_format_response,
             dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
@@ -1582,6 +1677,94 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let b = self.compile_expr(&args[0].value)?;
                 return Ok(b);
             }
+            // --- TCP socket operations ---
+            if mod_name == "net" && method == "tcp_listen" {
+                let port = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.net_tcp_listen, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[port]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "net" && method == "tcp_accept" {
+                let server_fd = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.net_tcp_accept, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[server_fd]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "net" && method == "tcp_read" {
+                let fd = self.compile_expr(&args[0].value)?;
+                let max = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.net_tcp_read, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[fd, max]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "net" && method == "tcp_write" {
+                let fd = self.compile_expr(&args[0].value)?;
+                let data = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.net_tcp_write, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[fd, data]);
+                // Return value is i64 (ssize_t), truncate to i32
+                let result = self.builder.inst_results(call)[0];
+                let truncated = self.builder.ins().ireduce(cl_types::I32, result);
+                return Ok(truncated);
+            }
+            if mod_name == "net" && method == "tcp_close" {
+                let fd = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.net_tcp_close, self.builder.func);
+                self.builder.ins().call(func_ref, &[fd]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "http" && method == "parse_method" {
+                let raw = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.http_parse_method, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[raw]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "http" && method == "parse_path" {
+                let raw = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.http_parse_path, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[raw]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "http" && method == "parse_body" {
+                let raw = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.http_parse_body, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[raw]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "http" && method == "format_response" {
+                let status = self.compile_expr(&args[0].value)?;
+                let body = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.http_format_response, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[status, body]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
         }
         Err(NativeError {
             span,
@@ -2674,6 +2857,29 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     if m == "string" && method == "from_bytes" {
                         return Ok(Ty::String);
+                    }
+                    // TCP socket operations
+                    if m == "net" && method == "tcp_listen" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "net" && method == "tcp_accept" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "net" && method == "tcp_read" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if m == "net" && method == "tcp_write" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "net" && method == "tcp_close" {
+                        return Ok(Ty::I32);
+                    }
+                    // HTTP parsing/formatting
+                    if m == "http" && (method == "parse_method" || method == "parse_path" || method == "parse_body") {
+                        return Ok(Ty::String);
+                    }
+                    if m == "http" && method == "format_response" {
+                        return Ok(Ty::Bytes);
                     }
                 }
                 Ty::I32

@@ -1356,6 +1356,97 @@ impl<'a> FnChecker<'a> {
                 }
                 Some(Ty::String)
             }
+            ("net", "tcp_listen") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.tcp_listen` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("net", "tcp_accept") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.tcp_accept` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("net", "tcp_read") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.tcp_read` expects 2 arguments, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                }
+                Some(Ty::Bytes)
+            }
+            ("net", "tcp_write") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.tcp_write` expects 2 arguments, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::Bytes);
+                }
+                Some(Ty::I32)
+            }
+            ("net", "tcp_close") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.tcp_close` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("http", "parse_method") | ("http", "parse_path") | ("http", "parse_body") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "`http.{method}` expects 1 argument, found {}",
+                            args.len()
+                        ),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::Bytes);
+                }
+                Some(Ty::String)
+            }
+            ("http", "format_response") => {
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "`http.format_response` expects 2 arguments, found {}",
+                            args.len()
+                        ),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::String);
+                }
+                Some(Ty::Bytes)
+            }
             _ => None,
         }
     }

@@ -1,0 +1,32 @@
+// A simple HTTP web server in Lumen.
+// Listens on port 8080, handles requests one at a time.
+
+import std/io
+import std/net
+
+fn handle_request(raw: bytes): bytes {
+    let path = http.parse_path(raw)
+    let method = http.parse_method(raw)
+
+    if string_len(path) == 1 {
+        http.format_response(200, "Welcome to Lumen! Try /hello or /count")
+    } else {
+        http.format_response(200, method + " " + path)
+    }
+}
+
+fn main(): i32 io {
+    let server = net.tcp_listen(8080)
+    io.println("Lumen web server listening on :8080")
+
+    for i in range(0, 100) {
+        let client = net.tcp_accept(server)
+        let request = net.tcp_read(client, 4096)
+        let response = handle_request(request)
+        let written = net.tcp_write(client, response)
+        net.tcp_close(client)
+    }
+
+    net.tcp_close(server)
+    0
+}

@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // Forward declarations.
 void lumen_rt_drain(void);
@@ -83,4 +87,170 @@ void lumen_rt_drain(void) {
 // and loop headers for cooperative scheduling.
 void lumen_rt_yield(void) {
     lumen_rt_step();
+}
+
+// --- TCP socket operations ------------------------------------------------
+
+// Allocate a Lumen bytes value: [rc:i32=1 | magic:i32=0x4C554D45 | len:i32 | data...]
+// Returns pointer to the payload (len field), same as lumen_rc_alloc would.
+static char *alloc_bytes(int32_t len) {
+    // Total: 8 (rc header) + 4 (len) + len (data)
+    char *raw = (char *)malloc(8 + 4 + len);
+    if (!raw) return NULL;
+    *(int32_t *)(raw + 0) = 1;            // refcount
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic "LUME"
+    char *payload = raw + 8;
+    *(int32_t *)(payload) = len;           // bytes length
+    return payload;
+}
+
+// socket + setsockopt + bind + listen. Returns server fd (or -1 on error).
+int lumen_tcp_listen(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 128) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Accept a connection. Returns client fd (or -1 on error).
+int lumen_tcp_accept(int server_fd) {
+    struct sockaddr_in client_addr;
+    socklen_t len = sizeof(client_addr);
+    return accept(server_fd, (struct sockaddr *)&client_addr, &len);
+}
+
+// Read up to max bytes from fd. Returns a Lumen bytes pointer (i64).
+int64_t lumen_tcp_read(int fd, int max) {
+    char *buf = alloc_bytes(max);
+    if (!buf) return 0;
+    ssize_t n = read(fd, buf + 4, max);  // data starts at offset 4
+    if (n < 0) n = 0;
+    *(int32_t *)buf = (int32_t)n;         // store actual length
+    return (int64_t)(uintptr_t)buf;
+}
+
+// Write bytes to fd. bytes_ptr is a Lumen bytes pointer [len:i32 | data...].
+// Returns number of bytes written.
+int64_t lumen_tcp_write(int fd, int64_t bytes_ptr) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    ssize_t n = write(fd, buf + 4, len);
+    return (int64_t)n;
+}
+
+// Close a file descriptor.
+void lumen_tcp_close(int fd) {
+    close(fd);
+}
+
+// --- HTTP/1.1 parsing and formatting ----------------------------------------
+
+// Helper: create an rc_alloc'd Lumen string from raw C data.
+// Uses the same alloc_bytes layout: [rc:i32=1 | magic:0x4C554D45 | len:i32 | data...]
+// Returns pointer to [len:i32 | data...] (past the 8-byte rc header).
+static int64_t make_lumen_string(const char *data, int len) {
+    char *payload = alloc_bytes(len);
+    if (len > 0) memcpy(payload + 4, data, len);
+    return (int64_t)(uintptr_t)payload;
+}
+
+// Parse HTTP method from raw request bytes.
+// raw_bytes_ptr points to [len:i32 | data...] (Lumen bytes layout).
+int64_t lumen_http_parse_method(int64_t raw_bytes_ptr) {
+    char *buf = (char *)(uintptr_t)raw_bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    const char *data = buf + 4;
+
+    // Find first space -> method ends there.
+    int i = 0;
+    while (i < len && data[i] != ' ') i++;
+
+    return make_lumen_string(data, i);
+}
+
+// Parse HTTP path from raw request bytes.
+int64_t lumen_http_parse_path(int64_t raw_bytes_ptr) {
+    char *buf = (char *)(uintptr_t)raw_bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    const char *data = buf + 4;
+
+    // Find first space (end of method).
+    int i = 0;
+    while (i < len && data[i] != ' ') i++;
+    i++; // skip the space
+
+    // Path starts here. Find second space.
+    int path_start = i;
+    while (i < len && data[i] != ' ') i++;
+
+    return make_lumen_string(data + path_start, i - path_start);
+}
+
+// Parse HTTP body from raw request bytes.
+// Body starts after "\r\n\r\n".
+int64_t lumen_http_parse_body(int64_t raw_bytes_ptr) {
+    char *buf = (char *)(uintptr_t)raw_bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    const char *data = buf + 4;
+
+    // Find "\r\n\r\n".
+    for (int i = 0; i + 3 < len; i++) {
+        if (data[i] == '\r' && data[i+1] == '\n' &&
+            data[i+2] == '\r' && data[i+3] == '\n') {
+            int body_start = i + 4;
+            return make_lumen_string(data + body_start, len - body_start);
+        }
+    }
+    // No body found - return empty string.
+    return make_lumen_string("", 0);
+}
+
+// Format an HTTP/1.1 response: "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\n\r\n{body}"
+// body_str_ptr points to [len:i32 | data...] (Lumen string layout).
+// Returns an rc_alloc'd bytes pointer.
+int64_t lumen_http_format_response(int32_t status, int64_t body_str_ptr) {
+    char *body_buf = (char *)(uintptr_t)body_str_ptr;
+    int32_t body_len = *(int32_t *)body_buf;
+    const char *body_data = body_buf + 4;
+
+    // Convert status and body_len to strings.
+    char status_str[16];
+    int status_str_len = snprintf(status_str, sizeof(status_str), "%d", status);
+    char len_str[16];
+    int len_str_len = snprintf(len_str, sizeof(len_str), "%d", body_len);
+
+    // Build: "HTTP/1.1 " + status + " OK\r\nContent-Length: " + len + "\r\n\r\n" + body
+    const char *p1 = "HTTP/1.1 ";           int p1_len = 9;
+    const char *p2 = " OK\r\nContent-Length: "; int p2_len = 20;
+    const char *p3 = "\r\n\r\n";            int p3_len = 4;
+
+    int total = p1_len + status_str_len + p2_len + len_str_len + p3_len + body_len;
+    char *payload = alloc_bytes(total);
+    char *out = payload + 4; // skip past len field (already set by alloc_bytes)
+
+    memcpy(out, p1, p1_len);                out += p1_len;
+    memcpy(out, status_str, status_str_len); out += status_str_len;
+    memcpy(out, p2, p2_len);                out += p2_len;
+    memcpy(out, len_str, len_str_len);       out += len_str_len;
+    memcpy(out, p3, p3_len);                out += p3_len;
+    if (body_len > 0) memcpy(out, body_data, body_len);
+
+    return (int64_t)(uintptr_t)payload;
 }

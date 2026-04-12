@@ -1,0 +1,13 @@
+import std/io
+import std/net
+
+fn main(): i32 io {
+    let server = net.tcp_listen(8080)
+    io.println("listening on :8080")
+    let client = net.tcp_accept(server)
+    let data = net.tcp_read(client, 1024)
+    net.tcp_write(client, data)
+    net.tcp_close(client)
+    net.tcp_close(server)
+    0
+}
