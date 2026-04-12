@@ -57,6 +57,8 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     /// A user-declared struct or sum type by name.
     User(String),
+    /// Function pointer: a reference to a top-level function.
+    FnPtr { params: Vec<Ty>, ret: Box<Ty> },
     /// An actor handle.
     Handle(Box<Ty>),
     /// Internal placeholder emitted after a type error. Any comparison
@@ -85,6 +87,10 @@ impl Ty {
             Ty::Result(o, e) => format!("Result<{}, {}>", o.display(), e.display()),
             Ty::List(t) => format!("List<{}>", t.display()),
             Ty::User(name) => name.clone(),
+            Ty::FnPtr { params, ret } => {
+                let ps: Vec<String> = params.iter().map(|t| t.display()).collect();
+                format!("fn({}): {}", ps.join(", "), ret.display())
+            }
             Ty::Handle(inner) => format!("Handle<{}>", inner.display()),
             Ty::Error => "<error>".into(),
         }
@@ -808,6 +814,12 @@ impl<'a> FnChecker<'a> {
                         });
                         Ty::Error
                     }
+                } else if let Some(sig) = self.module.fns.get(name) {
+                    // Top-level function referenced as a value → FnPtr.
+                    Ty::FnPtr {
+                        params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
+                        ret: Box::new(sig.ret.clone()),
+                    }
                 } else {
                     self.errors.push(TypeError {
                         span: expr.span,
@@ -1277,6 +1289,28 @@ impl<'a> FnChecker<'a> {
                 return self.check_variant_call(&ty_name, variant, args, whole_span);
             }
 
+            // Check if `name` is a local variable of FnPtr or I64 type
+            // (indirect call through a variable that holds a function address).
+            if let Some(binding) = self.lookup(name) {
+                match binding.ty.clone() {
+                    Ty::FnPtr { params, ret } => {
+                        let param_pairs: Vec<(String, Ty)> = params
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| (format!("_{i}"), t.clone()))
+                            .collect();
+                        self.check_args_against_params(&param_pairs, args, whole_span);
+                        return *ret;
+                    }
+                    // An i64 variable can hold a function address (opaque fn ptr).
+                    // We can't statically know the signature, so return Error to
+                    // silence cascading type errors. The codegen handles this via
+                    // call_indirect at runtime.
+                    Ty::I64 => return Ty::Error,
+                    _ => {} // Variable exists but is not callable — fall through to error.
+                }
+            }
+
             self.errors.push(TypeError {
                 span: callee.span,
                 message: format!("unknown function `{name}`"),
@@ -1284,11 +1318,21 @@ impl<'a> FnChecker<'a> {
             return Ty::Error;
         }
 
-        // Anything else (e.g. calling the result of an expression) isn't
-        // supported in v1.
+        // Try indirect call: the callee might be a variable of FnPtr type.
+        let callee_ty = self.infer_expr(callee);
+        if let Ty::FnPtr { params, ret } = callee_ty {
+            let param_pairs: Vec<(String, Ty)> = params
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (format!("_{i}"), t.clone()))
+                .collect();
+            self.check_args_against_params(&param_pairs, args, whole_span);
+            return *ret;
+        }
+
         self.errors.push(TypeError {
             span: whole_span,
-            message: "only direct function calls are supported".into(),
+            message: "not a callable function or function pointer".into(),
         });
         Ty::Error
     }
@@ -2163,6 +2207,10 @@ impl<'a> FnChecker<'a> {
 fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Error, _) | (_, Ty::Error) => true,
+        // A function pointer is represented as an i64 address, so it's
+        // compatible with i64 parameters (used when passing fn names as args
+        // before FnPtr syntax lands in the parser).
+        (Ty::FnPtr { .. }, Ty::I64) | (Ty::I64, Ty::FnPtr { .. }) => true,
         // Option<Error> from `None` unifies with any Option<T>.
         (Ty::Option(inner), Ty::Option(_)) | (Ty::Option(_), Ty::Option(inner))
             if matches!(**inner, Ty::Error) =>

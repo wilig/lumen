@@ -3237,7 +3237,9 @@ fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
         | Ty::Result(_, _)
         | Ty::List(_)
         | Ty::Handle(_)
-        | Ty::Tuple(_) => ValType::I32,
+        | Ty::Tuple(_)
+        // Function pointers are i32 addresses in Wasm linear memory.
+        | Ty::FnPtr { .. } => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
         Ty::Error => {

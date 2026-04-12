@@ -1541,6 +1541,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 } else if let Some(sum_name) = self.find_sum_for_variant(name) {
                     let tag = self.variant_tag(&Ty::User(sum_name), name).unwrap_or(0);
                     self.build_sum_block(tag, None)
+                } else if let Some(&func_id) = self.cg.fn_ids.get(name) {
+                    // A function name used as a value — emit its address as a PTR.
+                    let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+                    Ok(self.builder.ins().func_addr(PTR, func_ref))
                 } else {
                     Err(NativeError {
                         span: expr.span,
@@ -1765,6 +1769,47 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             let layout = fields.clone();
             let payload = self.build_payload_block(&layout, args, span)?;
             return self.build_sum_block(tag, Some(payload));
+        }
+
+        // Indirect call through a local FnPtr or I64 variable.
+        if let Some(&var) = self.names.get(&name) {
+            let local_ty = self.name_types.get(&name).cloned();
+            let func_ptr_val = self.builder.use_var(var);
+            let mut sig = self.cg.obj.make_signature();
+            let indirect = match &local_ty {
+                Some(Ty::FnPtr { params, ret }) => {
+                    for p in params {
+                        sig.params.push(AbiParam::new(lumen_to_cl(p)));
+                    }
+                    if **ret != Ty::Unit {
+                        sig.returns.push(AbiParam::new(lumen_to_cl(ret)));
+                    } else {
+                        sig.returns.push(AbiParam::new(cl_types::I32));
+                    }
+                    true
+                }
+                // Opaque i64 fn address: infer signature from call-site args.
+                // Return type assumed i32 (the most common case for MVPs).
+                Some(Ty::I64) => {
+                    for a in args {
+                        let arg_ty = self.infer_ty(&a.value)?;
+                        sig.params.push(AbiParam::new(lumen_to_cl(&arg_ty)));
+                    }
+                    sig.returns.push(AbiParam::new(cl_types::I32));
+                    true
+                }
+                _ => false,
+            };
+            if indirect {
+                let mut arg_vals = Vec::new();
+                for a in args {
+                    let val = self.compile_expr(&a.value)?;
+                    arg_vals.push(val);
+                }
+                let sig_ref = self.builder.import_signature(sig);
+                let call = self.builder.ins().call_indirect(sig_ref, func_ptr_val, &arg_vals);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
         }
 
         // User function call.
@@ -3156,6 +3201,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 if let Some(ty) = self.name_types.get(name) {
                     return Ok(ty.clone());
                 }
+                // If the ident names a known function, return its FnPtr type.
+                if let Some(sig) = self.cg.info.fns.get(name) {
+                    let params: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+                    return Ok(Ty::FnPtr { params, ret: Box::new(sig.ret.clone()) });
+                }
                 Ty::I32 // fallback
             }
             ExprKind::Paren(e) => self.infer_ty(e)?,
@@ -3196,6 +3246,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     if let Some(sum_name) = self.find_sum_for_variant(name) {
                         return Ok(Ty::User(sum_name));
+                    }
+                    // Calling a local FnPtr variable — return its ret type.
+                    if let Some(Ty::FnPtr { ret, .. }) = self.name_types.get(name) {
+                        return Ok(*ret.clone());
                     }
                 }
                 Ty::I32
@@ -3392,6 +3446,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
+        Ty::FnPtr { .. } => PTR,
         Ty::Error => cl_types::I32,
     }
 }
@@ -3404,6 +3459,8 @@ fn is_scalar(ty: &Ty) -> bool {
         // own memory via realloc inside push/remove. RC decrementing a
         // list after realloc moved it would double-free.
         | Ty::List(_)
+        // Function pointers are just integer addresses — no RC needed.
+        | Ty::FnPtr { .. }
     )
 }
 
@@ -3412,6 +3469,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
+        Ty::FnPtr { .. } => 8,
         Ty::Error => 4,
     }
 }
