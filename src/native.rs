@@ -595,7 +595,7 @@ impl<'a> NativeCodegen<'a> {
             for (pname, pty) in sig.params.iter() {
                 if !is_scalar(pty) {
                     if let Some(&var) = fb.names.get(pname) {
-                        param_cleanup.push((pname.clone(), var));
+                        param_cleanup.push((pname.clone(), var, pty.clone()));
                     }
                 }
             }
@@ -912,8 +912,8 @@ struct FnEmitter<'a, 'b, 'c> {
     name_types: HashMap<String, Ty>,
     /// Stack of cleanup lists. Each block pushes a list; pointer-typed
     /// `let` bindings are appended to the current list. On block exit,
-    /// everything in the list is rc_decr'd.
-    cleanup_stack: Vec<Vec<(String, Variable)>>,
+    /// everything in the list is rc_decr'd with type-aware child cleanup.
+    cleanup_stack: Vec<Vec<(String, Variable, Ty)>>,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -945,7 +945,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     fn compile_block_with_cleanup(
         &mut self,
         block: &ast::Block,
-        initial_cleanup: Vec<(String, Variable)>,
+        initial_cleanup: Vec<(String, Variable, Ty)>,
     ) -> Result<Value, NativeError> {
         self.cleanup_stack.push(initial_cleanup);
         for stmt in &block.stmts {
@@ -970,9 +970,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             self.emit_rc_incr(result);
         }
         let cleanup = self.cleanup_stack.pop().unwrap_or_default();
-        for (_name, var) in &cleanup {
+        for (_name, var, ty) in &cleanup {
             let val = self.builder.use_var(*var);
-            self.emit_rc_decr(val);
+            self.emit_rc_decr_typed(val, ty);
         }
         Ok(result)
     }
@@ -990,17 +990,17 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 // Register pointer-typed bindings for scope-exit cleanup.
                 if !is_scalar(&lumen_ty) {
                     if let Some(list) = self.cleanup_stack.last_mut() {
-                        list.push((name.clone(), var));
+                        list.push((name.clone(), var, lumen_ty));
                     }
                 }
             }
             StmtKind::Assign { name, value } => {
-                // RC: decrement the old value before overwriting.
-                if let Some(ty) = self.name_types.get(name) {
-                    if !is_scalar(ty) {
+                // RC: decrement the old value before overwriting (typed).
+                if let Some(ty) = self.name_types.get(name).cloned() {
+                    if !is_scalar(&ty) {
                         if let Some(&var) = self.names.get(name) {
                             let old = self.builder.use_var(var);
-                            self.emit_rc_decr(old);
+                            self.emit_rc_decr_typed(old, &ty);
                         }
                     }
                 }
@@ -1518,6 +1518,98 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .obj
             .declare_func_in_func(self.cg.helper_rc_decr, self.builder.func);
         self.builder.ins().call(func_ref, &[ptr]);
+    }
+
+    /// Type-aware rc_decr: if the type has pointer children and the
+    /// refcount is about to hit 0, recursively decr the children BEFORE
+    /// freeing the block. Falls back to generic rc_decr for leaf types.
+    fn emit_rc_decr_typed(&mut self, ptr: Value, ty: &Ty) {
+        if is_scalar(ty) {
+            return;
+        }
+        if !self.type_has_ptr_children(ty) {
+            // Strings, simple scalars wrapped in Option/Result with
+            // scalar payloads — no recursive work needed.
+            self.emit_rc_decr(ptr);
+            return;
+        }
+
+        // Inline check: if rc == 1, decr children first, then generic decr.
+        // If rc > 1, just generic decr (children stay alive).
+        let flags = MemFlags::new();
+        let is_null = self.builder.ins().icmp_imm(IntCC::Equal, ptr, 0);
+        let check_bb = self.builder.create_block();
+        let decr_children_bb = self.builder.create_block();
+        let do_decr_bb = self.builder.create_block();
+        let exit_bb = self.builder.create_block();
+
+        self.builder.ins().brif(is_null, exit_bb, &[], check_bb, &[]);
+
+        self.builder.switch_to_block(check_bb);
+        let eight = self.builder.ins().iconst(PTR, 8);
+        let header = self.builder.ins().isub(ptr, eight);
+        // Check magic.
+        let magic = self.builder.ins().load(cl_types::I32, flags, header, 4);
+        let expected = self.builder.ins().iconst(cl_types::I32, 0x4C554D45u32 as i64);
+        let is_rc = self.builder.ins().icmp(IntCC::Equal, magic, expected);
+        self.builder.ins().brif(is_rc, do_decr_bb, &[], exit_bb, &[]);
+
+        self.builder.switch_to_block(do_decr_bb);
+        let rc = self.builder.ins().load(cl_types::I32, flags, header, 0);
+        let will_free = self.builder.ins().icmp_imm(IntCC::Equal, rc, 1);
+        self.builder.ins().brif(will_free, decr_children_bb, &[], exit_bb, &[]);
+
+        // Decr children before the generic decr frees the block.
+        self.builder.switch_to_block(decr_children_bb);
+        self.emit_child_decrs(ptr, ty);
+        self.builder.ins().jump(exit_bb, &[]);
+
+        self.builder.switch_to_block(exit_bb);
+        // Always call generic decr (handles the actual rc-- and free).
+        self.emit_rc_decr(ptr);
+    }
+
+    /// Emit rc_decr calls for each pointer-typed child field of a value.
+    fn emit_child_decrs(&mut self, ptr: Value, ty: &Ty) {
+        let flags = MemFlags::new();
+        match ty {
+            Ty::User(name) => {
+                let fields = get_struct_fields(&self.cg.info.types, name);
+                for (fname, fty) in &fields {
+                    if !is_scalar(fty) {
+                        let (offset, _) = field_offset(&fields, fname);
+                        let child = self.builder.ins().load(PTR, flags, ptr, offset);
+                        // Recursive: children might have their own children.
+                        self.emit_rc_decr_typed(child, fty);
+                    }
+                }
+            }
+            Ty::Option(_) | Ty::Result(_, _) => {
+                // Sum type: payload_ptr is at offset +8.
+                let payload = self.builder.ins().load(PTR, flags, ptr, 8);
+                // Generic decr on the payload block (we don't know the
+                // variant's field layout at this point without checking
+                // the tag, so we just release the payload's own refcount).
+                self.emit_rc_decr(payload);
+            }
+            Ty::String => {
+                // Strings have no pointer children.
+            }
+            _ => {}
+        }
+    }
+
+    /// Does this type contain pointer-typed fields that need recursive
+    /// decrement on free?
+    fn type_has_ptr_children(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::User(name) => {
+                let fields = get_struct_fields(&self.cg.info.types, name);
+                fields.iter().any(|(_, fty)| !is_scalar(fty))
+            }
+            Ty::Option(_) | Ty::Result(_, _) => true, // payload ptr
+            _ => false,
+        }
     }
 
     /// Emit rc_decr for all pointer-typed local variables currently in scope.
