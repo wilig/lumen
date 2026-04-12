@@ -723,9 +723,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ExprKind::Ident(name) => {
                 if let Some(&var) = self.names.get(name) {
                     Ok(self.builder.use_var(var))
-                } else if name == "None" || self.find_sum_for_variant(name).is_some() {
-                    // Zero-payload constructor — stub for now.
-                    Ok(self.builder.ins().iconst(PTR, 0))
+                } else if name == "None" {
+                    self.build_sum_block(0, None)
+                } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    let tag = self.variant_tag(&Ty::User(sum_name), name).unwrap_or(0);
+                    self.build_sum_block(tag, None)
                 } else {
                     Err(NativeError {
                         span: expr.span,
@@ -791,17 +793,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
             ExprKind::Block(b) => self.compile_block(b),
             ExprKind::Match { scrutinee, arms } => {
-                Err(NativeError {
-                    span: expr.span,
-                    message: "match not yet implemented in native backend (coming next)".into(),
-                })
+                self.compile_match(scrutinee, arms, expr.span)
             }
-            ExprKind::Try(inner) => {
-                Err(NativeError {
-                    span: expr.span,
-                    message: "? not yet implemented in native backend (coming next)".into(),
-                })
-            }
+            ExprKind::Try(inner) => self.compile_try(inner, expr.span),
             _ => Err(NativeError {
                 span: expr.span,
                 message: "expression not supported in native backend".into(),
@@ -891,16 +885,27 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             return Ok(len);
         }
 
-        // Built-in range (not a runtime call — handled by for-loop).
-        // Ok/Err/Some/None constructors — stub for now.
+        // Built-in Option/Result constructors.
         match name.as_str() {
-            "Ok" | "Err" | "Some" => {
-                // Placeholder: just return the inner value.
-                // Full sum-type support coming next.
-                return self.compile_expr(&args[0].value);
-            }
-            "None" => return Ok(self.builder.ins().iconst(PTR, 0)),
+            "Ok" => return self.compile_single_field_constructor(0, &args[0].value),
+            "Err" => return self.compile_single_field_constructor(1, &args[0].value),
+            "Some" => return self.compile_single_field_constructor(1, &args[0].value),
+            "None" => return self.build_sum_block(0, None),
             _ => {}
+        }
+
+        // User variant constructor (positional payload)?
+        if let Some(sum_name) = self.find_sum_for_variant(&name) {
+            let tag = self.variant_tag(&Ty::User(sum_name), &name).unwrap_or(0);
+            if args.is_empty() {
+                return self.build_sum_block(tag, None);
+            }
+            // Positional variant: allocate payload with fields.
+            let scrut_ty = Ty::User(self.find_sum_for_variant(&name).unwrap());
+            let fields = self.variant_field_types(&scrut_ty, &name).unwrap_or_default();
+            let layout = fields.clone();
+            let payload = self.build_payload_block(&layout, args, span)?;
+            return self.build_sum_block(tag, Some(payload));
         }
 
         // User function call.
@@ -1055,6 +1060,27 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         fields: &[ast::FieldInit],
         span: Span,
     ) -> Result<Value, NativeError> {
+        // Named-field variant constructor? (e.g. Circle { radius: 2 })
+        if get_struct_fields(&self.cg.info.types, name).is_empty() {
+            if let Some(sum_name) = self.find_sum_for_variant(name) {
+                let scrut_ty = Ty::User(sum_name);
+                let tag = self.variant_tag(&scrut_ty, name).unwrap_or(0);
+                let var_fields = self.variant_field_types(&scrut_ty, name).unwrap_or_default();
+                if var_fields.is_empty() {
+                    return self.build_sum_block(tag, None);
+                }
+                let total = struct_size(&var_fields);
+                let payload = self.bump_alloc(total as i64)?;
+                for (fname, fty) in &var_fields {
+                    let init = fields.iter().find(|fi| &fi.name == fname).unwrap();
+                    let val = self.compile_expr(&init.value)?;
+                    let (offset, _) = field_offset(&var_fields, fname);
+                    self.builder.ins().store(MemFlags::new(), val, payload, offset);
+                }
+                return self.build_sum_block(tag, Some(payload));
+            }
+        }
+
         let def_fields = get_struct_fields(&self.cg.info.types, name);
         let total_size = struct_size(&def_fields);
         let ptr = self.bump_alloc(total_size as i64)?;
@@ -1100,6 +1126,310 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(result)
     }
 
+    // --- Sum-type helpers ------------------------------------------------
+
+    /// Allocate a 16-byte sum block { tag: i32 @+0, payload_ptr: i64 @+8 }.
+    fn build_sum_block(
+        &mut self,
+        tag: u32,
+        payload_ptr: Option<Value>,
+    ) -> Result<Value, NativeError> {
+        let ptr = self.bump_alloc(16)?;
+        let tag_val = self.builder.ins().iconst(cl_types::I32, tag as i64);
+        self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0);
+        let payload = payload_ptr.unwrap_or_else(|| self.builder.ins().iconst(PTR, 0));
+        self.builder.ins().store(MemFlags::new(), payload, ptr, 8);
+        Ok(ptr)
+    }
+
+    /// Ok(v), Err(e), Some(v): allocate a field block for the single value,
+    /// then wrap in a sum block.
+    fn compile_single_field_constructor(
+        &mut self,
+        tag: u32,
+        value: &Expr,
+    ) -> Result<Value, NativeError> {
+        let val = self.compile_expr(value)?;
+        let ty = self.infer_ty(value)?;
+        let size = native_sizeof(&ty);
+        let field_ptr = self.bump_alloc(size as i64)?;
+        self.builder.ins().store(MemFlags::new(), val, field_ptr, 0);
+        self.build_sum_block(tag, Some(field_ptr))
+    }
+
+    /// Allocate a payload block for a positional variant and store each
+    /// arg value at the correct offset.
+    fn build_payload_block(
+        &mut self,
+        fields: &[(String, Ty)],
+        args: &[ast::Arg],
+        _span: Span,
+    ) -> Result<Value, NativeError> {
+        let total = struct_size(fields);
+        let ptr = self.bump_alloc(total as i64)?;
+        for (i, (fname, _fty)) in fields.iter().enumerate() {
+            if let Some(arg) = args.get(i) {
+                let val = self.compile_expr(&arg.value)?;
+                let (offset, _) = field_offset(fields, fname);
+                self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+            }
+        }
+        Ok(ptr)
+    }
+
+    /// Match on a sum type (Option, Result, or user sum). Compiled as a
+    /// chain of if-else on the tag discriminant, same structure as the
+    /// Wasm backend.
+    fn compile_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[ast::MatchArm],
+        _span: Span,
+    ) -> Result<Value, NativeError> {
+        let scrut_ty = self.infer_ty(scrutinee)?;
+        let scrut_val = self.compile_expr(scrutinee)?;
+
+        // Store scrutinee in a variable so we can re-read tag + payload.
+        let scrut_var = self.fresh_var(PTR);
+        self.builder.def_var(scrut_var, scrut_val);
+
+        let result_ty = arms
+            .first()
+            .map(|a| self.infer_ty(&a.body))
+            .transpose()?
+            .unwrap_or(Ty::Unit);
+        let cl_result = lumen_to_cl(&result_ty);
+
+        let merge_bb = self.builder.create_block();
+        self.builder.append_block_param(merge_bb, cl_result);
+
+        self.compile_match_arms(arms, 0, scrut_var, &scrut_ty, cl_result, merge_bb)?;
+
+        self.builder.switch_to_block(merge_bb);
+        Ok(self.builder.block_params(merge_bb)[0])
+    }
+
+    fn compile_match_arms(
+        &mut self,
+        arms: &[ast::MatchArm],
+        idx: usize,
+        scrut_var: Variable,
+        scrut_ty: &Ty,
+        cl_result: CLType,
+        merge_bb: cranelift_codegen::ir::Block,
+    ) -> Result<(), NativeError> {
+        use ast::PatternKind;
+
+        if idx >= arms.len() {
+            self.builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+            return Ok(());
+        }
+        let arm = &arms[idx];
+
+        let always = matches!(
+            arm.pattern.kind,
+            PatternKind::Wildcard | PatternKind::Binding(_)
+        );
+
+        if always {
+            if let PatternKind::Binding(name) = &arm.pattern.kind {
+                let var = self.fresh_var(PTR);
+                let v = self.builder.use_var(scrut_var);
+                self.builder.def_var(var, v);
+                self.names.insert(name.clone(), var);
+            }
+            let body_val = self.compile_expr(&arm.body)?;
+            self.builder
+                .ins()
+                .jump(merge_bb, &[BlockArg::Value(body_val)]);
+            return Ok(());
+        }
+
+        let PatternKind::Variant {
+            name: variant_name,
+            payload,
+        } = &arm.pattern.kind
+        else {
+            // Unsupported pattern kind — treat as wildcard.
+            let body_val = self.compile_expr(&arm.body)?;
+            self.builder
+                .ins()
+                .jump(merge_bb, &[BlockArg::Value(body_val)]);
+            return Ok(());
+        };
+
+        let tag = self.variant_tag(scrut_ty, variant_name).unwrap_or(0);
+        let scrut_ptr = self.builder.use_var(scrut_var);
+        let actual_tag = self.builder.ins().load(cl_types::I32, MemFlags::new(), scrut_ptr, 0);
+        let tag_val = self.builder.ins().iconst(cl_types::I32, tag as i64);
+        let matches = self.builder.ins().icmp(IntCC::Equal, actual_tag, tag_val);
+
+        let matched_bb = self.builder.create_block();
+        let next_bb = self.builder.create_block();
+        self.builder.ins().brif(matches, matched_bb, &[], next_bb, &[]);
+
+        // Matched branch.
+        self.builder.switch_to_block(matched_bb);
+        if let Some(payload_pat) = payload {
+            let scrut_ptr = self.builder.use_var(scrut_var);
+            let payload_ptr = self.builder.ins().load(PTR, MemFlags::new(), scrut_ptr, 8);
+            self.bind_pattern_payload(payload_pat, &scrut_ty.clone(), variant_name, payload_ptr)?;
+        }
+        let body_val = self.compile_expr(&arm.body)?;
+        self.builder
+            .ins()
+            .jump(merge_bb, &[BlockArg::Value(body_val)]);
+
+        // Next branch.
+        self.builder.switch_to_block(next_bb);
+        self.compile_match_arms(arms, idx + 1, scrut_var, scrut_ty, cl_result, merge_bb)?;
+
+        Ok(())
+    }
+
+    fn bind_pattern_payload(
+        &mut self,
+        payload: &ast::VariantPatPayload,
+        scrut_ty: &Ty,
+        variant_name: &str,
+        payload_ptr: Value,
+    ) -> Result<(), NativeError> {
+        use ast::{PatternKind, VariantPatPayload};
+
+        let fields = self.variant_field_types(scrut_ty, variant_name).unwrap_or_default();
+        let sub_pats: Vec<(&str, &ast::Pattern, i32, Ty)> = match payload {
+            VariantPatPayload::Named(pfs) => pfs
+                .iter()
+                .filter_map(|pf| {
+                    let (off, fty) = field_offset(&fields, &pf.name);
+                    Some((pf.name.as_str(), &pf.pattern, off, fty))
+                })
+                .collect(),
+            VariantPatPayload::Positional(pats) => pats
+                .iter()
+                .enumerate()
+                .filter_map(|(i, pat)| {
+                    let (fname, fty) = fields.get(i)?;
+                    let (off, _) = field_offset(&fields, fname);
+                    Some(("", pat, off, fty.clone()))
+                })
+                .collect(),
+        };
+
+        for (_name, pat, offset, fty) in sub_pats {
+            if let PatternKind::Binding(bind_name) = &pat.kind {
+                let cl_ty = lumen_to_cl(&fty);
+                let val = self.builder.ins().load(cl_ty, MemFlags::new(), payload_ptr, offset);
+                let var = self.fresh_var(cl_ty);
+                self.builder.def_var(var, val);
+                self.names.insert(bind_name.clone(), var);
+            }
+        }
+        Ok(())
+    }
+
+    /// `expr?` — check tag, return on error, extract value on success.
+    fn compile_try(
+        &mut self,
+        inner: &Expr,
+        _span: Span,
+    ) -> Result<Value, NativeError> {
+        let inner_ty = self.infer_ty(inner)?;
+        let (err_tag, ok_payload_ty) = match inner_ty {
+            Ty::Result(ok, _) => (1u32, *ok),
+            Ty::Option(inner) => (0u32, *inner),
+            _ => {
+                return Err(NativeError {
+                    span: _span,
+                    message: "`?` requires Result or Option".into(),
+                })
+            }
+        };
+
+        let sum_ptr = self.compile_expr(inner)?;
+        let scrut_var = self.fresh_var(PTR);
+        self.builder.def_var(scrut_var, sum_ptr);
+
+        let tag = self.builder.ins().load(cl_types::I32, MemFlags::new(), sum_ptr, 0);
+        let err_tag_val = self.builder.ins().iconst(cl_types::I32, err_tag as i64);
+        let is_err = self.builder.ins().icmp(IntCC::Equal, tag, err_tag_val);
+
+        let err_bb = self.builder.create_block();
+        let ok_bb = self.builder.create_block();
+        self.builder.ins().brif(is_err, err_bb, &[], ok_bb, &[]);
+
+        // Err path: return the sum pointer directly.
+        self.builder.switch_to_block(err_bb);
+        let err_ptr = self.builder.use_var(scrut_var);
+        self.builder.ins().return_(&[err_ptr]);
+
+        // Ok path: load payload, extract value.
+        self.builder.switch_to_block(ok_bb);
+        let ok_ptr = self.builder.use_var(scrut_var);
+        let payload_ptr = self.builder.ins().load(PTR, MemFlags::new(), ok_ptr, 8);
+        let cl_ty = lumen_to_cl(&ok_payload_ty);
+        let val = self.builder.ins().load(cl_ty, MemFlags::new(), payload_ptr, 0);
+        Ok(val)
+    }
+
+    fn variant_tag(&self, scrut_ty: &Ty, variant_name: &str) -> Option<u32> {
+        match scrut_ty {
+            Ty::User(type_name) => {
+                if let Some(TypeInfo::Sum { variants, .. }) = self.cg.info.types.get(type_name) {
+                    variants
+                        .iter()
+                        .position(|v| v.name == variant_name)
+                        .map(|i| i as u32)
+                } else {
+                    None
+                }
+            }
+            Ty::Option(_) => match variant_name {
+                "None" => Some(0),
+                "Some" => Some(1),
+                _ => None,
+            },
+            Ty::Result(_, _) => match variant_name {
+                "Ok" => Some(0),
+                "Err" => Some(1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn variant_field_types(&self, scrut_ty: &Ty, variant_name: &str) -> Option<Vec<(String, Ty)>> {
+        match scrut_ty {
+            Ty::User(type_name) => {
+                if let Some(TypeInfo::Sum { variants, .. }) = self.cg.info.types.get(type_name) {
+                    let v = variants.iter().find(|v| v.name == variant_name)?;
+                    Some(match &v.payload {
+                        None => Vec::new(),
+                        Some(crate::types::VariantPayloadInfo::Named(fs)) => fs.clone(),
+                        Some(crate::types::VariantPayloadInfo::Positional(tys)) => tys
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| (format!("_{i}"), t.clone()))
+                            .collect(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Ty::Option(inner) => match variant_name {
+                "None" => Some(Vec::new()),
+                "Some" => Some(vec![("_0".into(), (**inner).clone())]),
+                _ => None,
+            },
+            Ty::Result(ok, err) => match variant_name {
+                "Ok" => Some(vec![("_0".into(), (**ok).clone())]),
+                "Err" => Some(vec![("_0".into(), (**err).clone())]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn infer_ty(&self, expr: &Expr) -> Result<Ty, NativeError> {
         // Simplified type inference for codegen dispatch.
         Ok(match &expr.kind {
@@ -1134,13 +1464,32 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 UnaryOp::Not => Ty::Bool,
             },
             ExprKind::Cast { to, .. } => resolve_cast_target(to)?,
-            ExprKind::Call { callee, .. } => {
+            ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(name) = &callee.kind {
                     if name == "string_len" {
                         return Ok(Ty::I32);
                     }
+                    match name.as_str() {
+                        "Ok" => {
+                            let ok_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?.unwrap_or(Ty::Error);
+                            return Ok(Ty::Result(Box::new(ok_ty), Box::new(Ty::Error)));
+                        }
+                        "Err" => {
+                            let err_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?.unwrap_or(Ty::Error);
+                            return Ok(Ty::Result(Box::new(Ty::Error), Box::new(err_ty)));
+                        }
+                        "Some" => {
+                            let inner = args.first().map(|a| self.infer_ty(&a.value)).transpose()?.unwrap_or(Ty::Error);
+                            return Ok(Ty::Option(Box::new(inner)));
+                        }
+                        "None" => return Ok(Ty::Option(Box::new(Ty::Error))),
+                        _ => {}
+                    }
                     if let Some(sig) = self.cg.info.fns.get(name) {
                         return Ok(sig.ret.clone());
+                    }
+                    if let Some(sum_name) = self.find_sum_for_variant(name) {
+                        return Ok(Ty::User(sum_name));
                     }
                 }
                 Ty::I32
@@ -1171,6 +1520,19 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
             }
             ExprKind::If { then_block, .. } => self.infer_block_ty(then_block).unwrap_or(Ty::Unit),
+            ExprKind::Match { arms, .. } => arms
+                .first()
+                .map(|a| self.infer_ty(&a.body))
+                .transpose()?
+                .unwrap_or(Ty::I32),
+            ExprKind::Try(inner) => {
+                let inner_ty = self.infer_ty(inner)?;
+                match inner_ty {
+                    Ty::Result(ok, _) => *ok,
+                    Ty::Option(inner) => *inner,
+                    _ => Ty::Error,
+                }
+            }
             _ => Ty::I32,
         })
     }
@@ -1202,6 +1564,15 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::F64 => cl_types::F64,
         Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => PTR,
         Ty::Error => cl_types::I32,
+    }
+}
+
+fn native_sizeof(ty: &Ty) -> i32 {
+    match ty {
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
+        Ty::I64 | Ty::U64 | Ty::F64 => 8,
+        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => 8, // pointer
+        Ty::Error => 4,
     }
 }
 
