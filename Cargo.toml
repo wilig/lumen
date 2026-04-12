@@ -16,8 +16,25 @@ path = "src/lib.rs"
 
 [dependencies]
 wasm-encoder = "0.246"
-wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
-wasmtime-wasi = "43"
+cranelift-codegen = "0.130"
+cranelift-frontend = "0.130"
+cranelift-module = "0.130"
+cranelift-object = "0.130"
+cranelift-native = "0.130"
+target-lexicon = "0.13"
+
+[features]
+wasm-runtime = ["wasmtime", "wasmtime-wasi"]
+
+[dependencies.wasmtime]
+version = "43"
+default-features = false
+features = ["cranelift", "runtime"]
+optional = true
+
+[dependencies.wasmtime-wasi]
+version = "43"
+optional = true
 
 [dev-dependencies]
 wasmparser = "0.246"

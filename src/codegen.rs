@@ -3314,6 +3314,7 @@ mod tests {
 
     // --- End-to-end execution via Wasmtime --------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     fn run_i32(wasm: &[u8], func: &str) -> i32 {
         use wasmtime::*;
         let engine = Engine::default();
@@ -3326,6 +3327,7 @@ mod tests {
         f.call(&mut store, ()).expect("call")
     }
 
+    #[cfg(feature = "wasm-runtime")]
     fn run_i32_i32(wasm: &[u8], func: &str, arg: i32) -> i32 {
         use wasmtime::*;
         let engine = Engine::default();
@@ -3338,6 +3340,7 @@ mod tests {
         f.call(&mut store, arg).expect("call")
     }
 
+    #[cfg(feature = "wasm-runtime")]
     fn run_i64(wasm: &[u8], func: &str) -> i64 {
         use wasmtime::*;
         let engine = Engine::default();
@@ -3350,18 +3353,21 @@ mod tests {
         f.call(&mut store, ()).expect("call")
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_constant_i32() {
         let wasm = compile_src("fn answer(): i32 { 42 }");
         assert_eq!(run_i32(&wasm, "answer"), 42);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_arithmetic_chain() {
         let wasm = compile_src("fn value(): i32 { (1 + 2) * (3 + 4) - 5 }");
         assert_eq!(run_i32(&wasm, "value"), 16);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_user_function_calls() {
         let src = r#"
@@ -3372,6 +3378,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "value"), 25);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_with_parameter() {
         let src = "fn cube(n: i32): i32 { n * n * n }";
@@ -3380,6 +3387,7 @@ mod tests {
         assert_eq!(run_i32_i32(&wasm, "cube", 5), 125);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_if_expression() {
         let src = "fn abs(n: i32): i32 { if n < 0 { -n } else { n } }";
@@ -3389,6 +3397,7 @@ mod tests {
         assert_eq!(run_i32_i32(&wasm, "abs", 0), 0);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_var_accumulation() {
         // A manual loop-unroll that uses `var` + assignment.
@@ -3404,6 +3413,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "four_plus_three"), 7);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_i64_arithmetic() {
         let src = "fn big(): i64 { 1000000i64 * 1000i64 }";
@@ -3411,6 +3421,7 @@ mod tests {
         assert_eq!(run_i64(&wasm, "big"), 1_000_000_000);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_cast_widening() {
         let src = "fn widen(n: i32): i64 { n as i64 }";
@@ -3424,6 +3435,7 @@ mod tests {
         assert_eq!(f.call(&mut store, 42).unwrap(), 42i64);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_literal_length() {
         let src = r#"fn hello_len(): i32 { string_len("hello") }"#;
@@ -3432,6 +3444,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "hello_len"), 5);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_concat_length() {
         // The star criterion: string concat compiles and runs end-to-end.
@@ -3441,6 +3454,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "total"), 12);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_concat_three_way() {
         let src = r#"fn total(): i32 { string_len("a" + "bc" + "def") }"#;
@@ -3448,6 +3462,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "total"), 6);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_concat_with_variable() {
         let src = r#"
@@ -3460,6 +3475,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "greet"), 12);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_literal_deduplicated() {
         // Using the same literal twice should not crash — the scanner
@@ -3475,6 +3491,7 @@ mod tests {
 
     // --- Structs -----------------------------------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_struct_literal_and_field_access() {
         let src = r#"
@@ -3490,6 +3507,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "make_and_read"), 7);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_struct_with_mixed_field_widths() {
         // i64 field forces 8-byte alignment; make sure the layout holds.
@@ -3512,6 +3530,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "tag"), 7);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_struct_as_argument_and_return() {
         let src = r#"
@@ -3535,6 +3554,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "manhattan"), 7);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_struct_with_string_field() {
         // Make sure the string field's i32 pointer layout interacts with
@@ -3553,6 +3573,7 @@ mod tests {
 
     // --- Sum types: Option / Result / match / ? -------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_some_none_construction() {
         // Option<i32> constructors allocate; we can't read the value back
@@ -3566,6 +3587,7 @@ mod tests {
         wasmparser::validate(&wasm).expect("module must validate");
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_match_option_extracts_value() {
         let src = r#"
@@ -3585,6 +3607,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "with_none"), 99);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_match_result_extracts_value() {
         let src = r#"
@@ -3611,6 +3634,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "test_err"), 100);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_try_operator_happy_path() {
         let src = r#"
@@ -3634,6 +3658,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "run"), 30);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_try_operator_short_circuits_on_err() {
         let src = r#"
@@ -3655,6 +3680,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "run"), 42);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_user_sum_type_with_positional_variant() {
         let src = r#"
@@ -3674,6 +3700,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "number_val"), 7);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_user_sum_type_with_named_fields() {
         let src = r#"
@@ -3697,6 +3724,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "rect_area"), 12);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_user_sum_type_with_zero_payload_variants() {
         let src = r#"
@@ -3718,6 +3746,7 @@ mod tests {
         assert_eq!(run_i32(&wasm, "green_code"), 3);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_sibling_arms_reuse_binding_name() {
         // Two arms bind `h`; the scope refactor needs to put them in
@@ -3740,6 +3769,7 @@ mod tests {
 
     // --- For loops --------------------------------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_sum_of_squares_with_for_loop() {
         let src = r#"
@@ -3759,6 +3789,7 @@ mod tests {
         assert_eq!(run_i32_i32(&wasm, "sum_of_squares", 1), 1);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_triangle_number_for_loop() {
         let src = r#"
@@ -3775,6 +3806,7 @@ mod tests {
         assert_eq!(run_i32_i32(&wasm, "triangle", 100), 5050);
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_empty_range_does_nothing() {
         let src = r#"
@@ -3792,6 +3824,7 @@ mod tests {
 
     // --- WASI / io.println ------------------------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_hello_world_via_wasi() {
         let src = r#"
@@ -3831,6 +3864,7 @@ mod tests {
 
     // --- Stdlib: int.to_string_i32 -----------------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_int_to_string_positive() {
         let src = r#"
@@ -3867,6 +3901,7 @@ mod tests {
 
     // --- Error frames -----------------------------------------------------
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_error_frames_print_on_err() {
         let src = r#"
@@ -3920,6 +3955,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_error_frames_with_arg_capture() {
         let src = r#"
@@ -3967,6 +4003,7 @@ mod tests {
         assert!(out.contains("at main"), "expected main frame, got: {out}");
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_error_frames_empty_on_ok() {
         // When everything succeeds, no frames should print.
@@ -4003,6 +4040,7 @@ mod tests {
         assert!(output.is_empty(), "expected no output on Ok, got: {output}");
     }
 
+    #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_recursive_function() {
         let src = r#"

@@ -1,3 +1,4 @@
+#![cfg(feature = "wasm-runtime")]
 //! Golden tests: compile each `.lm` example, run it on Wasmtime, and
 //! compare stdout against the expected output.
 

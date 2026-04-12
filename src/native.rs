@@ -1,0 +1,1423 @@
+//! Native backend via Cranelift. Produces a relocatable object file (.o)
+//! that links with `cc` to produce a standalone executable.
+//!
+//! Same AST and type checker as the Wasm backend; only the codegen
+//! differs. Uses `cranelift-frontend`'s `FunctionBuilder` for automatic
+//! SSA construction.
+//!
+//! Memory model: same bump allocator as the Wasm backend, but in
+//! process memory (a large `static mut` buffer). String representation
+//! is identical: `[len: i32 | bytes...]` pointed to by an i64 address.
+//! Structs and sum types use the same layouts. IO goes through libc
+//! `write(2)` instead of WASI `fd_write`.
+
+use std::collections::HashMap;
+
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::types as cl_types;
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Type as CLType, Value};
+use cranelift_codegen::settings;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
+
+use crate::ast::{self, BinOp, Effect, Expr, ExprKind, FnDecl, Item, StmtKind, UnaryOp};
+use crate::lexer::IntSuffix;
+use crate::span::Span;
+use crate::types::{ModuleInfo, Ty, TypeInfo};
+
+/// Compile a type-checked module to a native object file (bytes).
+pub fn compile_native(
+    module: &ast::Module,
+    info: &ModuleInfo,
+) -> Result<Vec<u8>, NativeError> {
+    let mut cg = NativeCodegen::new(info)?;
+    cg.compile_module(module)?;
+    Ok(cg.finish())
+}
+
+#[derive(Debug)]
+pub struct NativeError {
+    pub span: Span,
+    pub message: String,
+}
+
+impl std::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}: {}", self.span.line, self.span.col, self.message)
+    }
+}
+
+impl std::error::Error for NativeError {}
+
+// The pointer type for the target — i64 on 64-bit.
+const PTR: CLType = cl_types::I64;
+
+// ---------------------------------------------------------------------------
+// Native codegen state
+// ---------------------------------------------------------------------------
+
+struct NativeCodegen<'a> {
+    info: &'a ModuleInfo,
+    obj: ObjectModule,
+
+    /// Lumen fn name → Cranelift FuncId.
+    fn_ids: HashMap<String, FuncId>,
+    /// Built-in helper func IDs.
+    libc_write: FuncId,
+    helper_concat: FuncId,
+    helper_println: FuncId,
+    helper_itoa: FuncId,
+
+    /// DataId for the heap buffer (a large static byte array).
+    heap_data: DataId,
+    /// DataId for the bump pointer (an 8-byte mutable global).
+    bump_ptr_data: DataId,
+    /// DataId for the frame chain pointer.
+    frame_chain_data: DataId,
+
+    /// Interned string literals: content → DataId.
+    string_data: HashMap<String, DataId>,
+
+    /// Uses WASI / io module.
+    uses_io: bool,
+}
+
+impl<'a> NativeCodegen<'a> {
+    fn new(info: &'a ModuleInfo) -> Result<Self, NativeError> {
+        let isa = cranelift_native::builder()
+            .map_err(|e| NativeError {
+                span: Span::DUMMY,
+                message: format!("cranelift ISA: {e}"),
+            })?
+            .finish(settings::Flags::new(settings::builder()))
+            .map_err(|e| NativeError {
+                span: Span::DUMMY,
+                message: format!("cranelift flags: {e}"),
+            })?;
+
+        let builder = ObjectBuilder::new(
+            isa,
+            "lumen_module",
+            cranelift_module::default_libcall_names(),
+        )
+        .map_err(|e| NativeError {
+            span: Span::DUMMY,
+            message: format!("object builder: {e}"),
+        })?;
+        let mut obj = ObjectModule::new(builder);
+
+        // Declare libc write(fd, buf, count) -> ssize_t
+        let mut write_sig = obj.make_signature();
+        write_sig.params.push(AbiParam::new(cl_types::I32)); // fd
+        write_sig.params.push(AbiParam::new(PTR)); // buf
+        write_sig.params.push(AbiParam::new(PTR)); // count
+        write_sig.returns.push(AbiParam::new(PTR)); // ssize_t
+        let libc_write = obj
+            .declare_function("write", Linkage::Import, &write_sig)
+            .unwrap();
+
+        // Heap: a 1MB static buffer. Enough for the prototype.
+        let heap_data = obj.declare_data("lumen_heap", Linkage::Local, true, false).unwrap();
+        let bump_ptr_data = obj.declare_data("lumen_bump", Linkage::Local, true, false).unwrap();
+        let frame_chain_data =
+            obj.declare_data("lumen_frame_chain", Linkage::Local, true, false).unwrap();
+
+        // Define heap: 1MB of zeros.
+        let mut desc = DataDescription::new();
+        desc.define_zeroinit(1024 * 1024);
+        obj.define_data(heap_data, &desc).unwrap();
+
+        // Define bump_ptr: 8 bytes, initially 0 (will be patched after
+        // string literals are placed).
+        let mut desc = DataDescription::new();
+        desc.define(vec![0u8; 8].into_boxed_slice());
+        obj.define_data(bump_ptr_data, &desc).unwrap();
+
+        // Define frame_chain: 8 bytes, initially 0.
+        let mut desc = DataDescription::new();
+        desc.define(vec![0u8; 8].into_boxed_slice());
+        obj.define_data(frame_chain_data, &desc).unwrap();
+
+        // Declare internal helpers (defined later).
+        let mut concat_sig = obj.make_signature();
+        concat_sig.params.push(AbiParam::new(PTR));
+        concat_sig.params.push(AbiParam::new(PTR));
+        concat_sig.returns.push(AbiParam::new(PTR));
+        let helper_concat = obj
+            .declare_function("lumen_concat", Linkage::Local, &concat_sig)
+            .unwrap();
+
+        let mut println_sig = obj.make_signature();
+        println_sig.params.push(AbiParam::new(PTR));
+        let helper_println = obj
+            .declare_function("lumen_println", Linkage::Local, &println_sig)
+            .unwrap();
+
+        let mut itoa_sig = obj.make_signature();
+        itoa_sig.params.push(AbiParam::new(cl_types::I32));
+        itoa_sig.returns.push(AbiParam::new(PTR));
+        let helper_itoa = obj
+            .declare_function("lumen_itoa", Linkage::Local, &itoa_sig)
+            .unwrap();
+
+        Ok(Self {
+            info,
+            obj,
+            fn_ids: HashMap::new(),
+            libc_write,
+            helper_concat,
+            helper_println,
+            helper_itoa,
+            heap_data,
+            bump_ptr_data,
+            frame_chain_data,
+            string_data: HashMap::new(),
+            uses_io: false,
+        })
+    }
+
+    fn compile_module(&mut self, module: &ast::Module) -> Result<(), NativeError> {
+        self.uses_io = module.imports.iter().any(|im| im.path == ["std", "io"]);
+
+        // Intern string literals + frame messages.
+        self.intern_all_strings(module);
+
+        // Declare all user functions.
+        for item in &module.items {
+            if let Item::Fn(f) = item {
+                let sig = self.build_sig(&f.name);
+                let id = self
+                    .obj
+                    .declare_function(&f.name, Linkage::Export, &sig)
+                    .unwrap();
+                self.fn_ids.insert(f.name.clone(), id);
+            }
+        }
+
+        // Define helper bodies.
+        self.define_concat_helper()?;
+        self.define_println_helper()?;
+        self.define_itoa_helper()?;
+
+        // Define user function bodies.
+        let fn_ids = self.fn_ids.clone();
+        for item in &module.items {
+            if let Item::Fn(f) = item {
+                let func_id = fn_ids[&f.name];
+                self.define_function(f, func_id)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let product = self.obj.finish();
+        product.emit().unwrap()
+    }
+
+    fn build_sig(&self, fn_name: &str) -> cranelift_codegen::ir::Signature {
+        let sig = &self.info.fns[fn_name];
+        let mut cl_sig = self.obj.make_signature();
+        for (_, ty) in &sig.params {
+            cl_sig.params.push(AbiParam::new(lumen_to_cl(ty)));
+        }
+        cl_sig.returns.push(AbiParam::new(lumen_to_cl(&sig.ret)));
+        cl_sig
+    }
+
+    // --- String interning -----------------------------------------------
+
+    fn intern_all_strings(&mut self, module: &ast::Module) {
+        // Collect all string literals from the AST.
+        let mut strings = Vec::new();
+        for item in &module.items {
+            if let Item::Fn(f) = item {
+                collect_strings_block(&f.body, &mut strings);
+                // Frame messages for each ? site.
+                collect_try_frame_strings(&f.name, &f.body, &mut strings);
+            }
+        }
+        strings.push("\n".to_string());
+        strings.push(", ".to_string());
+        strings.push("=".to_string());
+        strings.push("true".to_string());
+        strings.push("false".to_string());
+        // Intern param names for frame arg capture.
+        for (fn_name, sig) in &self.info.fns {
+            for (pname, _) in &sig.params {
+                strings.push(pname.clone());
+            }
+            let _ = fn_name;
+        }
+        strings.sort();
+        strings.dedup();
+
+        for s in &strings {
+            self.intern_string(s);
+        }
+    }
+
+    fn intern_string(&mut self, s: &str) -> DataId {
+        if let Some(&id) = self.string_data.get(s) {
+            return id;
+        }
+        let name = format!("str_{}", self.string_data.len());
+        let id = self
+            .obj
+            .declare_data(&name, Linkage::Local, false, false)
+            .unwrap();
+        let bytes = s.as_bytes();
+        let len = bytes.len() as u32;
+        let mut payload = Vec::with_capacity(4 + bytes.len());
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        // Pad to 8-byte alignment.
+        while payload.len() % 8 != 0 {
+            payload.push(0);
+        }
+        let mut desc = DataDescription::new();
+        desc.define(payload.into_boxed_slice());
+        self.obj.define_data(id, &desc).unwrap();
+        self.string_data.insert(s.to_string(), id);
+        id
+    }
+
+    // --- Function definition --------------------------------------------
+
+    fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
+        let sig = &self.info.fns[&f.name];
+        let cl_sig = self.build_sig(&f.name);
+
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = cl_sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        // (sealed later)
+
+        {
+            let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
+
+            // Declare params as variables.
+            for (i, (pname, pty)) in sig.params.iter().enumerate() {
+                let var = fb.fresh_var(lumen_to_cl(pty));
+                let val = fb.builder.block_params(entry)[i];
+                fb.builder.def_var(var, val);
+                fb.names.insert(pname.clone(), var);
+            }
+
+            // Compile body.
+            let result = fb.compile_block(&f.body)?;
+
+            // Return.
+            fb.builder.ins().return_(&[result]);
+        } // fb dropped here, releasing the mutable borrow on builder
+
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| NativeError {
+                span: f.span,
+                message: format!("define {}: {e}", f.name),
+            })?;
+
+        Ok(())
+    }
+
+    // --- Helpers (defined as Cranelift functions) ------------------------
+
+    fn define_concat_helper(&mut self) -> Result<(), NativeError> {
+        // lumen_concat(a: ptr, b: ptr) -> ptr
+        // Same logic as the Wasm string_concat helper.
+        let sig = {
+            let mut s = self.obj.make_signature();
+            s.params.push(AbiParam::new(PTR));
+            s.params.push(AbiParam::new(PTR));
+            s.returns.push(AbiParam::new(PTR));
+            s
+        };
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        // (sealed later)
+
+        let a = builder.block_params(block)[0];
+        let b = builder.block_params(block)[1];
+        let flags = MemFlags::new();
+
+        // len_a = *(a) as i64 (load i32, extend)
+        let len_a_i32 = builder.ins().load(cl_types::I32, flags, a, 0);
+        let len_a = builder.ins().uextend(PTR, len_a_i32);
+        let len_b_i32 = builder.ins().load(cl_types::I32, flags, b, 0);
+        let len_b = builder.ins().uextend(PTR, len_b_i32);
+
+        let total = builder.ins().iadd(len_a, len_b);
+        let total_i32 = builder.ins().ireduce(cl_types::I32, total);
+
+        // Allocate: bump_alloc(4 + total)
+        let bump_gv = self.declare_data_in_func(self.bump_ptr_data, &mut builder);
+        let heap_gv = self.declare_data_in_func(self.heap_data, &mut builder);
+
+        let bump_addr = builder.ins().global_value(PTR, bump_gv);
+        let old_offset = builder.ins().load(PTR, flags, bump_addr, 0);
+
+        let heap_base = builder.ins().global_value(PTR, heap_gv);
+        let result = builder.ins().iadd(heap_base, old_offset);
+
+        let four = builder.ins().iconst(PTR, 4);
+        let new_offset = builder.ins().iadd(old_offset, four);
+        let new_offset = builder.ins().iadd(new_offset, total);
+        // Align up to 8.
+        let seven = builder.ins().iconst(PTR, 7);
+        let new_offset = builder.ins().iadd(new_offset, seven);
+        let mask = builder.ins().iconst(PTR, -8i64);
+        let new_offset = builder.ins().band(new_offset, mask);
+        builder.ins().store(flags, new_offset, bump_addr, 0);
+
+        // *result = total_i32
+        builder.ins().store(flags, total_i32, result, 0);
+
+        // memcpy(result+4, a+4, len_a)
+        let dst1 = builder.ins().iadd_imm(result, 4);
+        let src1 = builder.ins().iadd_imm(a, 4);
+        builder.call_memcpy(self.obj.target_config(), dst1, src1, len_a);
+
+        // memcpy(result+4+len_a, b+4, len_b)
+        let dst2 = builder.ins().iadd(dst1, len_a);
+        let src2 = builder.ins().iadd_imm(b, 4);
+        builder.call_memcpy(self.obj.target_config(), dst2, src2, len_b);
+
+        builder.ins().return_(&[result]);
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj.define_function(self.helper_concat, &mut ctx).unwrap();
+        Ok(())
+    }
+
+    fn define_println_helper(&mut self) -> Result<(), NativeError> {
+        // lumen_println(s: ptr) — prints the string followed by \n.
+        let sig = {
+            let mut s = self.obj.make_signature();
+            s.params.push(AbiParam::new(PTR));
+            s
+        };
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        // (sealed later)
+
+        let s = builder.block_params(block)[0];
+        let flags = MemFlags::new();
+
+        // Concat s + "\n".
+        let nl_id = *self.string_data.get("\n").unwrap();
+        let nl_gv = self.declare_data_in_func(nl_id, &mut builder);
+        let nl = builder.ins().global_value(PTR, nl_gv);
+
+        let concat_ref = self
+            .obj
+            .declare_func_in_func(self.helper_concat, builder.func);
+        let with_nl = builder.ins().call(concat_ref, &[s, nl]);
+        let with_nl = builder.inst_results(with_nl)[0];
+
+        // Read len, compute data ptr.
+        let len_i32 = builder.ins().load(cl_types::I32, flags, with_nl, 0);
+        let len = builder.ins().uextend(PTR, len_i32);
+        let data = builder.ins().iadd_imm(with_nl, 4);
+
+        // write(1, data, len)
+        let fd = builder.ins().iconst(cl_types::I32, 1);
+        let write_ref = self
+            .obj
+            .declare_func_in_func(self.libc_write, builder.func);
+        builder.ins().call(write_ref, &[fd, data, len]);
+
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj.define_function(self.helper_println, &mut ctx).unwrap();
+        Ok(())
+    }
+
+    fn define_itoa_helper(&mut self) -> Result<(), NativeError> {
+        // lumen_itoa(n: i32) -> ptr (string)
+        // Same algorithm as the Wasm version: reverse digit extraction.
+        // For brevity, this is a simplified version that handles the
+        // common case. A full production itoa would handle i32::MIN.
+        let sig = {
+            let mut s = self.obj.make_signature();
+            s.params.push(AbiParam::new(cl_types::I32));
+            s.returns.push(AbiParam::new(PTR));
+            s
+        };
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+
+        let n = builder.block_params(entry)[0];
+        let flags = MemFlags::new();
+
+        // Allocate 16-byte scratch in heap.
+        let bump_gv = self.declare_data_in_func(self.bump_ptr_data, &mut builder);
+        let heap_gv = self.declare_data_in_func(self.heap_data, &mut builder);
+
+        // scratch = heap_base + old_offset
+        let bump_addr = builder.ins().global_value(PTR, bump_gv);
+        let old_off = builder.ins().load(PTR, flags, bump_addr, 0);
+        let heap_base = builder.ins().global_value(PTR, heap_gv);
+        let scratch = builder.ins().iadd(heap_base, old_off);
+
+        // bump += 16
+        let new_off = builder.ins().iadd_imm(old_off, 16);
+        builder.ins().store(flags, new_off, bump_addr, 0);
+
+        // Simple approach: format into scratch[0..15] backwards.
+        // Use a loop block for digit extraction.
+
+        // is_neg = n < 0
+        let zero_i32 = builder.ins().iconst(cl_types::I32, 0);
+        let is_neg = builder.ins().icmp(IntCC::SignedLessThan, n, zero_i32);
+
+        // abs = is_neg ? (0 - n) : n
+        let neg_n = builder.ins().ineg(n);
+        let abs_val = builder.ins().select(is_neg, neg_n, n);
+
+        // pos = scratch + 15  (write position, working backwards)
+        let pos_var = builder.declare_var(PTR);
+        let init_pos = builder.ins().iadd_imm(scratch, 15);
+        builder.def_var(pos_var, init_pos);
+
+        let abs_var = builder.declare_var(cl_types::I32);
+        builder.def_var(abs_var, abs_val);
+
+        // if abs == 0: write '0', else loop
+        let is_zero = builder.ins().icmp_imm(IntCC::Equal, abs_val, 0);
+
+        let zero_block = builder.create_block();
+        let loop_header = builder.create_block();
+        let loop_body = builder.create_block();
+        let after_digits = builder.create_block();
+
+        builder.ins().brif(is_zero, zero_block, &[], loop_header, &[]);
+        // (sealed later)
+
+        // Zero block: write '0'.
+        builder.switch_to_block(zero_block);
+        let pos = builder.use_var(pos_var);
+        let ascii_0 = builder.ins().iconst(cl_types::I8, 48);
+        builder.ins().store(flags, ascii_0, pos, 0);
+        let pos = builder.ins().iadd_imm(pos, -1);
+        builder.def_var(pos_var, pos);
+        builder.ins().jump(after_digits, &[]);
+        // (sealed later)
+
+        // Loop header: check if abs > 0.
+        builder.switch_to_block(loop_header);
+        let abs = builder.use_var(abs_var);
+        let done = builder.ins().icmp_imm(IntCC::Equal, abs, 0);
+        builder.ins().brif(done, after_digits, &[], loop_body, &[]);
+        // (sealed later)
+
+        // Loop body: extract one digit.
+        builder.switch_to_block(loop_body);
+        let abs = builder.use_var(abs_var);
+        let ten = builder.ins().iconst(cl_types::I32, 10);
+        let digit = builder.ins().srem(abs, ten);
+        let digit_byte = builder.ins().iadd_imm(digit, 48);
+        let digit_byte = builder.ins().ireduce(cl_types::I8, digit_byte);
+        let pos = builder.use_var(pos_var);
+        builder.ins().store(flags, digit_byte, pos, 0);
+        let pos = builder.ins().iadd_imm(pos, -1);
+        builder.def_var(pos_var, pos);
+        let abs = builder.ins().sdiv(abs, ten);
+        builder.def_var(abs_var, abs);
+        builder.ins().jump(loop_header, &[]);
+        // (sealed later)
+
+        // After digits: handle sign, then build result string.
+        builder.switch_to_block(after_digits);
+        let neg_block = builder.create_block();
+        let final_block = builder.create_block();
+
+        let pos = builder.use_var(pos_var);
+        builder.ins().brif(is_neg, neg_block, &[], final_block, &[]);
+        // (sealed later)
+
+        // Neg block: write '-'.
+        builder.switch_to_block(neg_block);
+        let pos = builder.use_var(pos_var);
+        let minus = builder.ins().iconst(cl_types::I8, 45);
+        builder.ins().store(flags, minus, pos, 0);
+        let pos = builder.ins().iadd_imm(pos, -1);
+        builder.def_var(pos_var, pos);
+        builder.ins().jump(final_block, &[]);
+        // (sealed later)
+
+        // Final: allocate result string [len | bytes].
+        builder.switch_to_block(final_block);
+        let pos = builder.use_var(pos_var);
+        // start = pos + 1
+        let start = builder.ins().iadd_imm(pos, 1);
+        // end = scratch + 16
+        let end = builder.ins().iadd_imm(scratch, 16);
+        let len = builder.ins().isub(end, start);
+        let len_i32 = builder.ins().ireduce(cl_types::I32, len);
+
+        // Allocate (4 + len) via bump.
+        let bump_addr2 = builder.ins().global_value(PTR, bump_gv);
+        let off2 = builder.ins().load(PTR, flags, bump_addr2, 0);
+        let result = builder.ins().iadd(heap_base, off2);
+        let four = builder.ins().iconst(PTR, 4);
+        let new_off2 = builder.ins().iadd(off2, four);
+        let new_off2 = builder.ins().iadd(new_off2, len);
+        let seven = builder.ins().iconst(PTR, 7);
+        let new_off2 = builder.ins().iadd(new_off2, seven);
+        let mask = builder.ins().iconst(PTR, -8i64);
+        let new_off2 = builder.ins().band(new_off2, mask);
+        builder.ins().store(flags, new_off2, bump_addr2, 0);
+
+        // *result = len_i32
+        builder.ins().store(flags, len_i32, result, 0);
+        // memcpy(result+4, start, len)
+        let dst = builder.ins().iadd_imm(result, 4);
+        builder.call_memcpy(self.obj.target_config(), dst, start, len);
+
+        builder.ins().return_(&[result]);
+        // (sealed later)
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj.define_function(self.helper_itoa, &mut ctx).unwrap();
+        Ok(())
+    }
+
+    fn declare_data_in_func(
+        &mut self,
+        data_id: DataId,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> cranelift_codegen::ir::GlobalValue {
+        self.obj.declare_data_in_func(data_id, builder.func)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-function emitter
+// ---------------------------------------------------------------------------
+
+struct FnEmitter<'a, 'b, 'c> {
+    cg: &'a mut NativeCodegen<'b>,
+    builder: &'a mut FunctionBuilder<'c>,
+    sig: &'a crate::types::FnSig,
+    fn_name: String,
+    names: HashMap<String, Variable>,
+}
+
+impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
+    fn new(
+        cg: &'a mut NativeCodegen<'b>,
+        builder: &'a mut FunctionBuilder<'c>,
+        sig: &'a crate::types::FnSig,
+        fn_name: &str,
+    ) -> Self {
+        Self {
+            cg,
+            builder,
+            sig,
+            fn_name: fn_name.to_string(),
+            names: HashMap::new(),
+        }
+    }
+
+    fn fresh_var(&mut self, ty: CLType) -> Variable {
+        self.builder.declare_var(ty)
+    }
+
+    fn compile_block(&mut self, block: &ast::Block) -> Result<Value, NativeError> {
+        for stmt in &block.stmts {
+            self.compile_stmt(stmt)?;
+        }
+        match &block.tail {
+            Some(e) => self.compile_expr(e),
+            None => Ok(self.builder.ins().iconst(cl_types::I32, 0)),
+        }
+    }
+
+    fn compile_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), NativeError> {
+        match &stmt.kind {
+            StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
+                let val = self.compile_expr(value)?;
+                let ty = lumen_to_cl(&self.infer_ty(value)?);
+                let var = self.fresh_var(ty);
+                self.builder.def_var(var, val);
+                self.names.insert(name.clone(), var);
+            }
+            StmtKind::Assign { name, value } => {
+                let val = self.compile_expr(value)?;
+                let var = *self.names.get(name).ok_or_else(|| NativeError {
+                    span: stmt.span,
+                    message: format!("unknown `{name}`"),
+                })?;
+                self.builder.def_var(var, val);
+            }
+            StmtKind::Expr(e) => {
+                self.compile_expr(e)?;
+            }
+            StmtKind::For { binder, iter, body } => {
+                self.compile_for(binder, iter, body, stmt.span)?;
+            }
+            StmtKind::Return(Some(e)) => {
+                let val = self.compile_expr(e)?;
+                self.builder.ins().return_(&[val]);
+            }
+            StmtKind::Return(None) => {
+                let zero = self.builder.ins().iconst(cl_types::I32, 0);
+                self.builder.ins().return_(&[zero]);
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_expr(&mut self, expr: &Expr) -> Result<Value, NativeError> {
+        match &expr.kind {
+            ExprKind::IntLit { value, suffix } => {
+                let (ty, val) = match suffix {
+                    Some(IntSuffix::I64) | Some(IntSuffix::U64) => {
+                        (cl_types::I64, *value as i64)
+                    }
+                    _ => (cl_types::I32, *value as i64),
+                };
+                Ok(self.builder.ins().iconst(ty, val))
+            }
+            ExprKind::FloatLit(v) => Ok(self.builder.ins().f64const(*v)),
+            ExprKind::BoolLit(b) => {
+                Ok(self.builder.ins().iconst(cl_types::I32, if *b { 1 } else { 0 }))
+            }
+            ExprKind::UnitLit => Ok(self.builder.ins().iconst(cl_types::I32, 0)),
+            ExprKind::StringLit(s) => {
+                let data_id = *self.cg.string_data.get(s).unwrap();
+                let gv = self.cg.obj.declare_data_in_func(data_id, self.builder.func);
+                Ok(self.builder.ins().global_value(PTR, gv))
+            }
+            ExprKind::Ident(name) => {
+                if let Some(&var) = self.names.get(name) {
+                    Ok(self.builder.use_var(var))
+                } else if name == "None" || self.find_sum_for_variant(name).is_some() {
+                    // Zero-payload constructor — stub for now.
+                    Ok(self.builder.ins().iconst(PTR, 0))
+                } else {
+                    Err(NativeError {
+                        span: expr.span,
+                        message: format!("unknown identifier `{name}`"),
+                    })
+                }
+            }
+            ExprKind::Paren(inner) => self.compile_expr(inner),
+            ExprKind::Binary { op, lhs, rhs } => self.compile_binary(*op, lhs, rhs, expr.span),
+            ExprKind::Unary { op, rhs } => {
+                let v = self.compile_expr(rhs)?;
+                match op {
+                    UnaryOp::Neg => {
+                        let ty = lumen_to_cl(&self.infer_ty(rhs)?);
+                        if ty == cl_types::F64 {
+                            Ok(self.builder.ins().fneg(v))
+                        } else {
+                            Ok(self.builder.ins().ineg(v))
+                        }
+                    }
+                    UnaryOp::Not => {
+                        let zero = self.builder.ins().iconst(cl_types::I32, 0);
+                        Ok(self.builder.ins().icmp(IntCC::Equal, v, zero))
+                    }
+                }
+            }
+            ExprKind::Cast { expr: inner, to } => {
+                let v = self.compile_expr(inner)?;
+                let from = self.infer_ty(inner)?;
+                let to_ty = resolve_cast_target(to)?;
+                Ok(emit_cast_cl(self.builder, v, &from, &to_ty))
+            }
+            ExprKind::Call { callee, args } => self.compile_call(callee, args, expr.span),
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.compile_method_call(receiver, method, args, expr.span),
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => self.compile_if(cond, then_block, else_block, expr.span),
+            ExprKind::Field { receiver, name } => {
+                let ptr = self.compile_expr(receiver)?;
+                let recv_ty = self.infer_ty(receiver)?;
+                let type_name = match recv_ty {
+                    Ty::User(n) => n,
+                    _ => {
+                        return Err(NativeError {
+                            span: expr.span,
+                            message: "field access on non-struct".into(),
+                        })
+                    }
+                };
+                let fields = get_struct_fields(&self.cg.info.types, &type_name);
+                let (offset, fty) = field_offset(&fields, name);
+                let cl_ty = lumen_to_cl(&fty);
+                Ok(self.builder.ins().load(cl_ty, MemFlags::new(), ptr, offset))
+            }
+            ExprKind::StructLit { name, fields, .. } => {
+                self.compile_struct_lit(name, fields, expr.span)
+            }
+            ExprKind::Block(b) => self.compile_block(b),
+            ExprKind::Match { scrutinee, arms } => {
+                Err(NativeError {
+                    span: expr.span,
+                    message: "match not yet implemented in native backend (coming next)".into(),
+                })
+            }
+            ExprKind::Try(inner) => {
+                Err(NativeError {
+                    span: expr.span,
+                    message: "? not yet implemented in native backend (coming next)".into(),
+                })
+            }
+            _ => Err(NativeError {
+                span: expr.span,
+                message: "expression not supported in native backend".into(),
+            }),
+        }
+    }
+
+    fn compile_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        let lt = self.infer_ty(lhs)?;
+
+        // String + string.
+        if matches!(op, BinOp::Add) && matches!(lt, Ty::String) {
+            let a = self.compile_expr(lhs)?;
+            let b = self.compile_expr(rhs)?;
+            let func_ref = self
+                .cg
+                .obj
+                .declare_func_in_func(self.cg.helper_concat, self.builder.func);
+            let call = self.builder.ins().call(func_ref, &[a, b]);
+            return Ok(self.builder.inst_results(call)[0]);
+        }
+
+        let a = self.compile_expr(lhs)?;
+        let b = self.compile_expr(rhs)?;
+        let is_f64 = matches!(lt, Ty::F64);
+        let is_signed = matches!(lt, Ty::I32 | Ty::I64);
+
+        Ok(match op {
+            BinOp::Add if is_f64 => self.builder.ins().fadd(a, b),
+            BinOp::Sub if is_f64 => self.builder.ins().fsub(a, b),
+            BinOp::Mul if is_f64 => self.builder.ins().fmul(a, b),
+            BinOp::Div if is_f64 => self.builder.ins().fdiv(a, b),
+            BinOp::Add => self.builder.ins().iadd(a, b),
+            BinOp::Sub => self.builder.ins().isub(a, b),
+            BinOp::Mul => self.builder.ins().imul(a, b),
+            BinOp::Div if is_signed => self.builder.ins().sdiv(a, b),
+            BinOp::Div => self.builder.ins().udiv(a, b),
+            BinOp::Rem if is_signed => self.builder.ins().srem(a, b),
+            BinOp::Rem => self.builder.ins().urem(a, b),
+            BinOp::Eq if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::Equal, a, b),
+            BinOp::NotEq if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::NotEqual, a, b),
+            BinOp::Lt if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::LessThan, a, b),
+            BinOp::LtEq if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::LessThanOrEqual, a, b),
+            BinOp::Gt if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::GreaterThan, a, b),
+            BinOp::GtEq if is_f64 => self.builder.ins().fcmp(cranelift_codegen::ir::condcodes::FloatCC::GreaterThanOrEqual, a, b),
+            BinOp::Eq => self.builder.ins().icmp(IntCC::Equal, a, b),
+            BinOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, a, b),
+            BinOp::Lt if is_signed => self.builder.ins().icmp(IntCC::SignedLessThan, a, b),
+            BinOp::Lt => self.builder.ins().icmp(IntCC::UnsignedLessThan, a, b),
+            BinOp::LtEq if is_signed => self.builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b),
+            BinOp::LtEq => self.builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, a, b),
+            BinOp::Gt if is_signed => self.builder.ins().icmp(IntCC::SignedGreaterThan, a, b),
+            BinOp::Gt => self.builder.ins().icmp(IntCC::UnsignedGreaterThan, a, b),
+            BinOp::GtEq if is_signed => self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, b),
+            BinOp::GtEq => self.builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, a, b),
+            BinOp::And => self.builder.ins().band(a, b),
+            BinOp::Or => self.builder.ins().bor(a, b),
+        })
+    }
+
+    fn compile_call(
+        &mut self,
+        callee: &Expr,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        let name = match &callee.kind {
+            ExprKind::Ident(n) => n.clone(),
+            _ => {
+                return Err(NativeError {
+                    span,
+                    message: "only direct calls".into(),
+                })
+            }
+        };
+
+        // Built-in string_len.
+        if name == "string_len" {
+            let s = self.compile_expr(&args[0].value)?;
+            let len = self.builder.ins().load(cl_types::I32, MemFlags::new(), s, 0);
+            return Ok(len);
+        }
+
+        // Built-in range (not a runtime call — handled by for-loop).
+        // Ok/Err/Some/None constructors — stub for now.
+        match name.as_str() {
+            "Ok" | "Err" | "Some" => {
+                // Placeholder: just return the inner value.
+                // Full sum-type support coming next.
+                return self.compile_expr(&args[0].value);
+            }
+            "None" => return Ok(self.builder.ins().iconst(PTR, 0)),
+            _ => {}
+        }
+
+        // User function call.
+        let func_id = self.cg.fn_ids.get(&name).ok_or_else(|| NativeError {
+            span,
+            message: format!("unknown function `{name}`"),
+        })?;
+        let func_ref = self
+            .cg
+            .obj
+            .declare_func_in_func(*func_id, self.builder.func);
+        let mut arg_vals = Vec::new();
+        for a in args {
+            arg_vals.push(self.compile_expr(&a.value)?);
+        }
+        let call = self.builder.ins().call(func_ref, &arg_vals);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    fn compile_method_call(
+        &mut self,
+        receiver: &Expr,
+        method: &str,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        if let ExprKind::Ident(mod_name) = &receiver.kind {
+            if mod_name == "io" && method == "println" {
+                let s = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.helper_println, self.builder.func);
+                self.builder.ins().call(func_ref, &[s]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "int" && method == "to_string_i32" {
+                let n = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.helper_itoa, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[n]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+        }
+        Err(NativeError {
+            span,
+            message: format!("method `.{method}()` not supported in native backend"),
+        })
+    }
+
+    fn compile_if(
+        &mut self,
+        cond: &Expr,
+        then_block: &ast::Block,
+        else_block: &ast::Block,
+        _span: Span,
+    ) -> Result<Value, NativeError> {
+        let cond_val = self.compile_expr(cond)?;
+        let then_bb = self.builder.create_block();
+        let else_bb = self.builder.create_block();
+        let merge_bb = self.builder.create_block();
+
+        let result_ty = self
+            .infer_block_ty(then_block)
+            .map(|t| lumen_to_cl(&t))
+            .unwrap_or(cl_types::I32);
+        self.builder.append_block_param(merge_bb, result_ty);
+
+        self.builder.ins().brif(cond_val, then_bb, &[], else_bb, &[]);
+
+        self.builder.switch_to_block(then_bb);
+        // (sealed later)
+        let then_val = self.compile_block(then_block)?;
+        self.builder.ins().jump(merge_bb, &[BlockArg::Value(then_val)]);
+
+        self.builder.switch_to_block(else_bb);
+        // (sealed later)
+        let else_val = self.compile_block(else_block)?;
+        self.builder.ins().jump(merge_bb, &[BlockArg::Value(else_val)]);
+
+        self.builder.switch_to_block(merge_bb);
+        // (sealed later)
+        Ok(self.builder.block_params(merge_bb)[0])
+    }
+
+    fn compile_for(
+        &mut self,
+        binder: &str,
+        iter: &Expr,
+        body: &ast::Block,
+        span: Span,
+    ) -> Result<(), NativeError> {
+        let (start_expr, end_expr) = match &iter.kind {
+            ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ExprKind::Ident(n) if n == "range")
+                    && args.len() == 2 =>
+            {
+                (&args[0].value, &args[1].value)
+            }
+            _ => {
+                return Err(NativeError {
+                    span: iter.span,
+                    message: "only range(start, end) supported".into(),
+                })
+            }
+        };
+
+        let start = self.compile_expr(start_expr)?;
+        let end = self.compile_expr(end_expr)?;
+
+        let counter_var = self.fresh_var(cl_types::I32);
+        self.builder.def_var(counter_var, start);
+
+        let binder_var = self.fresh_var(cl_types::I32);
+        self.builder.def_var(binder_var, start);
+        self.names.insert(binder.to_string(), binder_var);
+
+        let header_bb = self.builder.create_block();
+        let body_bb = self.builder.create_block();
+        let exit_bb = self.builder.create_block();
+
+        self.builder.ins().jump(header_bb, &[]);
+
+        self.builder.switch_to_block(header_bb);
+        let counter = self.builder.use_var(counter_var);
+        let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, counter, end);
+        self.builder.ins().brif(done, exit_bb, &[], body_bb, &[]);
+
+        self.builder.switch_to_block(body_bb);
+        // (sealed later)
+        let counter = self.builder.use_var(counter_var);
+        self.builder.def_var(binder_var, counter);
+        self.compile_block(body)?;
+        let counter = self.builder.use_var(counter_var);
+        let one = self.builder.ins().iconst(cl_types::I32, 1);
+        let next = self.builder.ins().iadd(counter, one);
+        self.builder.def_var(counter_var, next);
+        self.builder.ins().jump(header_bb, &[]);
+
+        // (sealed later)
+        self.builder.switch_to_block(exit_bb);
+        // (sealed later)
+
+        Ok(())
+    }
+
+    fn compile_struct_lit(
+        &mut self,
+        name: &str,
+        fields: &[ast::FieldInit],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        let def_fields = get_struct_fields(&self.cg.info.types, name);
+        let total_size = struct_size(&def_fields);
+        let ptr = self.bump_alloc(total_size as i64)?;
+
+        for (fname, fty) in &def_fields {
+            let init = fields.iter().find(|fi| &fi.name == fname).ok_or_else(|| {
+                NativeError {
+                    span,
+                    message: format!("missing field `{fname}`"),
+                }
+            })?;
+            let val = self.compile_expr(&init.value)?;
+            let (offset, _) = field_offset(&def_fields, fname);
+            self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+        }
+        Ok(ptr)
+    }
+
+    fn bump_alloc(&mut self, size: i64) -> Result<Value, NativeError> {
+        let flags = MemFlags::new();
+        let bump_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.bump_ptr_data, self.builder.func);
+        let heap_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.heap_data, self.builder.func);
+
+        let bump_addr = self.builder.ins().global_value(PTR, bump_gv);
+        let old_off = self.builder.ins().load(PTR, flags, bump_addr, 0);
+        let heap_base = self.builder.ins().global_value(PTR, heap_gv);
+        let result = self.builder.ins().iadd(heap_base, old_off);
+
+        let size_val = self.builder.ins().iconst(PTR, size);
+        let new_off = self.builder.ins().iadd(old_off, size_val);
+        let seven = self.builder.ins().iconst(PTR, 7);
+        let new_off = self.builder.ins().iadd(new_off, seven);
+        let mask = self.builder.ins().iconst(PTR, -8i64);
+        let new_off = self.builder.ins().band(new_off, mask);
+        self.builder.ins().store(flags, new_off, bump_addr, 0);
+
+        Ok(result)
+    }
+
+    fn infer_ty(&self, expr: &Expr) -> Result<Ty, NativeError> {
+        // Simplified type inference for codegen dispatch.
+        Ok(match &expr.kind {
+            ExprKind::IntLit { suffix, .. } => match suffix {
+                Some(IntSuffix::I64) => Ty::I64,
+                Some(IntSuffix::U64) => Ty::U64,
+                Some(IntSuffix::U32) => Ty::U32,
+                _ => Ty::I32,
+            },
+            ExprKind::FloatLit(_) => Ty::F64,
+            ExprKind::BoolLit(_) => Ty::Bool,
+            ExprKind::UnitLit => Ty::Unit,
+            ExprKind::StringLit(_) => Ty::String,
+            ExprKind::Ident(name) => {
+                // Look up in sig params.
+                for (pname, pty) in &self.sig.params {
+                    if pname == name {
+                        return Ok(pty.clone());
+                    }
+                }
+                Ty::I32 // fallback
+            }
+            ExprKind::Paren(e) => self.infer_ty(e)?,
+            ExprKind::Binary { op, lhs, .. } => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                    self.infer_ty(lhs)?
+                }
+                _ => Ty::Bool,
+            },
+            ExprKind::Unary { op, rhs } => match op {
+                UnaryOp::Neg => self.infer_ty(rhs)?,
+                UnaryOp::Not => Ty::Bool,
+            },
+            ExprKind::Cast { to, .. } => resolve_cast_target(to)?,
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(name) = &callee.kind {
+                    if name == "string_len" {
+                        return Ok(Ty::I32);
+                    }
+                    if let Some(sig) = self.cg.info.fns.get(name) {
+                        return Ok(sig.ret.clone());
+                    }
+                }
+                Ty::I32
+            }
+            ExprKind::MethodCall { receiver, method, .. } => {
+                if let ExprKind::Ident(m) = &receiver.kind {
+                    if m == "int" && method == "to_string_i32" {
+                        return Ok(Ty::String);
+                    }
+                    if m == "io" && method == "println" {
+                        return Ok(Ty::Unit);
+                    }
+                }
+                Ty::I32
+            }
+            ExprKind::StructLit { name, .. } => Ty::User(name.clone()),
+            ExprKind::Field { receiver, name } => {
+                let recv_ty = self.infer_ty(receiver)?;
+                if let Ty::User(tn) = recv_ty {
+                    let fields = get_struct_fields(&self.cg.info.types, &tn);
+                    fields
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or(Ty::I32)
+                } else {
+                    Ty::I32
+                }
+            }
+            ExprKind::If { then_block, .. } => self.infer_block_ty(then_block).unwrap_or(Ty::Unit),
+            _ => Ty::I32,
+        })
+    }
+
+    fn infer_block_ty(&self, block: &ast::Block) -> Option<Ty> {
+        block.tail.as_ref().map(|e| self.infer_ty(e).unwrap_or(Ty::I32))
+    }
+
+    fn find_sum_for_variant(&self, name: &str) -> Option<String> {
+        for (type_name, info) in &self.cg.info.types {
+            if let TypeInfo::Sum { variants, .. } = info {
+                if variants.iter().any(|v| v.name == name) {
+                    return Some(type_name.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn lumen_to_cl(ty: &Ty) -> CLType {
+    match ty {
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
+        Ty::I64 | Ty::U64 => cl_types::I64,
+        Ty::F64 => cl_types::F64,
+        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => PTR,
+        Ty::Error => cl_types::I32,
+    }
+}
+
+fn resolve_cast_target(ty: &ast::Type) -> Result<Ty, NativeError> {
+    match &ty.kind {
+        ast::TypeKind::Named { name, args } if args.is_empty() => match name.as_str() {
+            "i32" => Ok(Ty::I32),
+            "i64" => Ok(Ty::I64),
+            "u32" => Ok(Ty::U32),
+            "u64" => Ok(Ty::U64),
+            "f64" => Ok(Ty::F64),
+            _ => Err(NativeError {
+                span: ty.span,
+                message: format!("`as` target must be numeric, got `{name}`"),
+            }),
+        },
+        _ => Err(NativeError {
+            span: ty.span,
+            message: "`as` target must be bare numeric type".into(),
+        }),
+    }
+}
+
+fn emit_cast_cl(builder: &mut FunctionBuilder, v: Value, from: &Ty, to: &Ty) -> Value {
+    match (from, to) {
+        (Ty::I32, Ty::I64) => builder.ins().sextend(cl_types::I64, v),
+        (Ty::U32, Ty::I64) | (Ty::I32, Ty::U64) | (Ty::U32, Ty::U64) => {
+            builder.ins().uextend(cl_types::I64, v)
+        }
+        (Ty::I64, Ty::I32) | (Ty::I64, Ty::U32) | (Ty::U64, Ty::I32) | (Ty::U64, Ty::U32) => {
+            builder.ins().ireduce(cl_types::I32, v)
+        }
+        (Ty::I32, Ty::F64) => builder.ins().fcvt_from_sint(cl_types::F64, v),
+        (Ty::U32, Ty::F64) => builder.ins().fcvt_from_uint(cl_types::F64, v),
+        (Ty::I64, Ty::F64) => builder.ins().fcvt_from_sint(cl_types::F64, v),
+        (Ty::U64, Ty::F64) => builder.ins().fcvt_from_uint(cl_types::F64, v),
+        (Ty::F64, Ty::I32) => builder.ins().fcvt_to_sint(cl_types::I32, v),
+        (Ty::F64, Ty::U32) => builder.ins().fcvt_to_uint(cl_types::I32, v),
+        (Ty::F64, Ty::I64) => builder.ins().fcvt_to_sint(cl_types::I64, v),
+        (Ty::F64, Ty::U64) => builder.ins().fcvt_to_uint(cl_types::I64, v),
+        _ => v,
+    }
+}
+
+fn get_struct_fields(types: &HashMap<String, TypeInfo>, name: &str) -> Vec<(String, Ty)> {
+    match types.get(name) {
+        Some(TypeInfo::Struct { fields, .. }) => fields.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn field_offset(fields: &[(String, Ty)], target: &str) -> (i32, Ty) {
+    let mut offset = 0i32;
+    for (name, ty) in fields {
+        let align = match ty {
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            _ => 4,
+        };
+        offset = (offset + align - 1) & !(align - 1);
+        if name == target {
+            return (offset, ty.clone());
+        }
+        let size = match ty {
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            _ => 4,
+        };
+        offset += size;
+    }
+    (0, Ty::I32)
+}
+
+fn struct_size(fields: &[(String, Ty)]) -> i32 {
+    let mut offset = 0i32;
+    for (_, ty) in fields {
+        let align = match ty {
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            _ => 4,
+        };
+        offset = (offset + align - 1) & !(align - 1);
+        let size = match ty {
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            _ => 4,
+        };
+        offset += size;
+    }
+    (offset + 7) & !7
+}
+
+fn collect_strings_block(block: &ast::Block, acc: &mut Vec<String>) {
+    for stmt in &block.stmts {
+        collect_strings_stmt(stmt, acc);
+    }
+    if let Some(tail) = &block.tail {
+        collect_strings_expr(tail, acc);
+    }
+}
+
+fn collect_strings_stmt(stmt: &ast::Stmt, acc: &mut Vec<String>) {
+    match &stmt.kind {
+        StmtKind::Let { value, .. }
+        | StmtKind::Var { value, .. }
+        | StmtKind::Assign { value, .. } => collect_strings_expr(value, acc),
+        StmtKind::Expr(e) => collect_strings_expr(e, acc),
+        StmtKind::For { iter, body, .. } => {
+            collect_strings_expr(iter, acc);
+            collect_strings_block(body, acc);
+        }
+        StmtKind::Return(Some(e)) => collect_strings_expr(e, acc),
+        StmtKind::Return(None) => {}
+    }
+}
+
+fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::StringLit(s) => acc.push(s.clone()),
+        ExprKind::Paren(e) | ExprKind::Unary { rhs: e, .. } | ExprKind::Cast { expr: e, .. } => {
+            collect_strings_expr(e, acc)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_strings_expr(lhs, acc);
+            collect_strings_expr(rhs, acc);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_strings_expr(callee, acc);
+            for a in args {
+                collect_strings_expr(&a.value, acc);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_strings_expr(receiver, acc);
+            for a in args {
+                collect_strings_expr(&a.value, acc);
+            }
+        }
+        ExprKind::Field { receiver, .. } => collect_strings_expr(receiver, acc),
+        ExprKind::Try(e) => collect_strings_expr(e, acc),
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            collect_strings_expr(cond, acc);
+            collect_strings_block(then_block, acc);
+            collect_strings_block(else_block, acc);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_strings_expr(scrutinee, acc);
+            for arm in arms {
+                collect_strings_expr(&arm.body, acc);
+            }
+        }
+        ExprKind::Block(b) => collect_strings_block(b, acc),
+        ExprKind::StructLit { fields, .. } => {
+            for fi in fields {
+                collect_strings_expr(&fi.value, acc);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_try_frame_strings(fn_name: &str, block: &ast::Block, acc: &mut Vec<String>) {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { value, .. }
+            | StmtKind::Var { value, .. }
+            | StmtKind::Assign { value, .. } => collect_try_frame_expr(fn_name, value, acc),
+            StmtKind::Expr(e) => collect_try_frame_expr(fn_name, e, acc),
+            StmtKind::For { iter, body, .. } => {
+                collect_try_frame_expr(fn_name, iter, acc);
+                collect_try_frame_strings(fn_name, body, acc);
+            }
+            StmtKind::Return(Some(e)) => collect_try_frame_expr(fn_name, e, acc),
+            StmtKind::Return(None) => {}
+        }
+    }
+    if let Some(tail) = &block.tail {
+        collect_try_frame_expr(fn_name, tail, acc);
+    }
+}
+
+fn collect_try_frame_expr(fn_name: &str, expr: &Expr, acc: &mut Vec<String>) {
+    if let ExprKind::Try(inner) = &expr.kind {
+        collect_try_frame_expr(fn_name, inner, acc);
+        acc.push(format!("  at {}(", fn_name));
+        acc.push(format!(") (<source>:{}:{})", expr.span.line, expr.span.col));
+        acc.push(format!(
+            "  at {} (<source>:{}:{})",
+            fn_name, expr.span.line, expr.span.col
+        ));
+    }
+    // Recurse into sub-expressions.
+    match &expr.kind {
+        ExprKind::Paren(e) | ExprKind::Unary { rhs: e, .. } | ExprKind::Cast { expr: e, .. } => {
+            collect_try_frame_expr(fn_name, e, acc)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_try_frame_expr(fn_name, lhs, acc);
+            collect_try_frame_expr(fn_name, rhs, acc);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_try_frame_expr(fn_name, callee, acc);
+            for a in args {
+                collect_try_frame_expr(fn_name, &a.value, acc);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            collect_try_frame_expr(fn_name, cond, acc);
+            collect_try_frame_strings(fn_name, then_block, acc);
+            collect_try_frame_strings(fn_name, else_block, acc);
+        }
+        ExprKind::Block(b) => collect_try_frame_strings(fn_name, b, acc),
+        _ => {}
+    }
+}
