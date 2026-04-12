@@ -29,6 +29,30 @@ pub enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
     ExternFn(ExternFnDecl),
+    Actor(ActorDecl),
+    MsgHandler(MsgHandlerDecl),
+}
+
+/// `actor Counter { count: i32 }`
+#[derive(Debug, Clone)]
+pub struct ActorDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<Field>,
+    pub span: Span,
+}
+
+/// `msg Counter.increment(self, n: i32): Counter { ... }`
+#[derive(Debug, Clone)]
+pub struct MsgHandlerDecl {
+    pub actor_name: String,
+    pub name: String,
+    pub name_span: Span,
+    /// Params excluding `self` (self is implicit).
+    pub params: Vec<Param>,
+    pub return_type: Type,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// `extern fn malloc(size: i64): i64`
@@ -228,9 +252,26 @@ pub enum ExprKind {
         method: String,
         args: Vec<Arg>,
     },
-    /// `expr?` — error propagation. Desugared by the typechecker/codegen into
-    /// a match that pushes an error frame and returns.
+    /// `expr?` — error propagation.
     Try(Box<Expr>),
+
+    /// `spawn Counter { count: 0 }`
+    Spawn {
+        actor_name: String,
+        fields: Vec<FieldInit>,
+    },
+    /// `send handle.method(args)`
+    Send {
+        handle: Box<Expr>,
+        method: String,
+        args: Vec<Arg>,
+    },
+    /// `ask handle.method(args)`
+    Ask {
+        handle: Box<Expr>,
+        method: String,
+        args: Vec<Arg>,
+    },
 
     // Unary / binary / cast
     Unary {

@@ -250,6 +250,19 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
+        // Declare msg handler functions (compiled as regular fns).
+        for item in &module.items {
+            if let Item::MsgHandler(mh) = item {
+                let fn_name = format!("{}_{}", mh.actor_name, mh.name);
+                let sig = self.build_sig(&fn_name);
+                let id = self
+                    .obj
+                    .declare_function(&fn_name, Linkage::Local, &sig)
+                    .unwrap();
+                self.fn_ids.insert(fn_name, id);
+            }
+        }
+
         // Declare extern fns as imported symbols.
         for item in &module.items {
             if let Item::ExternFn(ef) = item {
@@ -277,6 +290,39 @@ impl<'a> NativeCodegen<'a> {
             if let Item::Fn(f) = item {
                 let func_id = fn_ids[&f.name];
                 self.define_function(f, func_id)?;
+            }
+        }
+
+        // Define msg handler bodies (compiled as regular fns with `self` param).
+        for item in &module.items {
+            if let Item::MsgHandler(mh) = item {
+                let fn_name = format!("{}_{}", mh.actor_name, mh.name);
+                let func_id = fn_ids[&fn_name];
+                // Create a synthetic FnDecl with self prepended.
+                let synthetic = FnDecl {
+                    name: fn_name.clone(),
+                    name_span: mh.name_span,
+                    params: {
+                        let mut ps = vec![ast::Param {
+                            name: "self".to_string(),
+                            ty: ast::Type {
+                                kind: ast::TypeKind::Named {
+                                    name: mh.actor_name.clone(),
+                                    args: Vec::new(),
+                                },
+                                span: mh.name_span,
+                            },
+                            span: mh.name_span,
+                        }];
+                        ps.extend(mh.params.clone());
+                        ps
+                    },
+                    return_type: mh.return_type.clone(),
+                    effect: ast::Effect::Pure,
+                    body: mh.body.clone(),
+                    span: mh.span,
+                };
+                self.define_function(&synthetic, func_id)?;
             }
         }
 
@@ -1126,6 +1172,15 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 self.compile_match(scrutinee, arms, expr.span)
             }
             ExprKind::Try(inner) => self.compile_try(inner, expr.span),
+            ExprKind::Spawn {
+                actor_name, fields,
+            } => self.compile_spawn(actor_name, fields, expr.span),
+            ExprKind::Send {
+                handle, method, args,
+            } => self.compile_send(handle, method, args, expr.span),
+            ExprKind::Ask {
+                handle, method, args,
+            } => self.compile_ask(handle, method, args, expr.span),
             _ => Err(NativeError {
                 span: expr.span,
                 message: "expression not supported in native backend".into(),
@@ -2112,6 +2167,117 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(val)
     }
 
+    // --- Actor operations -------------------------------------------------
+
+    /// `spawn Counter { count: 0 }` — allocate a mutable state cell (8
+    /// bytes holding a ptr to the current actor state), build the initial
+    /// state as a struct, store the state ptr in the cell, return cell ptr.
+    fn compile_spawn(
+        &mut self,
+        actor_name: &str,
+        fields: &[ast::FieldInit],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        // Build the initial state (same as a struct literal).
+        let state = self.compile_struct_lit(actor_name, fields, span)?;
+        // Allocate an 8-byte mutable cell to hold the state pointer.
+        let cell = self.rc_alloc(8)?;
+        self.builder.ins().store(MemFlags::new(), state, cell, 0);
+        Ok(cell)
+    }
+
+    /// `send handle.method(args)` — load state from cell, call handler,
+    /// store new state if the handler returns the actor type.
+    fn compile_send(
+        &mut self,
+        handle: &Expr,
+        method: &str,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        self.compile_msg_dispatch(handle, method, args, span, false)
+    }
+
+    /// `ask handle.method(args)` — same as send but return the handler's result.
+    fn compile_ask(
+        &mut self,
+        handle: &Expr,
+        method: &str,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Result<Value, NativeError> {
+        self.compile_msg_dispatch(handle, method, args, span, true)
+    }
+
+    fn compile_msg_dispatch(
+        &mut self,
+        handle: &Expr,
+        method: &str,
+        args: &[ast::Arg],
+        span: Span,
+        return_result: bool,
+    ) -> Result<Value, NativeError> {
+        let handle_ty = self.infer_ty(handle)?;
+        let actor_name = match &handle_ty {
+            Ty::Handle(inner) => match inner.as_ref() {
+                Ty::User(n) => n.clone(),
+                _ => {
+                    return Err(NativeError {
+                        span,
+                        message: "expected actor handle".into(),
+                    })
+                }
+            },
+            _ => {
+                return Err(NativeError {
+                    span,
+                    message: "expected actor handle".into(),
+                })
+            }
+        };
+
+        let cell = self.compile_expr(handle)?;
+        // Load current state from the cell.
+        let state = self.builder.ins().load(PTR, MemFlags::new(), cell, 0);
+
+        // Build arg values.
+        let mut call_args = vec![state]; // self is the first param
+        for a in args {
+            call_args.push(self.compile_expr(&a.value)?);
+        }
+
+        // Call the handler function.
+        let fn_name = format!("{}_{}", actor_name, method);
+        let func_id = self.cg.fn_ids.get(&fn_name).ok_or_else(|| NativeError {
+            span,
+            message: format!("unknown msg handler `{fn_name}`"),
+        })?;
+        let func_ref = self
+            .cg
+            .obj
+            .declare_func_in_func(*func_id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &call_args);
+        let result = self.builder.inst_results(call)[0];
+
+        // If the handler returns the actor type (mutation), store the
+        // new state back in the cell.
+        let ret_ty = self.cg.info.fns.get(&fn_name).map(|s| s.ret.clone());
+        if let Some(Ty::User(ret_name)) = &ret_ty {
+            if ret_name == &actor_name {
+                self.builder.ins().store(MemFlags::new(), result, cell, 0);
+                if !return_result {
+                    return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+                }
+            }
+        }
+
+        if return_result {
+            Ok(result)
+        } else {
+            Ok(self.builder.ins().iconst(cl_types::I32, 0))
+        }
+    }
+
     fn variant_tag(&self, scrut_ty: &Ty, variant_name: &str) -> Option<u32> {
         match scrut_ty {
             Ty::User(type_name) => {
@@ -2255,6 +2421,22 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 } else {
                     Ty::I32
                 }
+            }
+            ExprKind::Spawn { actor_name, .. } => {
+                Ty::Handle(Box::new(Ty::User(actor_name.clone())))
+            }
+            ExprKind::Send { .. } => Ty::Unit,
+            ExprKind::Ask { handle, method, .. } => {
+                let handle_ty = self.infer_ty(handle)?;
+                if let Ty::Handle(inner) = &handle_ty {
+                    if let Ty::User(actor_name) = inner.as_ref() {
+                        let fn_name = format!("{}_{}", actor_name, method);
+                        if let Some(sig) = self.cg.info.fns.get(&fn_name) {
+                            return Ok(sig.ret.clone());
+                        }
+                    }
+                }
+                Ty::I32
             }
             ExprKind::If { then_block, .. } => self.infer_block_ty(then_block).unwrap_or(Ty::Unit),
             ExprKind::Match { arms, .. } => arms

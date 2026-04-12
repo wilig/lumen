@@ -1,0 +1,24 @@
+// Actor model: typed message passing with compile-time checked protocols.
+
+import std/io
+
+actor Counter {
+    count: i32
+}
+
+msg Counter.increment(self, n: i32): Counter {
+    Counter { count: self.count + n }
+}
+
+msg Counter.get(self): i32 {
+    self.count
+}
+
+fn main(): i32 io {
+    let c = spawn Counter { count: 0 }
+    send c.increment(5)
+    send c.increment(3)
+    let result = ask c.get()
+    io.println("counter = " + int.to_string_i32(result))
+    0
+}

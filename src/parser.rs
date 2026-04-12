@@ -174,8 +174,10 @@ impl Parser {
             TokenKind::Fn => self.parse_fn_decl().map(Item::Fn),
             TokenKind::Type => self.parse_type_decl().map(Item::Type),
             TokenKind::Extern => self.parse_extern_fn_decl().map(Item::ExternFn),
+            TokenKind::Actor => self.parse_actor_decl().map(Item::Actor),
+            TokenKind::Msg => self.parse_msg_handler().map(Item::MsgHandler),
             other => Err(self.error_here(format!(
-                "expected `fn`, `type`, or `extern` at top level, found {}",
+                "expected `fn`, `type`, `extern`, `actor`, or `msg` at top level, found {}",
                 describe_token(other)
             ))),
         }
@@ -208,6 +210,61 @@ impl Parser {
             name_span,
             params,
             return_type,
+            span: merge(start, end),
+        })
+    }
+
+    fn parse_actor_decl(&mut self) -> Result<ActorDecl, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Actor, "`actor`")?;
+        let (name, name_span) = self.expect_ident("actor name")?;
+        let fields = self.parse_struct_body()?;
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        Ok(ActorDecl {
+            name,
+            name_span,
+            fields,
+            span: merge(start, end),
+        })
+    }
+
+    fn parse_msg_handler(&mut self) -> Result<MsgHandlerDecl, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Msg, "`msg`")?;
+        let (actor_name, _) = self.expect_ident("actor name")?;
+        self.expect(&TokenKind::Dot, "`.` after actor name")?;
+        let (name, name_span) = self.expect_ident("message handler name")?;
+
+        self.expect(&TokenKind::LParen, "`(`")?;
+        // First param must be `self` (consumed but not stored).
+        let self_tok = self.expect_ident("`self` parameter")?;
+        if self_tok.0 != "self" {
+            return Err(ParseError {
+                span: self_tok.1,
+                message: "first parameter of a msg handler must be `self`".into(),
+            });
+        }
+        let mut params = Vec::new();
+        while self.eat(&TokenKind::Comma).is_some() {
+            if matches!(self.peek_kind(), TokenKind::RParen) {
+                break;
+            }
+            params.push(self.parse_param()?);
+        }
+        self.expect(&TokenKind::RParen, "`)`")?;
+
+        self.expect(&TokenKind::Colon, "`:` before return type")?;
+        let return_type = self.parse_type()?;
+
+        let body = self.parse_block()?;
+        let end = body.span;
+        Ok(MsgHandlerDecl {
+            actor_name,
+            name,
+            name_span,
+            params,
+            return_type,
+            body,
             span: merge(start, end),
         })
     }
@@ -561,7 +618,87 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
+            TokenKind::Spawn => self.parse_spawn_expr(),
+            TokenKind::Send => self.parse_send_expr(),
+            TokenKind::Ask => self.parse_ask_expr(),
             _ => self.parse_or_expr(ctx),
+        }
+    }
+
+    fn parse_spawn_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Spawn, "`spawn`")?;
+        let (name, name_span) = self.expect_ident("actor type name")?;
+        // Parse struct literal body.
+        self.expect(&TokenKind::LBrace, "`{` for initial state")?;
+        let mut fields = Vec::new();
+        if !matches!(self.peek_kind(), TokenKind::RBrace) {
+            loop {
+                fields.push(self.parse_field_init()?);
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+                if matches!(self.peek_kind(), TokenKind::RBrace) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "`}`")?.span;
+        Ok(Expr {
+            kind: ExprKind::Spawn {
+                actor_name: name,
+                fields,
+            },
+            span: merge(start, end),
+        })
+    }
+
+    fn parse_send_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Send, "`send`")?;
+        let handle = self.parse_postfix_expr(ExprCtx::no_struct())?;
+        // The postfix chain should end with a method call. Extract it.
+        match handle.kind {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => Ok(Expr {
+                kind: ExprKind::Send {
+                    handle: receiver,
+                    method,
+                    args,
+                },
+                span: merge(start, handle.span),
+            }),
+            _ => Err(ParseError {
+                span: handle.span,
+                message: "expected `send handle.method(args)`".into(),
+            }),
+        }
+    }
+
+    fn parse_ask_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Ask, "`ask`")?;
+        let handle = self.parse_postfix_expr(ExprCtx::no_struct())?;
+        match handle.kind {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => Ok(Expr {
+                kind: ExprKind::Ask {
+                    handle: receiver,
+                    method,
+                    args,
+                },
+                span: merge(start, handle.span),
+            }),
+            _ => Err(ParseError {
+                span: handle.span,
+                message: "expected `ask handle.method(args)`".into(),
+            }),
         }
     }
 
@@ -1146,6 +1283,11 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::In => "`in`".into(),
         TokenKind::Return => "`return`".into(),
         TokenKind::Extern => "`extern`".into(),
+        TokenKind::Actor => "`actor`".into(),
+        TokenKind::Msg => "`msg`".into(),
+        TokenKind::Spawn => "`spawn`".into(),
+        TokenKind::Send => "`send`".into(),
+        TokenKind::Ask => "`ask`".into(),
         TokenKind::As => "`as`".into(),
         TokenKind::True => "`true`".into(),
         TokenKind::False => "`false`".into(),
