@@ -52,6 +52,8 @@ pub enum Ty {
     List(Box<Ty>),
     /// A user-declared struct or sum type by name.
     User(String),
+    /// An actor handle. `spawn Counter { ... }` returns `Handle<Counter>`.
+    Handle(Box<Ty>),
     /// Internal placeholder emitted after a type error. Any comparison
     /// against `Error` silently succeeds so one failure doesn't cascade
     /// into a storm of follow-on errors.
@@ -73,6 +75,7 @@ impl Ty {
             Ty::Result(o, e) => format!("Result<{}, {}>", o.display(), e.display()),
             Ty::List(t) => format!("List<{}>", t.display()),
             Ty::User(name) => name.clone(),
+            Ty::Handle(inner) => format!("Handle<{}>", inner.display()),
             Ty::Error => "<error>".into(),
         }
     }
@@ -112,6 +115,16 @@ impl std::error::Error for TypeError {}
 pub struct ModuleInfo {
     pub types: HashMap<String, TypeInfo>,
     pub fns: HashMap<String, FnSig>,
+    /// Actor types: actor_name → list of message handler signatures.
+    pub actors: HashMap<String, Vec<MsgSig>>,
+}
+
+/// Signature of an actor message handler.
+#[derive(Debug, Clone)]
+pub struct MsgSig {
+    pub name: String,
+    pub params: Vec<(String, Ty)>,
+    pub ret: Ty,
 }
 
 #[derive(Debug)]
@@ -157,12 +170,26 @@ pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
     let mut info = ModuleInfo {
         types: HashMap::new(),
         fns: HashMap::new(),
+        actors: HashMap::new(),
     };
 
     // Pass 1: register all type decl names so the next pass can resolve
     // references between user types in any order.
     let mut pending_types: Vec<&TypeDecl> = Vec::new();
     for item in &module.items {
+        // Register actor types as structs (pass 1 placeholder).
+        if let Item::Actor(ad) = item {
+            if !info.types.contains_key(&ad.name) {
+                info.types.insert(
+                    ad.name.clone(),
+                    TypeInfo::Struct {
+                        fields: Vec::new(),
+                        span: ad.span,
+                    },
+                );
+                info.actors.insert(ad.name.clone(), Vec::new());
+            }
+        }
         if let Item::Type(td) = item {
             if info.types.contains_key(&td.name) {
                 errors.push(TypeError {
@@ -239,6 +266,65 @@ pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
         info.types.insert(td.name.clone(), body);
     }
 
+    // Pass 2b: resolve actor type bodies.
+    for item in &module.items {
+        if let Item::Actor(ad) = item {
+            let mut resolved = Vec::new();
+            for f in &ad.fields {
+                match resolve_type(&f.ty, &info.types) {
+                    Ok(t) => resolved.push((f.name.clone(), t)),
+                    Err(e) => errors.push(e),
+                }
+            }
+            info.types.insert(
+                ad.name.clone(),
+                TypeInfo::Struct {
+                    fields: resolved,
+                    span: ad.span,
+                },
+            );
+        }
+    }
+
+    // Pass 2c: collect msg handler signatures.
+    for item in &module.items {
+        if let Item::MsgHandler(mh) = item {
+            let mut params = Vec::new();
+            for p in &mh.params {
+                match resolve_type(&p.ty, &info.types) {
+                    Ok(t) => params.push((p.name.clone(), t)),
+                    Err(e) => errors.push(e),
+                }
+            }
+            let ret = match resolve_type(&mh.return_type, &info.types) {
+                Ok(t) => t,
+                Err(e) => {
+                    errors.push(e);
+                    Ty::Error
+                }
+            };
+            // Also register as a regular fn (for codegen) with self param prepended.
+            let mut fn_params = vec![("self".to_string(), Ty::User(mh.actor_name.clone()))];
+            fn_params.extend(params.clone());
+            let fn_name = format!("{}_{}", mh.actor_name, mh.name);
+            info.fns.insert(
+                fn_name,
+                FnSig {
+                    params: fn_params,
+                    ret: ret.clone(),
+                    effect: Effect::Pure,
+                },
+            );
+            if let Some(msgs) = info.actors.get_mut(&mh.actor_name) {
+                msgs.push(MsgSig {
+                    name: mh.name.clone(),
+                    params,
+                    ret,
+                });
+            }
+        }
+    }
+
     // Pass 3: collect fn signatures.
     for item in &module.items {
         if let Item::Fn(f) = item {
@@ -309,6 +395,42 @@ pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
         }
     }
 
+    // Pass 3d: check msg handler bodies.
+    for item in &module.items {
+        if let Item::MsgHandler(mh) = item {
+            let fn_name = format!("{}_{}", mh.actor_name, mh.name);
+            let Some(sig) = info.fns.get(&fn_name) else {
+                continue;
+            };
+            let mut checker = FnChecker::new(&info, sig, &mut errors);
+            // Wrap body in a synthetic FnDecl for check_fn.
+            let synthetic = FnDecl {
+                name: fn_name.clone(),
+                name_span: mh.name_span,
+                params: {
+                    let mut ps = vec![Param {
+                        name: "self".to_string(),
+                        ty: Type {
+                            kind: TypeKind::Named {
+                                name: mh.actor_name.clone(),
+                                args: Vec::new(),
+                            },
+                            span: mh.name_span,
+                        },
+                        span: mh.name_span,
+                    }];
+                    ps.extend(mh.params.clone());
+                    ps
+                },
+                return_type: mh.return_type.clone(),
+                effect: Effect::Pure,
+                body: mh.body.clone(),
+                span: mh.span,
+            };
+            checker.check_fn(&synthetic);
+        }
+    }
+
     // Pass 4: check each fn body.
     for item in &module.items {
         if let Item::Fn(f) = item {
@@ -351,6 +473,9 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
             )),
             "List" if args.len() == 1 => {
                 Ok(Ty::List(Box::new(resolve_type(&args[0], types)?)))
+            }
+            "Handle" if args.len() == 1 => {
+                Ok(Ty::Handle(Box::new(resolve_type(&args[0], types)?)))
             }
             _ if args.is_empty() && types.contains_key(name) => Ok(Ty::User(name.clone())),
             _ => Err(TypeError {
@@ -763,6 +888,53 @@ impl<'a> FnChecker<'a> {
                 t
             }
 
+            ExprKind::Spawn { actor_name, fields } => {
+                if !self.module.actors.contains_key(actor_name) {
+                    self.errors.push(TypeError {
+                        span: expr.span,
+                        message: format!("`{actor_name}` is not an actor type"),
+                    });
+                    return Ty::Error;
+                }
+                // Check fields like a struct literal.
+                self.check_struct_lit(actor_name, expr.span, fields, expr.span);
+                Ty::Handle(Box::new(Ty::User(actor_name.clone())))
+            }
+            ExprKind::Send { handle, method, args } => {
+                let handle_ty = self.infer_expr(handle);
+                let Ty::Handle(inner) = &handle_ty else {
+                    self.errors.push(TypeError {
+                        span: handle.span,
+                        message: format!(
+                            "`send` requires an actor handle, found {}",
+                            handle_ty.display()
+                        ),
+                    });
+                    return Ty::Unit;
+                };
+                let Ty::User(actor_name) = inner.as_ref() else {
+                    return Ty::Unit;
+                };
+                self.check_msg_args(actor_name, method, args, expr.span);
+                Ty::Unit
+            }
+            ExprKind::Ask { handle, method, args } => {
+                let handle_ty = self.infer_expr(handle);
+                let Ty::Handle(inner) = &handle_ty else {
+                    self.errors.push(TypeError {
+                        span: handle.span,
+                        message: format!(
+                            "`ask` requires an actor handle, found {}",
+                            handle_ty.display()
+                        ),
+                    });
+                    return Ty::Error;
+                };
+                let Ty::User(actor_name) = inner.as_ref() else {
+                    return Ty::Error;
+                };
+                self.check_msg_args(actor_name, method, args, expr.span)
+            }
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expr.span),
         }
     }
@@ -1117,6 +1289,47 @@ impl<'a> FnChecker<'a> {
 
     /// Check that the current function's effect allows calling a function
     /// with the given effect. A `pure` function cannot call an `io` function.
+    fn check_msg_args(
+        &mut self,
+        actor_name: &str,
+        method: &str,
+        args: &[Arg],
+        span: Span,
+    ) -> Ty {
+        let Some(msgs) = self.module.actors.get(actor_name) else {
+            self.errors.push(TypeError {
+                span,
+                message: format!("unknown actor type `{actor_name}`"),
+            });
+            return Ty::Error;
+        };
+        let Some(msg_sig) = msgs.iter().find(|m| m.name == method) else {
+            self.errors.push(TypeError {
+                span,
+                message: format!(
+                    "actor `{actor_name}` has no message handler `{method}`"
+                ),
+            });
+            return Ty::Error;
+        };
+        if args.len() != msg_sig.params.len() {
+            self.errors.push(TypeError {
+                span,
+                message: format!(
+                    "message `{method}` expects {} argument(s), found {}",
+                    msg_sig.params.len(),
+                    args.len()
+                ),
+            });
+        } else {
+            for (i, arg) in args.iter().enumerate() {
+                let (_, pty) = &msg_sig.params[i];
+                self.check_expr(&arg.value, pty);
+            }
+        }
+        msg_sig.ret.clone()
+    }
+
     fn check_effect(&mut self, callee_effect: Effect, span: Span) {
         if self.sig.effect == Effect::Pure && callee_effect == Effect::Io {
             self.errors.push(TypeError {

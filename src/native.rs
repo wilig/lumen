@@ -2299,7 +2299,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
-        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => PTR,
+        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => PTR,
         Ty::Error => cl_types::I32,
     }
 }
@@ -2315,7 +2315,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
     match ty {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
-        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => 8, // pointer
+        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => 8, // pointer
         Ty::Error => 4,
     }
 }

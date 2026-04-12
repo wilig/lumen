@@ -571,6 +571,17 @@ impl<'a> Codegen<'a> {
                     self.scan_string_lits_in_expr(&fi.value, acc);
                 }
             }
+            ExprKind::Spawn { fields, .. } => {
+                for fi in fields {
+                    self.scan_string_lits_in_expr(&fi.value, acc);
+                }
+            }
+            ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
+                self.scan_string_lits_in_expr(handle, acc);
+                for a in args {
+                    self.scan_string_lits_in_expr(&a.value, acc);
+                }
+            }
             ExprKind::IntLit { .. }
             | ExprKind::FloatLit(_)
             | ExprKind::BoolLit(_)
@@ -1303,6 +1314,17 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     self.aux_slots.insert(expr.span.start, vec![sum_slot]);
                 }
             }
+            ExprKind::Spawn { fields, .. } => {
+                for fi in fields {
+                    self.walk_expr(&fi.value)?;
+                }
+            }
+            ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
+                self.walk_expr(handle)?;
+                for a in args {
+                    self.walk_expr(&a.value)?;
+                }
+            }
             // Leaves
             ExprKind::IntLit { .. }
             | ExprKind::FloatLit(_)
@@ -1661,6 +1683,26 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 Some(tail) => self.infer_expr_ty(tail)?,
                 None => Ty::Unit,
             },
+            ExprKind::Spawn { actor_name, .. } => {
+                Ty::Handle(Box::new(Ty::User(actor_name.clone())))
+            }
+            ExprKind::Send { .. } => Ty::Unit,
+            ExprKind::Ask { handle, method, .. } => {
+                // Look up the handler's return type from the module info.
+                if let ExprKind::Ident(actor_var) = &handle.kind {
+                    if let Some(ty) = self.lookup_ty(actor_var) {
+                        if let Ty::Handle(inner) = ty {
+                            if let Ty::User(actor_name) = *inner {
+                                let fn_name = format!("{actor_name}_{method}");
+                                if let Some(sig) = self.cg.info.fns.get(&fn_name) {
+                                    return Ok(sig.ret.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ty::Error
+            }
         })
     }
 
@@ -1978,6 +2020,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::Field { receiver, name } => {
                 self.compile_field_access(receiver, name, f)?;
+            }
+            ExprKind::Spawn { .. } | ExprKind::Send { .. } | ExprKind::Ask { .. } => {
+                return Err(CodegenError {
+                    span: expr.span,
+                    message: "actors not supported in Wasm backend".into(),
+                });
             }
         }
         Ok(())
@@ -3118,7 +3166,8 @@ fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
         | Ty::User(_)
         | Ty::Option(_)
         | Ty::Result(_, _)
-        | Ty::List(_) => ValType::I32,
+        | Ty::List(_)
+        | Ty::Handle(_) => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
         Ty::Error => {
