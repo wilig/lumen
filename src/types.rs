@@ -1509,6 +1509,37 @@ impl<'a> FnChecker<'a> {
                 }
                 Some(Ty::Unit)
             }
+            // --- List operations ---
+            ("list", "new") => {
+                Some(Ty::List(Box::new(Ty::Error)))
+            }
+            ("list", "len") => {
+                if args.len() != 1 { self.errors.push(TypeError { span, message: "`list.len` expects 1 arg".into() }); }
+                Some(Ty::I32)
+            }
+            ("list", "push") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.push` expects 2 args".into() }); }
+                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
+                Some(Ty::List(Box::new(Ty::Error)))
+            }
+            ("list", "get") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.get` expects 2 args".into() }); }
+                if let Some(a) = args.first() {
+                    let lt = self.infer_expr(&a.value);
+                    if let Ty::List(inner) = lt { return Some(*inner); }
+                }
+                Some(Ty::I32)
+            }
+            ("list", "set") => {
+                if args.len() != 3 { self.errors.push(TypeError { span, message: "`list.set` expects 3 args".into() }); }
+                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
+                Some(Ty::List(Box::new(Ty::Error)))
+            }
+            ("list", "remove") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.remove` expects 2 args".into() }); }
+                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
+                Some(Ty::List(Box::new(Ty::Error)))
+            }
             ("net", "gt_read") => {
                 self.check_effect(Effect::Io, span);
                 if args.len() != 2 {

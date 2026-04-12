@@ -259,6 +259,106 @@ int64_t lumen_http_format_response(int32_t status, int64_t body_str_ptr) {
     return (int64_t)(uintptr_t)payload;
 }
 
+// --- Dynamic list (List<T>) --------------------------------------------------
+// Layout: [rc:i32 | magic:i32 | len:i32 | cap:i32 | elem_size:i32 | pad:i32 | data...]
+// The pointer Lumen sees points past the 8-byte rc header to [len | cap | elem_size | pad | data].
+// Elements are stored contiguously starting at offset 16 (past the 4 metadata i32s).
+
+typedef struct {
+    int32_t len;
+    int32_t cap;
+    int32_t elem_size;
+    int32_t _pad;
+    // data follows inline
+} ListHeader;
+
+#define LIST_DATA(hdr) ((char *)(hdr) + sizeof(ListHeader))
+
+int64_t lumen_list_new(int32_t elem_size) {
+    int32_t initial_cap = 8;
+    int32_t total = sizeof(ListHeader) + elem_size * initial_cap;
+    char *raw = (char *)malloc(8 + total);
+    *(int32_t *)(raw + 0) = 1;            // rc
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
+    ListHeader *hdr = (ListHeader *)(raw + 8);
+    hdr->len = 0;
+    hdr->cap = initial_cap;
+    hdr->elem_size = elem_size;
+    hdr->_pad = 0;
+    return (int64_t)(uintptr_t)hdr;
+}
+
+int32_t lumen_list_len(int64_t list_ptr) {
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    return hdr->len;
+}
+
+// Grow the list if needed, returning the (possibly new) pointer.
+static int64_t list_ensure_cap(int64_t list_ptr) {
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    if (hdr->len < hdr->cap) return list_ptr;
+    int32_t new_cap = hdr->cap * 2;
+    int32_t total = sizeof(ListHeader) + hdr->elem_size * new_cap;
+    // realloc the entire block (including rc header).
+    char *raw = (char *)hdr - 8;
+    raw = realloc(raw, 8 + total);
+    hdr = (ListHeader *)(raw + 8);
+    hdr->cap = new_cap;
+    return (int64_t)(uintptr_t)hdr;
+}
+
+// Push an i64-sized element (covers i32, i64, f64, pointers).
+int64_t lumen_list_push(int64_t list_ptr, int64_t value) {
+    list_ptr = list_ensure_cap(list_ptr);
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    char *slot = LIST_DATA(hdr) + (int64_t)hdr->len * hdr->elem_size;
+    if (hdr->elem_size == 4) {
+        *(int32_t *)slot = (int32_t)value;
+    } else {
+        *(int64_t *)slot = value;
+    }
+    hdr->len++;
+    return list_ptr;  // may have moved due to realloc
+}
+
+// Get element at index. Returns i64 (caller truncates).
+int64_t lumen_list_get(int64_t list_ptr, int32_t index) {
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    if (index < 0 || index >= hdr->len) return 0;
+    char *slot = LIST_DATA(hdr) + (int64_t)index * hdr->elem_size;
+    if (hdr->elem_size == 4) {
+        return (int64_t)*(int32_t *)slot;
+    } else {
+        return *(int64_t *)slot;
+    }
+}
+
+// Set element at index. Returns the list pointer (unchanged).
+int64_t lumen_list_set(int64_t list_ptr, int32_t index, int64_t value) {
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    if (index < 0 || index >= hdr->len) return list_ptr;
+    char *slot = LIST_DATA(hdr) + (int64_t)index * hdr->elem_size;
+    if (hdr->elem_size == 4) {
+        *(int32_t *)slot = (int32_t)value;
+    } else {
+        *(int64_t *)slot = value;
+    }
+    return list_ptr;
+}
+
+// Remove element at index, shifting remaining elements left.
+int64_t lumen_list_remove(int64_t list_ptr, int32_t index) {
+    ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
+    if (index < 0 || index >= hdr->len) return list_ptr;
+    char *data = LIST_DATA(hdr);
+    int32_t es = hdr->elem_size;
+    memmove(data + (int64_t)index * es,
+            data + (int64_t)(index + 1) * es,
+            (int64_t)(hdr->len - index - 1) * es);
+    hdr->len--;
+    return list_ptr;
+}
+
 // --- Green thread runtime (ucontext + epoll) --------------------------------
 
 #define GT_MAX 4096

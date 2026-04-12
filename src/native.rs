@@ -92,6 +92,13 @@ struct NativeCodegen<'a> {
     http_parse_path: FuncId,
     http_parse_body: FuncId,
     http_format_response: FuncId,
+    /// List<T> operations (from runtime/rt.c).
+    list_new: FuncId,
+    list_len: FuncId,
+    list_push: FuncId,
+    list_get: FuncId,
+    list_set: FuncId,
+    list_remove: FuncId,
     /// Per-actor dispatch function IDs (actor_name → FuncId).
     dispatch_fns: HashMap<String, FuncId>,
 
@@ -359,6 +366,59 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_http_format_response", Linkage::Import, &http_fr_sig)
             .unwrap();
 
+        // lumen_list_new(elem_size: i32) -> i64 (PTR)
+        let mut list_new_sig = obj.make_signature();
+        list_new_sig.params.push(AbiParam::new(cl_types::I32));
+        list_new_sig.returns.push(AbiParam::new(PTR));
+        let list_new = obj
+            .declare_function("lumen_list_new", Linkage::Import, &list_new_sig)
+            .unwrap();
+
+        // lumen_list_len(list: i64) -> i32
+        let mut list_len_sig = obj.make_signature();
+        list_len_sig.params.push(AbiParam::new(cl_types::I64));
+        list_len_sig.returns.push(AbiParam::new(cl_types::I32));
+        let list_len = obj
+            .declare_function("lumen_list_len", Linkage::Import, &list_len_sig)
+            .unwrap();
+
+        // lumen_list_push(list: i64, value: i64) -> i64
+        let mut list_push_sig = obj.make_signature();
+        list_push_sig.params.push(AbiParam::new(cl_types::I64));
+        list_push_sig.params.push(AbiParam::new(cl_types::I64));
+        list_push_sig.returns.push(AbiParam::new(cl_types::I64));
+        let list_push = obj
+            .declare_function("lumen_list_push", Linkage::Import, &list_push_sig)
+            .unwrap();
+
+        // lumen_list_get(list: i64, index: i32) -> i64
+        let mut list_get_sig = obj.make_signature();
+        list_get_sig.params.push(AbiParam::new(cl_types::I64));
+        list_get_sig.params.push(AbiParam::new(cl_types::I32));
+        list_get_sig.returns.push(AbiParam::new(cl_types::I64));
+        let list_get = obj
+            .declare_function("lumen_list_get", Linkage::Import, &list_get_sig)
+            .unwrap();
+
+        // lumen_list_set(list: i64, index: i32, value: i64) -> i64
+        let mut list_set_sig = obj.make_signature();
+        list_set_sig.params.push(AbiParam::new(cl_types::I64));
+        list_set_sig.params.push(AbiParam::new(cl_types::I32));
+        list_set_sig.params.push(AbiParam::new(cl_types::I64));
+        list_set_sig.returns.push(AbiParam::new(cl_types::I64));
+        let list_set = obj
+            .declare_function("lumen_list_set", Linkage::Import, &list_set_sig)
+            .unwrap();
+
+        // lumen_list_remove(list: i64, index: i32) -> i64
+        let mut list_remove_sig = obj.make_signature();
+        list_remove_sig.params.push(AbiParam::new(cl_types::I64));
+        list_remove_sig.params.push(AbiParam::new(cl_types::I32));
+        list_remove_sig.returns.push(AbiParam::new(cl_types::I64));
+        let list_remove = obj
+            .declare_function("lumen_list_remove", Linkage::Import, &list_remove_sig)
+            .unwrap();
+
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -395,6 +455,12 @@ impl<'a> NativeCodegen<'a> {
             http_parse_path,
             http_parse_body,
             http_format_response,
+            list_new,
+            list_len,
+            list_push,
+            list_get,
+            list_set,
+            list_remove,
             dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
@@ -1941,6 +2007,96 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let call = self.builder.ins().call(func_ref, &[status, body]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
+            // --- List<T> operations ---
+            if mod_name == "list" && method == "new" {
+                // list.new(): create a new list with elem_size = 8.
+                let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_new, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[elem_size]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "list" && method == "len" {
+                // list.len(l): returns i32.
+                let l = self.compile_expr(&args[0].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_len, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[l]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "list" && method == "push" {
+                // list.push(l, val): val may need sextend to i64. Returns new list ptr.
+                let l = self.compile_expr(&args[0].value)?;
+                let val_raw = self.compile_expr(&args[1].value)?;
+                let val_ty = self.infer_ty(&args[1].value)?;
+                let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
+                    self.builder.ins().sextend(cl_types::I64, val_raw)
+                } else {
+                    val_raw
+                };
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_push, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[l, val64]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "list" && method == "get" {
+                // list.get(l, i): returns i64; ireduce to i32 if elem type is i32.
+                let l = self.compile_expr(&args[0].value)?;
+                let i = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_get, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[l, i]);
+                let result = self.builder.inst_results(call)[0];
+                // Determine element type from the list argument.
+                let list_ty = self.infer_ty(&args[0].value)?;
+                let elem_ty = match list_ty {
+                    Ty::List(inner) => *inner,
+                    _ => Ty::I64,
+                };
+                let r = if lumen_to_cl(&elem_ty) == cl_types::I32 {
+                    self.builder.ins().ireduce(cl_types::I32, result)
+                } else {
+                    result
+                };
+                return Ok(r);
+            }
+            if mod_name == "list" && method == "set" {
+                // list.set(l, i, val): sextend val if i32, returns new ptr.
+                let l = self.compile_expr(&args[0].value)?;
+                let i = self.compile_expr(&args[1].value)?;
+                let val_raw = self.compile_expr(&args[2].value)?;
+                let val_ty = self.infer_ty(&args[2].value)?;
+                let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
+                    self.builder.ins().sextend(cl_types::I64, val_raw)
+                } else {
+                    val_raw
+                };
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_set, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[l, i, val64]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "list" && method == "remove" {
+                // list.remove(l, i): returns new ptr.
+                let l = self.compile_expr(&args[0].value)?;
+                let i = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.list_remove, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[l, i]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
         }
         Err(NativeError {
             span,
@@ -3028,7 +3184,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
                 Ty::I32
             }
-            ExprKind::MethodCall { receiver, method, .. } => {
+            ExprKind::MethodCall { receiver, method, args, .. } => {
                 if let ExprKind::Ident(m) = &receiver.kind {
                     if m == "int" && method == "to_string_i32" {
                         return Ok(Ty::String);
@@ -3085,6 +3241,44 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     if m == "http" && method == "format_response" {
                         return Ok(Ty::Bytes);
+                    }
+                    // List<T> operations
+                    if m == "list" && method == "new" {
+                        return Ok(Ty::List(Box::new(Ty::I32)));
+                    }
+                    if m == "list" && method == "len" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "list" && method == "push" {
+                        // Returns the (possibly reallocated) list — same type as first arg.
+                        if let Some(first_arg) = args.first() {
+                            return self.infer_ty(&first_arg.value);
+                        }
+                        return Ok(Ty::List(Box::new(Ty::I32)));
+                    }
+                    if m == "list" && method == "get" {
+                        // Returns the element type of the list.
+                        if let Some(first_arg) = args.first() {
+                            let lt = self.infer_ty(&first_arg.value)?;
+                            if let Ty::List(inner) = lt {
+                                return Ok(*inner);
+                            }
+                        }
+                        return Ok(Ty::I64);
+                    }
+                    if m == "list" && method == "set" {
+                        // Returns the list pointer (same type as first arg).
+                        if let Some(first_arg) = args.first() {
+                            return self.infer_ty(&first_arg.value);
+                        }
+                        return Ok(Ty::List(Box::new(Ty::I32)));
+                    }
+                    if m == "list" && method == "remove" {
+                        // Returns the list pointer (same type as first arg).
+                        if let Some(first_arg) = args.first() {
+                            return self.infer_ty(&first_arg.value);
+                        }
+                        return Ok(Ty::List(Box::new(Ty::I32)));
                     }
                 }
                 Ty::I32
@@ -3190,6 +3384,10 @@ fn is_scalar(ty: &Ty) -> bool {
     matches!(
         ty,
         Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Bool | Ty::Unit
+        // Lists are treated as scalar for RC purposes: they manage their
+        // own memory via realloc inside push/remove. RC decrementing a
+        // list after realloc moved it would double-free.
+        | Ty::List(_)
     )
 }
 
