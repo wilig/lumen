@@ -618,10 +618,17 @@ impl<'a> FnChecker<'a> {
                 self.check_field_access(&recv, name, expr.span)
             }
 
-            ExprKind::MethodCall { receiver, method, args: _ } => {
-                // Typechecking stdlib method calls (io.println, list.iter, ...)
-                // will land with lumen-l64. For now, infer the receiver so
-                // errors inside it still fire, and return Error.
+            ExprKind::MethodCall { receiver, method, args } => {
+                // Recognize module-qualified calls BEFORE inferring the
+                // receiver type, because module names (`io`, `int`, ...)
+                // are not values and would fail type inference.
+                if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if let Some(ret) = self.check_module_call(
+                        mod_name, method, args, expr.span,
+                    ) {
+                        return ret;
+                    }
+                }
                 let _ = self.infer_expr(receiver);
                 self.errors.push(TypeError {
                     span: expr.span,
@@ -1026,6 +1033,35 @@ impl<'a> FnChecker<'a> {
         }
         let inner = self.infer_expr(&args[0].value);
         Ty::Option(Box::new(inner))
+    }
+
+    /// Recognize module-qualified calls like `io.println(s)`. Returns
+    /// `Some(return_type)` if recognized, `None` to fall through to the
+    /// generic method error.
+    fn check_module_call(
+        &mut self,
+        module: &str,
+        method: &str,
+        args: &[Arg],
+        span: Span,
+    ) -> Option<Ty> {
+        match (module, method) {
+            ("io", "println") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "`io.println` expects 1 argument, found {}",
+                            args.len()
+                        ),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::String);
+                }
+                Some(Ty::Unit)
+            }
+            _ => None,
+        }
     }
 
     fn check_string_len_call(&mut self, args: &[Arg], call_span: Span) -> Ty {

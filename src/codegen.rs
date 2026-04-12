@@ -36,9 +36,9 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ast::{self, BinOp, Expr, ExprKind, FnDecl, Item, StmtKind, UnaryOp};
@@ -82,10 +82,8 @@ pub fn compile(module: &ast::Module, info: &ModuleInfo) -> Result<Vec<u8>, Codeg
 // Codegen state
 // ---------------------------------------------------------------------------
 
-/// Fixed index assigned to the auto-emitted `string_concat` helper. The
-/// helper is always emitted (even for programs that don't use strings) so
-/// fn index assignment is stable and simple.
-const STRING_CONCAT_FN_INDEX: u32 = 0;
+// STRING_CONCAT_FN_INDEX is now `self.num_imports + 0` (determined at
+// compile time based on whether WASI imports are present).
 /// Reserve the first 8 bytes of linear memory as an unused null zone so an
 /// all-zeros pointer (commonly the uninitialized value of a memory slot)
 /// never names a real block.
@@ -100,10 +98,18 @@ const I32_MEM_ARG: MemArg = MemArg {
 struct Codegen<'a> {
     info: &'a ModuleInfo,
     /// Fn name → Wasm function index. Lumen fn `f` gets index
-    /// `1 + position_in_module`, because helper index 0 is reserved for
-    /// `string_concat`.
+    /// `num_imports + 1 + position_in_module`, because WASI imports
+    /// come first (if any), then helper index 0, then user fns.
     fn_indices: HashMap<String, u32>,
+    /// Whether the source module uses `import std/io`.
+    uses_wasi: bool,
+    /// Number of imported WASI functions (0 or 1 for fd_write).
+    num_imports: u32,
+    /// Function index of the auto-emitted `io_println` helper, if WASI
+    /// is in use.
+    io_println_idx: Option<u32>,
     types: TypeSection,
+    imports: ImportSection,
     functions: FunctionSection,
     memory: MemorySection,
     globals: GlobalSection,
@@ -145,7 +151,11 @@ impl<'a> Codegen<'a> {
         Self {
             info,
             fn_indices: HashMap::new(),
+            uses_wasi: false,
+            num_imports: 0,
+            io_println_idx: None,
             types: TypeSection::new(),
+            imports: ImportSection::new(),
             functions: FunctionSection::new(),
             memory: MemorySection::new(),
             globals: GlobalSection::new(),
@@ -159,6 +169,18 @@ impl<'a> Codegen<'a> {
     }
 
     fn compile_module(&mut self, module: &ast::Module) -> Result<(), CodegenError> {
+        // Check if the source imports std/io.
+        self.uses_wasi = module
+            .imports
+            .iter()
+            .any(|im| im.path == ["std", "io"]);
+
+        // If WASI is used, ensure "\n" is interned early for io_println.
+        if self.uses_wasi {
+            // We'll intern "\n" as a string literal so it's in the data
+            // section. The helper uses it for the trailing newline.
+        }
+
         // Pass A0: compute a layout for every user struct so that struct
         // literals and field accesses can emit stable offsets.
         for (name, info) in &self.info.types {
@@ -172,17 +194,62 @@ impl<'a> Codegen<'a> {
         // and emit the data section payloads. Do this before signatures so
         // the heap pointer is known by the time we emit the bump global.
         self.intern_string_literals(module);
+        // Ensure "\n" is interned for io_println even if the user didn't
+        // use it as a literal.
+        if self.uses_wasi && !self.string_offsets.contains_key("\n") {
+            let offset = self.heap_ptr;
+            self.string_offsets.insert("\n".to_string(), offset);
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.push(b'\n');
+            self.data
+                .active(0, &ConstExpr::i32_const(offset as i32), payload);
+            self.heap_ptr += 8; // 5 bytes rounded up to 8 for alignment
+        }
 
-        // Pass B: emit helper signatures first so their indices are fixed.
-        // string_concat has type index 0 and fn index 0.
+        // Determine function index offsets. When WASI is in use we import
+        // fd_write at index 0, shifting all internal functions by 1.
+        let mut type_idx = 0u32;
+
+        if self.uses_wasi {
+            // Import fd_write: (i32, i32, i32, i32) -> i32
+            self.types
+                .ty()
+                .function(vec![ValType::I32; 4], vec![ValType::I32]);
+            let fd_write_type_idx = type_idx;
+            type_idx += 1;
+            self.imports.import(
+                "wasi_snapshot_preview1",
+                "fd_write",
+                EntityType::Function(fd_write_type_idx),
+            );
+            self.num_imports = 1;
+        }
+
+        // Pass B: emit internal helper signatures.
+        // string_concat: (i32, i32) -> i32
         self.types
             .ty()
             .function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
-        self.functions.function(0);
+        type_idx += 1;
+        self.functions.function(type_idx - 1);
+
+        if self.uses_wasi {
+            // io_println: (i32) -> i32 (unit)
+            self.types
+                .ty()
+                .function(vec![ValType::I32], vec![ValType::I32]);
+            self.io_println_idx = Some(self.num_imports + 1);
+            #[allow(unused_assignments)]
+            {
+                self.functions.function(type_idx);
+                type_idx += 1;
+            }
+        }
 
         // Pass C: assign a function + type index to every user `fn` item.
-        // User fn `i` lives at fn index `1 + i` (helper = 0).
-        let mut next_index = 1u32;
+        let helpers = if self.uses_wasi { 2 } else { 1 }; // string_concat + maybe io_println
+        let mut next_index = self.num_imports + helpers;
         for item in &module.items {
             if let Item::Fn(f) = item {
                 let sig = self
@@ -230,8 +297,11 @@ impl<'a> Codegen<'a> {
         );
         self.exports.export("memory", ExportKind::Memory, 0);
 
-        // Pass E: emit the string_concat helper body.
+        // Pass E: emit helper function bodies.
         self.code.function(&self.emit_string_concat_helper());
+        if self.uses_wasi {
+            self.code.function(&self.emit_io_println_helper());
+        }
 
         // Pass F: emit each user function body.
         for item in &module.items {
@@ -442,9 +512,77 @@ impl<'a> Codegen<'a> {
         f
     }
 
+    /// Emit the body of the `io_println(s: i32) -> i32` helper.
+    /// Concatenates `\n` to the string, then writes via WASI fd_write.
+    fn emit_io_println_helper(&self) -> Function {
+        // Locals: 0=s (param), 1=with_nl, 2=iov_buf
+        let mut f = Function::new_with_locals_types(vec![ValType::I32, ValType::I32]);
+
+        let nl_offset = *self
+            .string_offsets
+            .get("\n")
+            .expect("\\n should be interned");
+        let concat_idx = self.num_imports; // string_concat fn index
+
+        // with_nl = string_concat(s, "\n")
+        f.instruction(&Instruction::LocalGet(0)); // s
+        f.instruction(&Instruction::I32Const(nl_offset as i32));
+        f.instruction(&Instruction::Call(concat_idx));
+        f.instruction(&Instruction::LocalSet(1)); // with_nl
+
+        // Allocate iov (8 bytes) + nwritten (4 bytes) = 12 bytes.
+        // Emit inline bump alloc.
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(12));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(-4));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::GlobalSet(0));
+        f.instruction(&Instruction::LocalSet(2)); // iov_buf
+
+        // iov[0].ptr = with_nl + 4  (skip length prefix)
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG)); // *(iov_buf+0) = ptr
+
+        // iov[0].len = i32.load(with_nl)
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        })); // *(iov_buf+4) = len
+
+        // fd_write(fd=1, iovs=iov_buf, iovs_count=1, nwritten=iov_buf+8)
+        f.instruction(&Instruction::I32Const(1)); // fd = stdout
+        f.instruction(&Instruction::LocalGet(2)); // iovs
+        f.instruction(&Instruction::I32Const(1)); // iovs_count
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add); // nwritten ptr
+        f.instruction(&Instruction::Call(0)); // fd_write is import index 0
+        f.instruction(&Instruction::Drop); // ignore errno
+
+        // Return unit (0).
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::End);
+
+        f
+    }
+
     fn finish(self) -> Vec<u8> {
         let mut module = Module::new();
         module.section(&self.types);
+        if self.uses_wasi {
+            module.section(&self.imports);
+        }
         module.section(&self.functions);
         module.section(&self.memory);
         module.section(&self.globals);
@@ -527,6 +665,7 @@ struct FnBuilder<'a, 'b> {
     /// - match scratch pointer for the scrutinee (key = match expr span.start)
     /// - pattern binding slots (key = pattern span.start)
     /// - `?` scratch (key = try expr span.start)
+    ///
     /// Populated during the walk pass, read during emit.
     slot_for_span: HashMap<u32, u32>,
     /// Extra scratch slots that certain emit paths need beyond the
@@ -536,8 +675,10 @@ struct FnBuilder<'a, 'b> {
     aux_slots: HashMap<u32, Vec<u32>>,
     /// Cached expression types. Populated during the walk pass for
     /// expressions whose type inference requires pattern-binding scope
-    /// context (e.g. match arm bodies). Read during emit to avoid
-    /// re-inferring in a scope where the bindings don't exist yet.
+    /// context (e.g. match arm bodies).
+    ///
+    /// Read during emit to avoid re-inferring in a scope where the
+    /// bindings don't exist yet.
     expr_type_cache: HashMap<u32, Ty>,
 }
 
@@ -1110,16 +1251,21 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     _ => Ty::Error,
                 }
             }
+            ExprKind::MethodCall { receiver, method, .. } => {
+                if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if mod_name == "io" && method == "println" {
+                        return Ok(Ty::Unit);
+                    }
+                }
+                return Err(CodegenError {
+                    span: expr.span,
+                    message: format!("method `.{method}(...)` not supported"),
+                });
+            }
             ExprKind::Block(b) => match &b.tail {
                 Some(tail) => self.infer_expr_ty(tail)?,
                 None => Ty::Unit,
             },
-            _ => {
-                return Err(CodegenError {
-                    span: expr.span,
-                    message: "expression kind not supported by current codegen".into(),
-                });
-            }
         })
     }
 
@@ -1167,13 +1313,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 f.instruction(&Instruction::LocalSet(idx));
             }
             StmtKind::Expr(e) => {
-                let ty = self.infer_expr_ty(e)?;
                 self.compile_expr(e, f)?;
-                if !matches!(ty, Ty::Unit) {
-                    // Drop statement-position expressions that don't
-                    // produce unit, since they aren't the tail.
-                    f.instruction(&Instruction::Drop);
-                }
+                // Statement-position expressions aren't consumed as a
+                // value, so drop whatever they leave on the Wasm stack.
+                // This applies even to "unit"-returning calls because we
+                // encode unit as i32(0).
+                f.instruction(&Instruction::Drop);
             }
             StmtKind::For { .. } => {
                 return Err(CodegenError {
@@ -1403,17 +1548,37 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 }
                 f.instruction(&Instruction::End);
             }
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                // Module-qualified stdlib calls, e.g. `io.println(s)`.
+                if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if mod_name == "io" && method == "println" {
+                        let idx = self.cg.io_println_idx.ok_or_else(|| CodegenError {
+                            span: expr.span,
+                            message: "`io.println` requires `import std/io`".into(),
+                        })?;
+                        if let Some(arg) = args.first() {
+                            self.compile_expr(&arg.value, f)?;
+                        }
+                        f.instruction(&Instruction::Call(idx));
+                        return Ok(());
+                    }
+                }
+                return Err(CodegenError {
+                    span: expr.span,
+                    message: format!(
+                        "method `.{method}(...)` not supported by codegen"
+                    ),
+                });
+            }
             ExprKind::StructLit { name, fields, .. } => {
                 self.compile_struct_lit(name, fields, expr.span, f)?;
             }
             ExprKind::Field { receiver, name } => {
                 self.compile_field_access(receiver, name, f)?;
-            }
-            _ => {
-                return Err(CodegenError {
-                    span: expr.span,
-                    message: "expression kind not supported by current codegen".into(),
-                });
             }
         }
         Ok(())
@@ -2211,7 +2376,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         if matches!(op, BinOp::Add) && matches!(lt, Ty::String) {
             self.compile_expr(lhs, f)?;
             self.compile_expr(rhs, f)?;
-            f.instruction(&Instruction::Call(STRING_CONCAT_FN_INDEX));
+            f.instruction(&Instruction::Call(self.cg.num_imports));
             return Ok(());
         }
 
@@ -2951,6 +3116,45 @@ mod tests {
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "run"), 11 + 102);
+    }
+
+    // --- WASI / io.println ------------------------------------------------
+
+    #[test]
+    fn run_hello_world_via_wasi() {
+        let src = r#"
+            import std/io
+
+            fn main(): i32 {
+                io.println("hello, world")
+                0
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+
+        // Run via wasmtime-wasi (preview 1) and capture stdout.
+        use wasmtime::*;
+        let engine = Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut linker = Linker::new(&engine);
+
+        let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(4096);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout_pipe.clone())
+            .build_p1();
+        let mut store = Store::new(&engine, wasi);
+
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s).unwrap();
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let f = instance.get_typed_func::<(), i32>(&mut store, "main").unwrap();
+        let ret = f.call(&mut store, ()).unwrap();
+        assert_eq!(ret, 0);
+
+        drop(store);
+        let output_bytes = stdout_pipe.try_into_inner().unwrap();
+        let output = String::from_utf8(output_bytes.into()).unwrap();
+        assert_eq!(output, "hello, world\n");
     }
 
     #[test]
