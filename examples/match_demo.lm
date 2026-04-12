@@ -11,7 +11,7 @@ fn approx_area(s: Shape): i32 {
     }
 }
 
-fn main(): i32 {
+fn main(): i32 io {
     let c = Circle { radius: 5 }
     let r = Rectangle { width: 4, height: 6 }
 

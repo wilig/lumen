@@ -941,6 +941,7 @@ impl<'a> FnChecker<'a> {
                 ret: s.ret.clone(),
                 effect: s.effect,
             }) {
+                self.check_effect(sig.effect, whole_span);
                 self.check_args_against_params(&sig.params, args, whole_span);
                 return sig.ret;
             }
@@ -1061,6 +1062,7 @@ impl<'a> FnChecker<'a> {
                 Some(Ty::String)
             }
             ("io", "println") => {
+                self.check_effect(Effect::Io, span);
                 if args.len() != 1 {
                     self.errors.push(TypeError {
                         span,
@@ -1075,6 +1077,17 @@ impl<'a> FnChecker<'a> {
                 Some(Ty::Unit)
             }
             _ => None,
+        }
+    }
+
+    /// Check that the current function's effect allows calling a function
+    /// with the given effect. A `pure` function cannot call an `io` function.
+    fn check_effect(&mut self, callee_effect: Effect, span: Span) {
+        if self.sig.effect == Effect::Pure && callee_effect == Effect::Io {
+            self.errors.push(TypeError {
+                span,
+                message: "a `pure` function cannot call an `io` function".into(),
+            });
         }
     }
 
@@ -1777,6 +1790,45 @@ mod tests {
             }
             "#,
         );
+    }
+
+    #[test]
+    fn pure_fn_calling_io_fn_is_error() {
+        let errs = tc_err(
+            r#"
+            import std/io
+            fn greet(): unit io { io.println("hi") }
+            fn bad(): unit { greet() }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("pure") && e.message.contains("io")));
+    }
+
+    #[test]
+    fn io_fn_calling_io_fn_is_ok() {
+        tc_ok(
+            r#"
+            import std/io
+            fn a(): unit io { io.println("a") }
+            fn b(): unit io { a() }
+            "#,
+        );
+    }
+
+    #[test]
+    fn pure_fn_calling_pure_fn_is_ok() {
+        tc_ok("fn a(): i32 { 1 }\nfn b(): i32 { a() }");
+    }
+
+    #[test]
+    fn pure_fn_calling_io_println_directly_is_error() {
+        let errs = tc_err(
+            r#"
+            import std/io
+            fn bad(): unit { io.println("oops") }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("pure") && e.message.contains("io")));
     }
 
     // --- Negative cases: one per rule ------------------------------------

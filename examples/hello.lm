@@ -1,6 +1,6 @@
 import std/io
 
-fn main(): i32 {
+fn main(): i32 io {
     io.println("hello, world")
     0
 }

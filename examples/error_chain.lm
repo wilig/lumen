@@ -14,7 +14,7 @@ fn compute(): Result<i32, string> {
     Ok(x + y)
 }
 
-fn main(): Result<i32, string> {
+fn main(): Result<i32, string> io {
     let result = compute()?
     io.println("result = " + int.to_string_i32(result))
     Ok(0)

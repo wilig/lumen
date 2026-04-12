@@ -3686,7 +3686,7 @@ mod tests {
         let src = r#"
             import std/io
 
-            fn main(): i32 {
+            fn main(): i32 io {
                 io.println("hello, world")
                 0
             }
@@ -3724,7 +3724,7 @@ mod tests {
     fn run_int_to_string_positive() {
         let src = r#"
             import std/io
-            fn main(): i32 {
+            fn main(): i32 io {
                 io.println(int.to_string_i32(42))
                 io.println(int.to_string_i32(0))
                 io.println(int.to_string_i32(-7))
@@ -3770,7 +3770,7 @@ mod tests {
                 Ok(x)
             }
 
-            fn main(): Result<i32, i32> {
+            fn main(): Result<i32, i32> io {
                 let y = middle()?
                 Ok(y)
             }
@@ -3816,7 +3816,7 @@ mod tests {
             import std/io
 
             fn inner(): Result<i32, i32> { Ok(1) }
-            fn main(): Result<i32, i32> {
+            fn main(): Result<i32, i32> io {
                 let x = inner()?
                 Ok(x)
             }
