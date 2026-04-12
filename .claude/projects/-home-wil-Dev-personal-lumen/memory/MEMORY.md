@@ -1,1 +1,2 @@
 - [Project direction](project_direction.md) — Lumen is now a general-purpose language, not short-lived scripts
+- [Return convention](return_convention.md) — Explicit return required for non-unit functions; tail expressions only in sub-blocks

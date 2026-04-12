@@ -1305,8 +1305,28 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         initial_cleanup: Vec<(String, Variable, Ty)>,
     ) -> Result<Value, NativeError> {
         self.cleanup_stack.push(initial_cleanup);
+        let mut hit_return = false;
         for stmt in &block.stmts {
             self.compile_stmt(stmt)?;
+            // If the statement was a `return`, the block is terminated.
+            // Don't emit any more code — Cranelift rejects instructions
+            // after a terminator.
+            if matches!(stmt.kind, StmtKind::Return(_)) {
+                hit_return = true;
+                break;
+            }
+        }
+        if hit_return {
+            // Block terminated by return. Clean up the stack but don't
+            // emit any more IR. Switch to an unreachable block so the
+            // caller can continue emitting without Cranelift errors.
+            self.cleanup_stack.pop();
+            let dead_bb = self.builder.create_block();
+            self.builder.switch_to_block(dead_bb);
+            // Return a dummy of the right type so define_function's
+            // final `return` instruction doesn't type-mismatch.
+            let ret_ty = lumen_to_cl(&self.sig.ret);
+            return Ok(self.builder.ins().iconst(ret_ty, 0));
         }
         let result = match &block.tail {
             Some(e) => self.compile_expr(e)?,
