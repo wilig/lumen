@@ -790,11 +790,22 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 self.walk_expr(value)?;
             }
             StmtKind::Expr(e) => self.walk_expr(e)?,
-            StmtKind::For { .. } => {
-                return Err(CodegenError {
-                    span: stmt.span,
-                    message: "for-loops are not supported by codegen yet (lumen-w0g)".into(),
-                });
+            StmtKind::For { binder, iter, body } => {
+                self.walk_expr(iter)?;
+                self.push_scope();
+                // Allocate the loop binder local (the element variable).
+                let binder_slot = self.alloc_local(Ty::I32, stmt.span)?;
+                self.slot_for_span.insert(stmt.span.start, binder_slot);
+                self.declare(binder.clone(), binder_slot);
+                // Allocate a counter local for the range lower bound
+                // and an end-bound local. These are aux slots for the
+                // for-loop desugaring.
+                let counter_slot = self.alloc_scratch_i32();
+                let end_slot = self.alloc_scratch_i32();
+                self.aux_slots
+                    .insert(stmt.span.start, vec![counter_slot, end_slot]);
+                self.walk_block(body)?;
+                self.pop_scope();
             }
             StmtKind::Return(Some(e)) => self.walk_expr(e)?,
             StmtKind::Return(None) => {}
@@ -1320,11 +1331,8 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 // encode unit as i32(0).
                 f.instruction(&Instruction::Drop);
             }
-            StmtKind::For { .. } => {
-                return Err(CodegenError {
-                    span: stmt.span,
-                    message: "for-loops are not supported by codegen yet (lumen-w0g)".into(),
-                });
+            StmtKind::For { binder, iter, body } => {
+                self.compile_for_range(binder, iter, body, stmt.span, f)?;
             }
             StmtKind::Return(Some(e)) => {
                 self.compile_expr(e, f)?;
@@ -1720,6 +1728,98 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             Some(e) => self.infer_expr_ty(e),
             None => Ok(Ty::Unit),
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // For loops
+    // ----------------------------------------------------------------------
+
+    /// Compile `for binder in range(start, end) { body }` as a counted
+    /// Wasm loop. Recognizes only `range(start, end)` as the iterator
+    /// expression for now; general iterators will come later.
+    fn compile_for_range(
+        &mut self,
+        binder: &str,
+        iter: &Expr,
+        body: &ast::Block,
+        span: Span,
+        f: &mut Function,
+    ) -> Result<(), CodegenError> {
+        // Verify the iterator is `range(start, end)`.
+        let (start_expr, end_expr) = match &iter.kind {
+            ExprKind::Call { callee, args }
+                if matches!(&callee.kind, ExprKind::Ident(n) if n == "range")
+                    && args.len() == 2 =>
+            {
+                (&args[0].value, &args[1].value)
+            }
+            _ => {
+                return Err(CodegenError {
+                    span: iter.span,
+                    message: "for-loop codegen only supports `range(start, end)` as iterator"
+                        .into(),
+                });
+            }
+        };
+
+        let binder_slot = *self
+            .slot_for_span
+            .get(&span.start)
+            .expect("walk reserved binder slot");
+        let aux = self.aux_slots.get(&span.start).cloned().unwrap();
+        let counter_slot = aux[0];
+        let end_slot = aux[1];
+
+        // counter = start
+        self.compile_expr(start_expr, f)?;
+        f.instruction(&Instruction::LocalSet(counter_slot));
+
+        // end = end
+        self.compile_expr(end_expr, f)?;
+        f.instruction(&Instruction::LocalSet(end_slot));
+
+        // block $break
+        //   loop $continue
+        //     if counter >= end { br $break }
+        //     binder = counter
+        //     <body>
+        //     counter = counter + 1
+        //     br $continue
+        //   end
+        // end
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // Break test: counter >= end → br 1 (exit outer block)
+        f.instruction(&Instruction::LocalGet(counter_slot));
+        f.instruction(&Instruction::LocalGet(end_slot));
+        f.instruction(&Instruction::I32GeS);
+        f.instruction(&Instruction::BrIf(1));
+
+        // Bind the element variable.
+        self.push_scope();
+        f.instruction(&Instruction::LocalGet(counter_slot));
+        f.instruction(&Instruction::LocalSet(binder_slot));
+        self.declare(binder.to_string(), binder_slot);
+
+        // Body.
+        self.compile_block(body, f)?;
+
+        self.pop_scope();
+
+        // Increment counter.
+        f.instruction(&Instruction::LocalGet(counter_slot));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(counter_slot));
+
+        // Jump back.
+        f.instruction(&Instruction::Br(0));
+
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        Ok(())
     }
 
     // ----------------------------------------------------------------------
@@ -3116,6 +3216,58 @@ mod tests {
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "run"), 11 + 102);
+    }
+
+    // --- For loops --------------------------------------------------------
+
+    #[test]
+    fn run_sum_of_squares_with_for_loop() {
+        let src = r#"
+            fn sum_of_squares(n: i32): i32 {
+                var total: i32 = 0
+                for i in range(1, n + 1) {
+                    total = total + i * i
+                }
+                total
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+        // 1² + 2² + 3² + 4² + 5² = 1 + 4 + 9 + 16 + 25 = 55
+        assert_eq!(run_i32_i32(&wasm, "sum_of_squares", 5), 55);
+        assert_eq!(run_i32_i32(&wasm, "sum_of_squares", 0), 0);
+        assert_eq!(run_i32_i32(&wasm, "sum_of_squares", 1), 1);
+    }
+
+    #[test]
+    fn run_triangle_number_for_loop() {
+        let src = r#"
+            fn triangle(n: i32): i32 {
+                var total: i32 = 0
+                for i in range(1, n + 1) {
+                    total = total + i
+                }
+                total
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32_i32(&wasm, "triangle", 10), 55);
+        assert_eq!(run_i32_i32(&wasm, "triangle", 100), 5050);
+    }
+
+    #[test]
+    fn run_empty_range_does_nothing() {
+        let src = r#"
+            fn f(): i32 {
+                var total: i32 = 42
+                for i in range(5, 5) {
+                    total = total + i
+                }
+                total
+            }
+        "#;
+        let wasm = compile_src(src);
+        assert_eq!(run_i32(&wasm, "f"), 42);
     }
 
     // --- WASI / io.println ------------------------------------------------
