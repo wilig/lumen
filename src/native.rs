@@ -811,6 +811,11 @@ impl<'a> NativeCodegen<'a> {
             builder.switch_to_block(match_bb);
             // Build args: (state, arg0 truncated to the right type).
             let is_mutation = matches!(msg.ret, Ty::User(ref n) if n == actor_name);
+            // Tuple return (State, reply): first element is the actor
+            // type (mutation), rest is the reply.
+            let is_tuple_mutation = matches!(&msg.ret,
+                Ty::Tuple(elems) if matches!(elems.first(), Some(Ty::User(ref n)) if n == actor_name)
+            );
             let mut call_args = vec![state];
             if msg.params.len() == 1 {
                 // Single arg: truncate arg0 to the param type.
@@ -840,6 +845,13 @@ impl<'a> NativeCodegen<'a> {
             if is_mutation {
                 // Store new state in cell.
                 builder.ins().store(flags, result, cell, 0);
+            } else if is_tuple_mutation {
+                // Tuple return: element 0 is new state, rest is the reply.
+                // result is a tuple pointer. Extract and store new state.
+                let new_state = builder.ins().load(PTR, flags, result, 0);
+                builder.ins().store(flags, new_state, cell, 0);
+                // Reply with the full tuple pointer (caller uses .1 etc.)
+                builder.ins().store(flags, result, reply_ptr, 0);
             } else {
                 // Write result as reply.
                 let reply_val = match lumen_to_cl(&msg.ret) {
@@ -1499,6 +1511,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     let val = self.compile_expr(elem_expr)?;
                     let (offset, _) = field_offset(&fields, &format!("_{i}"));
                     self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                    // rc_incr pointer-typed elements: the tuple now holds
+                    // a reference alongside the original let binding.
+                    if !is_scalar(&elem_tys[i]) {
+                        self.emit_rc_incr(val);
+                    }
                 }
                 Ok(ptr)
             }
@@ -2007,6 +2024,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             let val = self.compile_expr(&init.value)?;
             let (offset, _) = field_offset(&def_fields, fname);
             self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+            // rc_incr pointer-typed fields: the struct now holds a
+            // reference alongside the original binding.
+            if !is_scalar(fty) {
+                self.emit_rc_incr(val);
+            }
         }
         Ok(ptr)
     }
