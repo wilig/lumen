@@ -577,7 +577,9 @@ impl<'a> NativeCodegen<'a> {
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
 
-            // Declare params as variables.
+            // Declare params as variables. Pointer-typed params are
+            // registered on the cleanup stack — the caller incr'd them
+            // before the call, and our scope-exit decr balances it.
             for (i, (pname, pty)) in sig.params.iter().enumerate() {
                 let var = fb.fresh_var(lumen_to_cl(pty));
                 let val = fb.builder.block_params(entry)[i];
@@ -586,13 +588,24 @@ impl<'a> NativeCodegen<'a> {
                 fb.name_types.insert(pname.clone(), pty.clone());
             }
 
-            // Compile body.
-            let result = fb.compile_block(&f.body)?;
+            // Collect pointer-typed params for cleanup — the caller
+            // rc_incr'd them before the call, and our scope-exit decr
+            // balances it.
+            let mut param_cleanup = Vec::new();
+            for (pname, pty) in sig.params.iter() {
+                if !is_scalar(pty) {
+                    if let Some(&var) = fb.names.get(pname) {
+                        param_cleanup.push((pname.clone(), var));
+                    }
+                }
+            }
 
-            // Return. RC note: the return value keeps its current
-            // refcount (rc=1 from allocation). The caller receives
-            // ownership. rc_decr fires on var reassignment (not on
-            // function exit — that's a follow-up for full scope tracking).
+            // Compile body. The block's cleanup pass handles rc_decr
+            // for let bindings AND params. The block rc_incr's the tail
+            // expression to protect it from the cleanup pass.
+            let result = fb.compile_block_with_cleanup(&f.body, param_cleanup)?;
+
+            // Return.
             fb.builder.ins().return_(&[result]);
         } // fb dropped here, releasing the mutable borrow on builder
 
@@ -897,6 +910,10 @@ struct FnEmitter<'a, 'b, 'c> {
     fn_name: String,
     names: HashMap<String, Variable>,
     name_types: HashMap<String, Ty>,
+    /// Stack of cleanup lists. Each block pushes a list; pointer-typed
+    /// `let` bindings are appended to the current list. On block exit,
+    /// everything in the list is rc_decr'd.
+    cleanup_stack: Vec<Vec<(String, Variable)>>,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -913,6 +930,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             fn_name: fn_name.to_string(),
             names: HashMap::new(),
             name_types: HashMap::new(),
+            cleanup_stack: Vec::new(),
         }
     }
 
@@ -921,13 +939,42 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     }
 
     fn compile_block(&mut self, block: &ast::Block) -> Result<Value, NativeError> {
+        self.compile_block_with_cleanup(block, Vec::new())
+    }
+
+    fn compile_block_with_cleanup(
+        &mut self,
+        block: &ast::Block,
+        initial_cleanup: Vec<(String, Variable)>,
+    ) -> Result<Value, NativeError> {
+        self.cleanup_stack.push(initial_cleanup);
         for stmt in &block.stmts {
             self.compile_stmt(stmt)?;
         }
-        match &block.tail {
-            Some(e) => self.compile_expr(e),
-            None => Ok(self.builder.ins().iconst(cl_types::I32, 0)),
+        let result = match &block.tail {
+            Some(e) => self.compile_expr(e)?,
+            None => self.builder.ins().iconst(cl_types::I32, 0),
+        };
+        // rc_decr all pointer-typed let bindings that were declared in
+        // this block, EXCEPT skip any that happen to be the result value
+        // (the tail expression might reference a local that we're about
+        // to return from this block).
+        // Protect the result from the cleanup pass: rc_incr it first,
+        // then decr all locals (including the one that might hold the
+        // same pointer), then the net effect is +0 for the result and
+        // -1 for everything else.
+        let result_is_ptr = block.tail.as_ref().map(|e| {
+            self.infer_ty(e).map(|t| !is_scalar(&t)).unwrap_or(false)
+        }).unwrap_or(false);
+        if result_is_ptr {
+            self.emit_rc_incr(result);
         }
+        let cleanup = self.cleanup_stack.pop().unwrap_or_default();
+        for (_name, var) in &cleanup {
+            let val = self.builder.use_var(*var);
+            self.emit_rc_decr(val);
+        }
+        Ok(result)
     }
 
     fn compile_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), NativeError> {
@@ -939,7 +986,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
                 self.names.insert(name.clone(), var);
-                self.name_types.insert(name.clone(), lumen_ty);
+                self.name_types.insert(name.clone(), lumen_ty.clone());
+                // Register pointer-typed bindings for scope-exit cleanup.
+                if !is_scalar(&lumen_ty) {
+                    if let Some(list) = self.cleanup_stack.last_mut() {
+                        list.push((name.clone(), var));
+                    }
+                }
             }
             StmtKind::Assign { name, value } => {
                 // RC: decrement the old value before overwriting.
@@ -1196,7 +1249,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .declare_func_in_func(*func_id, self.builder.func);
         let mut arg_vals = Vec::new();
         for a in args {
-            arg_vals.push(self.compile_expr(&a.value)?);
+            let val = self.compile_expr(&a.value)?;
+            arg_vals.push(val);
+        }
+        // rc_incr each pointer argument so the callee's scope-exit
+        // decr doesn't free values the caller still holds.
+        if let Some(sig) = self.cg.info.fns.get(&name) {
+            let param_types: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
+            for (i, pty) in param_types.iter().enumerate() {
+                if !is_scalar(pty) {
+                    if let Some(&val) = arg_vals.get(i) {
+                        self.emit_rc_incr(val);
+                    }
+                }
+            }
         }
         let call = self.builder.ins().call(func_ref, &arg_vals);
         Ok(self.builder.inst_results(call)[0])
