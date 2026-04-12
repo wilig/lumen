@@ -3373,7 +3373,7 @@ mod tests {
 
     #[test]
     fn emitted_module_validates() {
-        let wasm = compile_src("fn answer(): i32 { 42 }");
+        let wasm = compile_src("fn answer(): i32 { return 42 }");
         // Basic shape check: starts with the Wasm magic number.
         assert_eq!(&wasm[0..4], b"\0asm");
         // Run it through wasmparser::validate to catch structural bugs.
@@ -3383,8 +3383,8 @@ mod tests {
     #[test]
     fn arithmetic_and_user_call_validate() {
         let src = r#"
-            fn square(n: i32): i32 { n * n }
-            fn sum_of_squares_three(): i32 { square(1) + square(2) + square(3) }
+            fn square(n: i32): i32 { return n * n }
+            fn sum_of_squares_three(): i32 { return square(1) + square(2) + square(3) }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3393,8 +3393,8 @@ mod tests {
     #[test]
     fn i64_and_f64_validate() {
         let src = r#"
-            fn big(): i64 { 1000000i64 * 1000i64 }
-            fn fp(): f64 { 1.5 + 2.5 }
+            fn big(): i64 { return 1000000i64 * 1000i64 }
+            fn fp(): f64 { return 1.5 + 2.5 }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3402,7 +3402,7 @@ mod tests {
 
     #[test]
     fn if_expression_validates() {
-        let src = "fn sign(n: i32): i32 { if n < 0 { -1 } else { if n == 0 { 0 } else { 1 } } }";
+        let src = "fn sign(n: i32): i32 { return if n < 0 { -1 } else { if n == 0 { 0 } else { 1 } } }";
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
     }
@@ -3414,7 +3414,7 @@ mod tests {
                 var total: i32 = 0
                 total = total + n
                 total = total + (n - 1)
-                total
+                return total
             }
         "#;
         let wasm = compile_src(src);
@@ -3424,8 +3424,8 @@ mod tests {
     #[test]
     fn cast_validates() {
         let src = r#"
-            fn widen(n: i32): i64 { n as i64 }
-            fn to_float(n: i32): f64 { n as f64 }
+            fn widen(n: i32): i64 { return n as i64 }
+            fn to_float(n: i32): f64 { return n as f64 }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3475,14 +3475,14 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_constant_i32() {
-        let wasm = compile_src("fn answer(): i32 { 42 }");
+        let wasm = compile_src("fn answer(): i32 { return 42 }");
         assert_eq!(run_i32(&wasm, "answer"), 42);
     }
 
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_arithmetic_chain() {
-        let wasm = compile_src("fn value(): i32 { (1 + 2) * (3 + 4) - 5 }");
+        let wasm = compile_src("fn value(): i32 { return (1 + 2) * (3 + 4) - 5 }");
         assert_eq!(run_i32(&wasm, "value"), 16);
     }
 
@@ -3490,8 +3490,8 @@ mod tests {
     #[test]
     fn run_user_function_calls() {
         let src = r#"
-            fn square(n: i32): i32 { n * n }
-            fn value(): i32 { square(3) + square(4) }
+            fn square(n: i32): i32 { return n * n }
+            fn value(): i32 { return square(3) + square(4) }
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "value"), 25);
@@ -3500,7 +3500,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_with_parameter() {
-        let src = "fn cube(n: i32): i32 { n * n * n }";
+        let src = "fn cube(n: i32): i32 { return n * n * n }";
         let wasm = compile_src(src);
         assert_eq!(run_i32_i32(&wasm, "cube", 3), 27);
         assert_eq!(run_i32_i32(&wasm, "cube", 5), 125);
@@ -3509,7 +3509,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_if_expression() {
-        let src = "fn abs(n: i32): i32 { if n < 0 { -n } else { n } }";
+        let src = "fn abs(n: i32): i32 { return if n < 0 { -n } else { n } }";
         let wasm = compile_src(src);
         assert_eq!(run_i32_i32(&wasm, "abs", -7), 7);
         assert_eq!(run_i32_i32(&wasm, "abs", 5), 5);
@@ -3525,7 +3525,7 @@ mod tests {
                 var total: i32 = 0
                 total = total + 4
                 total = total + 3
-                total
+                return total
             }
         "#;
         let wasm = compile_src(src);
@@ -3535,7 +3535,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_i64_arithmetic() {
-        let src = "fn big(): i64 { 1000000i64 * 1000i64 }";
+        let src = "fn big(): i64 { return 1000000i64 * 1000i64 }";
         let wasm = compile_src(src);
         assert_eq!(run_i64(&wasm, "big"), 1_000_000_000);
     }
@@ -3543,7 +3543,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_cast_widening() {
-        let src = "fn widen(n: i32): i64 { n as i64 }";
+        let src = "fn widen(n: i32): i64 { return n as i64 }";
         let wasm = compile_src(src);
         use wasmtime::*;
         let engine = Engine::default();
@@ -3557,7 +3557,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_literal_length() {
-        let src = r#"fn hello_len(): i32 { string_len("hello") }"#;
+        let src = r#"fn hello_len(): i32 { return string_len("hello") }"#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
         assert_eq!(run_i32(&wasm, "hello_len"), 5);
@@ -3567,7 +3567,7 @@ mod tests {
     #[test]
     fn run_string_concat_length() {
         // The star criterion: string concat compiles and runs end-to-end.
-        let src = r#"fn total(): i32 { string_len("hello, " + "world") }"#;
+        let src = r#"fn total(): i32 { return string_len("hello, " + "world") }"#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
         assert_eq!(run_i32(&wasm, "total"), 12);
@@ -3576,7 +3576,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[test]
     fn run_string_concat_three_way() {
-        let src = r#"fn total(): i32 { string_len("a" + "bc" + "def") }"#;
+        let src = r#"fn total(): i32 { return string_len("a" + "bc" + "def") }"#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "total"), 6);
     }
@@ -3587,7 +3587,7 @@ mod tests {
         let src = r#"
             fn greet(): i32 {
                 let greeting = "hello, " + "world"
-                string_len(greeting)
+                return string_len(greeting)
             }
         "#;
         let wasm = compile_src(src);
@@ -3600,8 +3600,8 @@ mod tests {
         // Using the same literal twice should not crash — the scanner
         // de-dupes by content before assigning offsets.
         let src = r#"
-            fn a(): i32 { string_len("hi") }
-            fn b(): i32 { string_len("hi") }
+            fn a(): i32 { return string_len("hi") }
+            fn b(): i32 { return string_len("hi") }
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "a"), 2);
@@ -3618,7 +3618,7 @@ mod tests {
 
             fn make_and_read(): i32 {
                 let p = Point { x: 3, y: 4 }
-                p.x + p.y
+                return p.x + p.y
             }
         "#;
         let wasm = compile_src(src);
@@ -3635,12 +3635,12 @@ mod tests {
 
             fn sum(): i64 {
                 let m = Mixed { tag: 1, big: 100i64, small: 2 }
-                m.big
+                return m.big
             }
 
             fn tag(): i32 {
                 let m = Mixed { tag: 7, big: 0i64, small: 0 }
-                m.tag + m.small
+                return m.tag + m.small
             }
         "#;
         let wasm = compile_src(src);
@@ -3656,16 +3656,16 @@ mod tests {
             type Point = { x: i32, y: i32 }
 
             fn origin(): Point {
-                Point { x: 0, y: 0 }
+                return Point { x: 0, y: 0 }
             }
 
             fn translate(p: Point, dx: i32, dy: i32): Point {
-                Point { x: p.x + dx, y: p.y + dy }
+                return Point { x: p.x + dx, y: p.y + dy }
             }
 
             fn manhattan(): i32 {
                 let p = translate(origin(), 3, 4)
-                p.x + p.y
+                return p.x + p.y
             }
         "#;
         let wasm = compile_src(src);
@@ -3683,7 +3683,7 @@ mod tests {
 
             fn greeting_len(): i32 {
                 let g = Greet { prefix: "hello" }
-                string_len(g.prefix)
+                return string_len(g.prefix)
             }
         "#;
         let wasm = compile_src(src);
@@ -3699,8 +3699,8 @@ mod tests {
         // without match, so just verify the pointers aren't 0 (Some) and
         // that None returns a non-null header either.
         let src = r#"
-            fn one(): Option<i32> { Some(1) }
-            fn empty(): Option<i32> { None }
+            fn one(): Option<i32> { return Some(1) }
+            fn empty(): Option<i32> { return None }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3711,14 +3711,14 @@ mod tests {
     fn run_match_option_extracts_value() {
         let src = r#"
             fn unwrap_or(o: Option<i32>, default: i32): i32 {
-                match o {
+                return match o {
                     Some(n) => n,
                     None => default,
                 }
             }
 
-            fn with_some(): i32 { unwrap_or(Some(42), 0) }
-            fn with_none(): i32 { unwrap_or(None, 99) }
+            fn with_some(): i32 { return unwrap_or(Some(42), 0) }
+            fn with_none(): i32 { return unwrap_or(None, 99) }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3731,18 +3731,18 @@ mod tests {
     fn run_match_result_extracts_value() {
         let src = r#"
             fn safe_div(a: i32, b: i32): Result<i32, i32> {
-                if b == 0 { Err(1) } else { Ok(a / b) }
+                return if b == 0 { Err(1) } else { Ok(a / b) }
             }
 
             fn test_ok(): i32 {
-                match safe_div(10, 2) {
+                return match safe_div(10, 2) {
                     Ok(v) => v,
                     Err(_) => -1,
                 }
             }
 
             fn test_err(): i32 {
-                match safe_div(10, 0) {
+                return match safe_div(10, 0) {
                     Ok(v) => v,
                     Err(code) => code * 100,
                 }
@@ -3757,17 +3757,17 @@ mod tests {
     #[test]
     fn run_try_operator_happy_path() {
         let src = r#"
-            fn first(): Result<i32, i32> { Ok(10) }
-            fn second(): Result<i32, i32> { Ok(20) }
+            fn first(): Result<i32, i32> { return Ok(10) }
+            fn second(): Result<i32, i32> { return Ok(20) }
 
             fn sum(): Result<i32, i32> {
                 let a = first()?
                 let b = second()?
-                Ok(a + b)
+                return Ok(a + b)
             }
 
             fn run(): i32 {
-                match sum() {
+                return match sum() {
                     Ok(v) => v,
                     Err(_) => -1,
                 }
@@ -3781,15 +3781,15 @@ mod tests {
     #[test]
     fn run_try_operator_short_circuits_on_err() {
         let src = r#"
-            fn fail(): Result<i32, i32> { Err(42) }
+            fn fail(): Result<i32, i32> { return Err(42) }
 
             fn chain(): Result<i32, i32> {
                 let x = fail()?
-                Ok(x + 100)
+                return Ok(x + 100)
             }
 
             fn run(): i32 {
-                match chain() {
+                return match chain() {
                     Ok(_) => 0,
                     Err(code) => code,
                 }
@@ -3809,7 +3809,7 @@ mod tests {
 
             fn number_val(): i32 {
                 let t = Number(7)
-                match t {
+                return match t {
                     Number(n) => n,
                     _ => -1,
                 }
@@ -3828,14 +3828,14 @@ mod tests {
                 | Rectangle { width: i32, height: i32 }
 
             fn area(s: Shape): i32 {
-                match s {
+                return match s {
                     Circle { radius: r } => r * r * 3,
                     Rectangle { width: w, height: h } => w * h,
                 }
             }
 
-            fn circle_area(): i32 { area(Circle { radius: 2 }) }
-            fn rect_area(): i32 { area(Rectangle { width: 3, height: 4 }) }
+            fn circle_area(): i32 { return area(Circle { radius: 2 }) }
+            fn rect_area(): i32 { return area(Rectangle { width: 3, height: 4 }) }
         "#;
         let wasm = compile_src(src);
         wasmparser::validate(&wasm).expect("module must validate");
@@ -3850,15 +3850,15 @@ mod tests {
             type Light = | Red | Yellow | Green
 
             fn code(l: Light): i32 {
-                match l {
+                return match l {
                     Red => 1,
                     Yellow => 2,
                     Green => 3,
                 }
             }
 
-            fn red_code(): i32 { code(Red) }
-            fn green_code(): i32 { code(Green) }
+            fn red_code(): i32 { return code(Red) }
+            fn green_code(): i32 { return code(Green) }
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "red_code"), 1);
@@ -3874,13 +3874,13 @@ mod tests {
             type Rect = | A { h: i32 } | B { h: i32 }
 
             fn height(r: Rect): i32 {
-                match r {
+                return match r {
                     A { h: h } => h + 1,
                     B { h: h } => h + 2,
                 }
             }
 
-            fn run(): i32 { height(A { h: 10 }) + height(B { h: 100 }) }
+            fn run(): i32 { return height(A { h: 10 }) + height(B { h: 100 }) }
         "#;
         let wasm = compile_src(src);
         assert_eq!(run_i32(&wasm, "run"), 11 + 102);
@@ -3897,7 +3897,7 @@ mod tests {
                 for i in range(1, n + 1) {
                     total = total + i * i
                 }
-                total
+                return total
             }
         "#;
         let wasm = compile_src(src);
@@ -3917,7 +3917,7 @@ mod tests {
                 for i in range(1, n + 1) {
                     total = total + i
                 }
-                total
+                return total
             }
         "#;
         let wasm = compile_src(src);
@@ -3934,7 +3934,7 @@ mod tests {
                 for i in range(5, 5) {
                     total = total + i
                 }
-                total
+                return total
             }
         "#;
         let wasm = compile_src(src);
@@ -3951,7 +3951,7 @@ mod tests {
 
             fn main(): i32 io {
                 io.println("hello, world")
-                0
+                return 0
             }
         "#;
         let wasm = compile_src(src);
@@ -3993,7 +3993,7 @@ mod tests {
                 io.println(int.to_string_i32(0))
                 io.println(int.to_string_i32(-7))
                 io.println(int.to_string_i32(12345))
-                0
+                return 0
             }
         "#;
         let wasm = compile_src(src);
@@ -4027,17 +4027,17 @@ mod tests {
             import std/io
 
             fn inner(): Result<i32, i32> {
-                Err(42)
+                return Err(42)
             }
 
             fn middle(): Result<i32, i32> {
                 let x = inner()?
-                Ok(x)
+                return Ok(x)
             }
 
             fn main(): Result<i32, i32> io {
                 let y = middle()?
-                Ok(y)
+                return Ok(y)
             }
         "#;
         let wasm = compile_src(src);
@@ -4081,17 +4081,17 @@ mod tests {
             import std/io
 
             fn divide(a: i32, b: i32): Result<i32, string> {
-                if b == 0 { Err("division by zero") } else { Ok(a / b) }
+                return if b == 0 { Err("division by zero") } else { Ok(a / b) }
             }
 
             fn compute(x: i32): Result<i32, string> {
                 let r = divide(x, 0)?
-                Ok(r)
+                return Ok(r)
             }
 
             fn main(): Result<i32, string> io {
                 let v = compute(42)?
-                Ok(v)
+                return Ok(v)
             }
         "#;
         let wasm = compile_src(src);
@@ -4129,10 +4129,10 @@ mod tests {
         let src = r#"
             import std/io
 
-            fn inner(): Result<i32, i32> { Ok(1) }
+            fn inner(): Result<i32, i32> { return Ok(1) }
             fn main(): Result<i32, i32> io {
                 let x = inner()?
-                Ok(x)
+                return Ok(x)
             }
         "#;
         let wasm = compile_src(src);
@@ -4164,7 +4164,7 @@ mod tests {
     fn run_recursive_function() {
         let src = r#"
             fn fact(n: i32): i32 {
-                if n <= 1 { 1 } else { n * fact(n - 1) }
+                return if n <= 1 { 1 } else { n * fact(n - 1) }
             }
         "#;
         let wasm = compile_src(src);

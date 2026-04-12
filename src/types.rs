@@ -2185,22 +2185,22 @@ mod tests {
 
     #[test]
     fn identity_fn() {
-        tc_ok("fn id(x: i32): i32 { x }");
+        tc_ok("fn id(x: i32): i32 { return x }");
     }
 
     #[test]
     fn arithmetic_and_comparison() {
-        tc_ok("fn f(a: i32, b: i32): bool { (a + b) * 2 < 100 }");
+        tc_ok("fn f(a: i32, b: i32): bool { return (a + b) * 2 < 100 }");
     }
 
     #[test]
     fn string_concat_via_plus() {
-        tc_ok("fn greet(name: string): string { \"hi, \" + name }");
+        tc_ok("fn greet(name: string): string { return \"hi, \" + name }");
     }
 
     #[test]
     fn as_cast_between_numeric_types() {
-        tc_ok("fn widen(n: i32): i64 { n as i64 }");
+        tc_ok("fn widen(n: i32): i64 { return n as i64 }");
     }
 
     #[test]
@@ -2212,7 +2212,7 @@ mod tests {
                 for i in range(1, n + 1) {
                     total = total + i * i
                 }
-                total
+                return total
             }
             "#,
         );
@@ -2225,7 +2225,7 @@ mod tests {
             type User = { name: string, age: i32 }
 
             fn age_of(u: User): i32 {
-                u.age
+                return u.age
             }
             "#,
         );
@@ -2238,7 +2238,7 @@ mod tests {
             type Point = { x: i32, y: i32 }
 
             fn make(): Point {
-                Point { x: 1, y: 2 }
+                return Point { x: 1, y: 2 }
             }
             "#,
         );
@@ -2254,7 +2254,7 @@ mod tests {
                 | Triangle { base: f64, height: f64 }
 
             fn area(s: Shape): f64 {
-                match s {
+                return match s {
                     Circle { radius: r } => r,
                     Rectangle { width: w, height: h } => w,
                     Triangle { base: b, height: h } => b,
@@ -2271,7 +2271,7 @@ mod tests {
             type T = | A | B | C
 
             fn f(t: T): i32 {
-                match t {
+                return match t {
                     A => 1,
                     _ => 0,
                 }
@@ -2285,12 +2285,12 @@ mod tests {
         tc_ok(
             r#"
             fn parse(s: string): Result<i32, string> {
-                Ok(42)
+                return Ok(42)
             }
 
             fn use_it(s: string): Result<i32, string> {
                 let n = parse(s)?
-                Ok(n)
+                return Ok(n)
             }
             "#,
         );
@@ -2301,16 +2301,16 @@ mod tests {
         tc_ok(
             r#"
             fn first(): Option<i32> {
-                Some(1)
+                return Some(1)
             }
 
             fn second(): Option<i32> {
                 let x = first()?
-                Some(x)
+                return Some(x)
             }
 
             fn third(): Option<i32> {
-                None
+                return None
             }
             "#,
         );
@@ -2325,7 +2325,7 @@ mod tests {
                 | Word(string)
 
             fn mk_num(): Token {
-                Number(1)
+                return Number(1)
             }
             "#,
         );
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[test]
     fn pure_fn_calling_pure_fn_is_ok() {
-        tc_ok("fn a(): i32 { 1 }\nfn b(): i32 { a() }");
+        tc_ok("fn a(): i32 { return 1 }\nfn b(): i32 { return a() }");
     }
 
     #[test]
@@ -2374,13 +2374,13 @@ mod tests {
 
     #[test]
     fn no_implicit_numeric_conversion() {
-        let errs = tc_err("fn f(n: i32): i64 { n }");
+        let errs = tc_err("fn f(n: i32): i64 { return n }");
         assert!(errs.iter().any(|e| e.message.contains("expected i64")));
     }
 
     #[test]
     fn mismatched_operands() {
-        let errs = tc_err("fn f(a: i32, b: i64): i32 { a + b }");
+        let errs = tc_err("fn f(a: i32, b: i64): i32 { return a + b }");
         assert!(errs.iter().any(|e| e.message.contains("matching numeric types")));
     }
 
@@ -2391,7 +2391,7 @@ mod tests {
             fn f(): i32 {
                 let x: i32 = 1
                 let x: i32 = 2
-                x
+                return x
             }
             "#,
         );
@@ -2405,7 +2405,7 @@ mod tests {
             fn f(): i32 {
                 let x: i32 = 1
                 x = 2
-                x
+                return x
             }
             "#,
         );
@@ -2419,7 +2419,7 @@ mod tests {
             type Point = { x: i32, y: i32 }
 
             fn f(): Point {
-                Point { x: 1 }
+                return Point { x: 1 }
             }
             "#,
         );
@@ -2433,7 +2433,7 @@ mod tests {
             type T = | A | B | C
 
             fn f(t: T): i32 {
-                match t {
+                return match t {
                     A => 1,
                     B => 2,
                 }
@@ -2449,11 +2449,11 @@ mod tests {
     fn try_in_wrong_function_type() {
         let errs = tc_err(
             r#"
-            fn parse(s: string): Result<i32, string> { Ok(1) }
+            fn parse(s: string): Result<i32, string> { return Ok(1) }
 
             fn f(): i32 {
                 let n = parse("a")?
-                n
+                return n
             }
             "#,
         );
@@ -2462,7 +2462,7 @@ mod tests {
 
     #[test]
     fn cast_requires_numeric() {
-        let errs = tc_err("fn f(b: bool): i32 { b as i32 }");
+        let errs = tc_err("fn f(b: bool): i32 { return b as i32 }");
         assert!(errs.iter().any(|e| e.message.contains("numeric source")));
     }
 }
