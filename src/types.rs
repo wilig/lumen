@@ -1487,6 +1487,40 @@ impl<'a> FnChecker<'a> {
                 }
                 Some(Ty::I32)
             }
+            ("net", "serve") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`net.serve` expects 2 arguments (port, handler), found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    // Second arg is a function name — type-check it as an ident.
+                    // The codegen will resolve it to a func_addr.
+                }
+                Some(Ty::Unit)
+            }
+            ("net", "gt_read") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 2 {
+                    self.errors.push(TypeError { span, message: format!("`net.gt_read` expects 2 args, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                }
+                Some(Ty::Bytes)
+            }
+            ("net", "gt_write") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 2 {
+                    self.errors.push(TypeError { span, message: format!("`net.gt_write` expects 2 args, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::Bytes);
+                }
+                Some(Ty::I32)
+            }
             ("net", "tcp_close") => {
                 self.check_effect(Effect::Io, span);
                 if args.len() != 1 {

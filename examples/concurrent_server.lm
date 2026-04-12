@@ -1,0 +1,19 @@
+// Concurrent HTTP server using green threads + epoll.
+// Each connection runs in its own green thread. The scheduler
+// multiplexes thousands of connections on a single OS thread
+// using non-blocking I/O.
+
+import std/io
+import std/net
+
+fn handle(client: i32): unit io {
+    let request = net.gt_read(client, 4096)
+    let path = http.parse_path(request)
+    let body = "Hello from " + path + "\n"
+    let response = http.format_response(200, body)
+    let written = net.gt_write(client, response)
+}
+
+fn main(): unit io {
+    net.serve(8080, handle)
+}

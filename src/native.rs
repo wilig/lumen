@@ -84,6 +84,9 @@ struct NativeCodegen<'a> {
     net_tcp_read: FuncId,
     net_tcp_write: FuncId,
     net_tcp_close: FuncId,
+    net_serve: FuncId,
+    gt_read: FuncId,
+    gt_write: FuncId,
     /// HTTP parsing/formatting helpers (from runtime/rt.c).
     http_parse_method: FuncId,
     http_parse_path: FuncId,
@@ -297,6 +300,32 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_tcp_close", Linkage::Import, &tcp_close_sig)
             .unwrap();
 
+        // lumen_net_serve(port: i32, handler: ptr)
+        let mut serve_sig = obj.make_signature();
+        serve_sig.params.push(AbiParam::new(cl_types::I32));
+        serve_sig.params.push(AbiParam::new(PTR));
+        let net_serve = obj
+            .declare_function("lumen_net_serve", Linkage::Import, &serve_sig)
+            .unwrap();
+
+        // lumen_gt_read(fd: i32, max: i32) -> ptr (bytes)
+        let mut gt_read_sig = obj.make_signature();
+        gt_read_sig.params.push(AbiParam::new(cl_types::I32));
+        gt_read_sig.params.push(AbiParam::new(cl_types::I32));
+        gt_read_sig.returns.push(AbiParam::new(PTR));
+        let gt_read = obj
+            .declare_function("lumen_gt_read", Linkage::Import, &gt_read_sig)
+            .unwrap();
+
+        // lumen_gt_write(fd: i32, bytes: ptr) -> i32
+        let mut gt_write_sig = obj.make_signature();
+        gt_write_sig.params.push(AbiParam::new(cl_types::I32));
+        gt_write_sig.params.push(AbiParam::new(PTR));
+        gt_write_sig.returns.push(AbiParam::new(cl_types::I32));
+        let gt_write = obj
+            .declare_function("lumen_gt_write", Linkage::Import, &gt_write_sig)
+            .unwrap();
+
         // lumen_http_parse_method(raw: ptr) -> ptr
         let mut http_pm_sig = obj.make_signature();
         http_pm_sig.params.push(AbiParam::new(PTR));
@@ -359,6 +388,9 @@ impl<'a> NativeCodegen<'a> {
             net_tcp_read,
             net_tcp_write,
             net_tcp_close,
+            net_serve,
+            gt_read,
+            gt_write,
             http_parse_method,
             http_parse_path,
             http_parse_body,
@@ -1807,6 +1839,42 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let truncated = self.builder.ins().ireduce(cl_types::I32, result);
                 return Ok(truncated);
             }
+            if mod_name == "net" && method == "serve" {
+                let port = self.compile_expr(&args[0].value)?;
+                // Second arg: function name → func_addr
+                let handler_name = match &args[1].value.kind {
+                    ExprKind::Ident(n) => n.clone(),
+                    _ => {
+                        return Err(NativeError {
+                            span,
+                            message: "net.serve: second arg must be a function name".into(),
+                        })
+                    }
+                };
+                let handler_id = self.cg.fn_ids.get(&handler_name).ok_or_else(|| {
+                    NativeError { span, message: format!("unknown function `{handler_name}`") }
+                })?;
+                let handler_ref = self.cg.obj.declare_func_in_func(*handler_id, self.builder.func);
+                let handler_addr = self.builder.ins().func_addr(PTR, handler_ref);
+                let serve_ref = self.cg.obj.declare_func_in_func(self.cg.net_serve, self.builder.func);
+                self.builder.ins().call(serve_ref, &[port, handler_addr]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            // Green-thread-aware I/O: use gt_read/gt_write when inside net.serve.
+            if mod_name == "net" && method == "gt_read" {
+                let fd = self.compile_expr(&args[0].value)?;
+                let max = self.compile_expr(&args[1].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.gt_read, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[fd, max]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "net" && method == "gt_write" {
+                let fd = self.compile_expr(&args[0].value)?;
+                let data = self.compile_expr(&args[1].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.gt_write, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[fd, data]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
             if mod_name == "net" && method == "tcp_close" {
                 let fd = self.compile_expr(&args[0].value)?;
                 let func_ref = self
@@ -2980,6 +3048,15 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         return Ok(Ty::I32);
                     }
                     if m == "net" && method == "tcp_close" {
+                        return Ok(Ty::Unit);
+                    }
+                    if m == "net" && method == "serve" {
+                        return Ok(Ty::Unit);
+                    }
+                    if m == "net" && method == "gt_read" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if m == "net" && method == "gt_write" {
                         return Ok(Ty::I32);
                     }
                     // HTTP parsing/formatting

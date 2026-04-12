@@ -9,6 +9,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ucontext.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <errno.h>
 
 // Forward declarations.
 void lumen_rt_drain(void);
@@ -253,4 +257,186 @@ int64_t lumen_http_format_response(int32_t status, int64_t body_str_ptr) {
     if (body_len > 0) memcpy(out, body_data, body_len);
 
     return (int64_t)(uintptr_t)payload;
+}
+
+// --- Green thread runtime (ucontext + epoll) --------------------------------
+
+#define GT_MAX 4096
+#define GT_STACK_SIZE (64 * 1024)
+
+typedef enum { GT_FREE, GT_RUNNABLE, GT_BLOCKED, GT_DONE } GTState;
+
+typedef struct {
+    ucontext_t ctx;
+    char *stack;
+    GTState state;
+    int wait_fd;
+} GreenThread;
+
+static GreenThread gt_pool[GT_MAX];
+static int gt_count = 0;
+static int gt_current = -1;
+static ucontext_t gt_sched_ctx;
+static int gt_epoll_fd = -1;
+
+static void gt_init(void) {
+    if (gt_epoll_fd < 0) {
+        gt_epoll_fd = epoll_create1(0);
+        for (int i = 0; i < GT_MAX; i++) gt_pool[i].state = GT_FREE;
+    }
+}
+
+typedef struct { void (*fn)(int); int arg; } GTEntry;
+
+static void gt_entry(unsigned int lo, unsigned int hi) {
+    GTEntry *e = (GTEntry *)(uintptr_t)((uint64_t)lo | ((uint64_t)hi << 32));
+    e->fn(e->arg);
+    free(e);
+    gt_pool[gt_current].state = GT_DONE;
+    swapcontext(&gt_pool[gt_current].ctx, &gt_sched_ctx);
+}
+
+static void gt_spawn(void (*fn)(int), int arg) {
+    gt_init();
+    int id = -1;
+    for (int i = 0; i < GT_MAX; i++) {
+        if (gt_pool[i].state == GT_FREE || gt_pool[i].state == GT_DONE) {
+            id = i; break;
+        }
+    }
+    if (id < 0) return;
+
+    if (gt_pool[id].stack) free(gt_pool[id].stack);
+    gt_pool[id].stack = malloc(GT_STACK_SIZE);
+    gt_pool[id].state = GT_RUNNABLE;
+    gt_pool[id].wait_fd = -1;
+
+    GTEntry *entry = malloc(sizeof(GTEntry));
+    entry->fn = fn;
+    entry->arg = arg;
+
+    getcontext(&gt_pool[id].ctx);
+    gt_pool[id].ctx.uc_stack.ss_sp = gt_pool[id].stack;
+    gt_pool[id].ctx.uc_stack.ss_size = GT_STACK_SIZE;
+    gt_pool[id].ctx.uc_link = NULL;
+    uintptr_t ptr = (uintptr_t)entry;
+    makecontext(&gt_pool[id].ctx, (void (*)())gt_entry,
+                2, (unsigned int)(ptr & 0xFFFFFFFF), (unsigned int)(ptr >> 32));
+    if (id >= gt_count) gt_count = id + 1;
+}
+
+// Block current green thread until fd is ready.
+static void gt_wait_fd(int fd, int events) {
+    if (gt_current < 0) return;
+    struct epoll_event ev = { .events = events | EPOLLONESHOT,
+                              .data.fd = gt_current };
+    epoll_ctl(gt_epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    gt_pool[gt_current].state = GT_BLOCKED;
+    gt_pool[gt_current].wait_fd = fd;
+    swapcontext(&gt_pool[gt_current].ctx, &gt_sched_ctx);
+    epoll_ctl(gt_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+static void gt_schedule(void) {
+    while (1) {
+        int ran = 0;
+        for (int i = 0; i < gt_count; i++) {
+            if (gt_pool[i].state == GT_RUNNABLE) {
+                gt_current = i;
+                swapcontext(&gt_sched_ctx, &gt_pool[i].ctx);
+                gt_current = -1;
+                ran = 1;
+                break;
+            }
+        }
+        if (ran) continue;
+
+        int alive = 0;
+        for (int i = 0; i < gt_count; i++)
+            if (gt_pool[i].state == GT_BLOCKED) alive++;
+        if (alive == 0) break;
+
+        struct epoll_event events[64];
+        int n = epoll_wait(gt_epoll_fd, events, 64, 100);
+        for (int i = 0; i < n; i++) {
+            int tid = events[i].data.fd;
+            if (tid >= 0 && tid < gt_count && gt_pool[tid].state == GT_BLOCKED)
+                gt_pool[tid].state = GT_RUNNABLE;
+        }
+    }
+}
+
+// --- net.serve: green-thread-per-connection HTTP server ----------------------
+
+static void (*gt_handler)(int);
+
+static void gt_connection_handler(int client_fd) {
+    gt_handler(client_fd);
+    close(client_fd);
+}
+
+static void gt_accept_loop(int server_fd) {
+    fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
+    while (1) {
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                gt_wait_fd(server_fd, EPOLLIN);
+                continue;
+            }
+            break;
+        }
+        fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK);
+        gt_spawn(gt_connection_handler, client);
+    }
+}
+
+void lumen_net_serve(int port, void (*handler)(int)) {
+    gt_init();
+    gt_handler = handler;
+    int server_fd = lumen_tcp_listen(port);
+    if (server_fd < 0) {
+        fprintf(stderr, "net.serve: failed to listen on port %d\n", port);
+        return;
+    }
+    fprintf(stderr, "Listening on :%d (green threads + epoll)\n", port);
+    gt_spawn(gt_accept_loop, server_fd);
+    gt_schedule();
+}
+
+// Green-thread-aware read.
+int64_t lumen_gt_read(int fd, int max) {
+    char *buf = alloc_bytes(max);
+    if (!buf) return 0;
+    while (1) {
+        ssize_t n = read(fd, buf + 4, max);
+        if (n >= 0) {
+            *(int32_t *)buf = (int32_t)n;
+            return (int64_t)(uintptr_t)buf;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            gt_wait_fd(fd, EPOLLIN);
+            continue;
+        }
+        *(int32_t *)buf = 0;
+        return (int64_t)(uintptr_t)buf;
+    }
+}
+
+// Green-thread-aware write.
+int32_t lumen_gt_write(int fd, int64_t bytes_ptr) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    int32_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, buf + 4 + written, len - written);
+        if (n >= 0) {
+            written += n;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            gt_wait_fd(fd, EPOLLOUT);
+        } else {
+            break;
+        }
+    }
+    return (int32_t)written;
 }
