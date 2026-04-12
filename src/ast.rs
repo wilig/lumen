@@ -238,6 +238,8 @@ pub enum ExprKind {
         name: String,
         name_span: Span,
         fields: Vec<FieldInit>,
+        /// `..expr` spread: fill unspecified fields from this expression.
+        spread: Option<Box<Expr>>,
     },
 
     // Postfix

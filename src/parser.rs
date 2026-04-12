@@ -1153,8 +1153,22 @@ impl Parser {
     fn parse_struct_lit_tail(&mut self, name: String, name_span: Span) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
+        let mut spread = None;
         if !matches!(self.peek_kind(), TokenKind::RBrace) {
             loop {
+                // Check for `..expr` spread syntax.
+                if matches!(self.peek_kind(), TokenKind::Dot) {
+                    if let Some(next) = self.peek_at(1) {
+                        if matches!(next.kind, TokenKind::Dot) {
+                            self.bump(); // first .
+                            self.bump(); // second .
+                            spread = Some(Box::new(self.parse_expr(ExprCtx::normal())?));
+                            // Trailing comma allowed after spread.
+                            self.eat(&TokenKind::Comma);
+                            break;
+                        }
+                    }
+                }
                 fields.push(self.parse_field_init()?);
                 if self.eat(&TokenKind::Comma).is_none() {
                     break;
@@ -1170,6 +1184,7 @@ impl Parser {
                 name,
                 name_span,
                 fields,
+                spread,
             },
             span: merge(name_span, end),
         })

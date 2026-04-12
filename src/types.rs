@@ -825,7 +825,8 @@ impl<'a> FnChecker<'a> {
                 name,
                 name_span,
                 fields,
-            } => self.check_struct_lit(name, *name_span, fields, expr.span),
+                spread,
+            } => self.check_struct_lit(name, *name_span, fields, spread.as_deref(), expr.span),
 
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
 
@@ -953,7 +954,7 @@ impl<'a> FnChecker<'a> {
                     return Ty::Error;
                 }
                 // Check fields like a struct literal.
-                self.check_struct_lit(actor_name, expr.span, fields, expr.span);
+                self.check_struct_lit(actor_name, expr.span, fields, None, expr.span);
                 Ty::Handle(Box::new(Ty::User(actor_name.clone())))
             }
             ExprKind::Send { handle, method, args } => {
@@ -1117,6 +1118,7 @@ impl<'a> FnChecker<'a> {
         name: &str,
         name_span: Span,
         fields: &[FieldInit],
+        spread: Option<&Expr>,
         whole_span: Span,
     ) -> Ty {
         // First try: a regular user struct type.
@@ -1126,7 +1128,7 @@ impl<'a> FnChecker<'a> {
         }) = self.module.types.get(name)
         {
             let def_fields: Vec<(String, Ty)> = def_fields.clone();
-            return self.check_struct_lit_fields(name, name_span, fields, whole_span, def_fields);
+            return self.check_struct_lit_fields(name, name_span, fields, spread, whole_span, def_fields);
         }
 
         // Second try: a sum-type variant constructor with named fields,
@@ -1136,6 +1138,7 @@ impl<'a> FnChecker<'a> {
                 name,
                 name_span,
                 fields,
+                spread,
                 whole_span,
                 variant_def_fields,
             );
@@ -1172,10 +1175,29 @@ impl<'a> FnChecker<'a> {
         name: &str,
         name_span: Span,
         fields: &[FieldInit],
+        spread: Option<&Expr>,
         whole_span: Span,
         def_fields: Vec<(String, Ty)>,
     ) -> Ty {
         let _ = name_span;
+
+        // If there is a spread expression, typecheck it and verify it has the
+        // same struct type.  Missing fields are then provided by the spread.
+        let has_spread = if let Some(spread_expr) = spread {
+            let spread_ty = self.infer_expr(spread_expr);
+            if !matches!(&spread_ty, Ty::User(n) if n == name) && !matches!(spread_ty, Ty::Error) {
+                self.errors.push(TypeError {
+                    span: spread_expr.span,
+                    message: format!(
+                        "spread expression has type `{}` but struct literal is `{name}`",
+                        spread_ty.display()
+                    ),
+                });
+            }
+            true
+        } else {
+            false
+        };
 
         // Check every provided field, collect names.
         let mut provided: HashMap<&str, &Expr> = HashMap::new();
@@ -1194,13 +1216,16 @@ impl<'a> FnChecker<'a> {
                     self.check_expr(e, fty);
                 }
                 None => {
-                    self.errors.push(TypeError {
-                        span: whole_span,
-                        message: format!(
-                            "struct `{name}` is missing field `{fname}` of type {}",
-                            fty.display()
-                        ),
-                    });
+                    // If there is a spread, missing fields come from there — OK.
+                    if !has_spread {
+                        self.errors.push(TypeError {
+                            span: whole_span,
+                            message: format!(
+                                "struct `{name}` is missing field `{fname}` of type {}",
+                                fty.display()
+                            ),
+                        });
+                    }
                 }
             }
         }

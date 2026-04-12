@@ -766,18 +766,19 @@ impl<'a> NativeCodegen<'a> {
         builder.ins().brif(is_null, exit, &[], do_incr, &[]);
 
         builder.switch_to_block(do_incr);
-        // Check if ptr is in the heap (bump-allocated) vs static data.
-        // Static data pointers are in .rodata and don't have a refcount
-        // header. We distinguish by checking if ptr is in the malloc'd
-        // range — but since we use malloc now, ALL rc_alloc'd pointers
-        // are in the C heap, and static data is in .rodata. The simplest
-        // safe heuristic: check if *(ptr-8) looks like a valid refcount
-        // (positive, < 1M). If not, skip. This is a conservative guard.
-        // For correctness, we just always do the incr — static data
-        // pointers should never reach rc_incr because the codegen only
-        // emits incr for values that went through rc_alloc.
+        // Check the magic sentinel at ptr-4 to verify this is an
+        // rc_alloc'd block. String literals and other static data in
+        // .rodata don't have the rc header — writing to their memory
+        // would segfault.
         let eight = builder.ins().iconst(PTR, 8);
         let header = builder.ins().isub(ptr, eight);
+        let magic = builder.ins().load(cl_types::I32, flags, header, 4);
+        let expected = builder.ins().iconst(cl_types::I32, 0x4C554D45u32 as i64);
+        let is_rc = builder.ins().icmp(IntCC::Equal, magic, expected);
+        let do_real_incr = builder.create_block();
+        builder.ins().brif(is_rc, do_real_incr, &[], exit, &[]);
+
+        builder.switch_to_block(do_real_incr);
         let rc = builder.ins().load(cl_types::I32, flags, header, 0);
         let new_rc = builder.ins().iadd_imm(rc, 1);
         builder.ins().store(flags, new_rc, header, 0);
@@ -1600,8 +1601,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let cl_ty = lumen_to_cl(&fty);
                 Ok(self.builder.ins().load(cl_ty, MemFlags::new(), ptr, offset))
             }
-            ExprKind::StructLit { name, fields, .. } => {
-                self.compile_struct_lit(name, fields, expr.span)
+            ExprKind::StructLit { name, fields, spread, .. } => {
+                self.compile_struct_lit(name, fields, spread.as_deref(), expr.span)
             }
             ExprKind::Block(b) => self.compile_block(b),
             ExprKind::Match { scrutinee, arms } => {
@@ -2231,6 +2232,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         &mut self,
         name: &str,
         fields: &[ast::FieldInit],
+        spread: Option<&ast::Expr>,
         span: Span,
     ) -> Result<Value, NativeError> {
         // Named-field variant constructor? (e.g. Circle { radius: 2 })
@@ -2254,24 +2256,38 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
         }
 
+        // Compile the spread base pointer (if any) before allocating the new
+        // struct so that any side-effects happen in source order.
+        let spread_val: Option<Value> = spread.map(|e| self.compile_expr(e)).transpose()?;
+
         let def_fields = get_struct_fields(&self.cg.info.types, name);
         let total_size = struct_size(&def_fields);
         let ptr = self.rc_alloc(total_size as i64)?;
 
         for (fname, fty) in &def_fields {
-            let init = fields.iter().find(|fi| &fi.name == fname).ok_or_else(|| {
-                NativeError {
+            let (offset, _) = field_offset(&def_fields, fname);
+            if let Some(init) = fields.iter().find(|fi| &fi.name == fname) {
+                // User explicitly provided this field.
+                let val = self.compile_expr(&init.value)?;
+                self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                // rc_incr pointer-typed fields: the struct now holds a
+                // reference alongside the original binding.
+                if !is_scalar(fty) {
+                    self.emit_rc_incr(val);
+                }
+            } else if let Some(base) = spread_val {
+                // Field not provided — load from the spread base struct.
+                let cl_ty = lumen_to_cl(fty);
+                let val = self.builder.ins().load(cl_ty, MemFlags::new(), base, offset);
+                self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                if !is_scalar(fty) {
+                    self.emit_rc_incr(val);
+                }
+            } else {
+                return Err(NativeError {
                     span,
                     message: format!("missing field `{fname}`"),
-                }
-            })?;
-            let val = self.compile_expr(&init.value)?;
-            let (offset, _) = field_offset(&def_fields, fname);
-            self.builder.ins().store(MemFlags::new(), val, ptr, offset);
-            // rc_incr pointer-typed fields: the struct now holds a
-            // reference alongside the original binding.
-            if !is_scalar(fty) {
-                self.emit_rc_incr(val);
+                });
             }
         }
         Ok(ptr)
@@ -2953,7 +2969,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         span: Span,
     ) -> Result<Value, NativeError> {
         // Build the initial state (same as a struct literal).
-        let state = self.compile_struct_lit(actor_name, fields, span)?;
+        let state = self.compile_struct_lit(actor_name, fields, None, span)?;
         // Allocate an 8-byte mutable cell to hold the state pointer.
         let cell = self.rc_alloc(8)?;
         self.builder.ins().store(MemFlags::new(), state, cell, 0);
@@ -3550,9 +3566,12 @@ fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
             }
         }
         ExprKind::Block(b) => collect_strings_block(b, acc),
-        ExprKind::StructLit { fields, .. } => {
+        ExprKind::StructLit { fields, spread, .. } => {
             for fi in fields {
                 collect_strings_expr(&fi.value, acc);
+            }
+            if let Some(s) = spread {
+                collect_strings_expr(s, acc);
             }
         }
         ExprKind::TupleLit(elems) => {
