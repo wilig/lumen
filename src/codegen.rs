@@ -108,6 +108,10 @@ struct Codegen<'a> {
     /// Function index of the auto-emitted `io_println` helper, if WASI
     /// is in use.
     io_println_idx: Option<u32>,
+    /// Function index of the auto-emitted `print_frames` helper. Present
+    /// whenever WASI is in use so that error frame chains can be printed
+    /// from main's Err epilogue.
+    print_frames_idx: Option<u32>,
     types: TypeSection,
     imports: ImportSection,
     functions: FunctionSection,
@@ -154,6 +158,7 @@ impl<'a> Codegen<'a> {
             uses_wasi: false,
             num_imports: 0,
             io_println_idx: None,
+            print_frames_idx: None,
             types: TypeSection::new(),
             imports: ImportSection::new(),
             functions: FunctionSection::new(),
@@ -194,6 +199,9 @@ impl<'a> Codegen<'a> {
         // and emit the data section payloads. Do this before signatures so
         // the heap pointer is known by the time we emit the bump global.
         self.intern_string_literals(module);
+        // Also intern the formatted error-frame messages for every `?`
+        // site in the source, so they're available in the data section.
+        self.intern_frame_messages(module);
         // Ensure "\n" is interned for io_println even if the user didn't
         // use it as a literal.
         if self.uses_wasi && !self.string_offsets.contains_key("\n") {
@@ -240,15 +248,21 @@ impl<'a> Codegen<'a> {
                 .ty()
                 .function(vec![ValType::I32], vec![ValType::I32]);
             self.io_println_idx = Some(self.num_imports + 1);
+            self.functions.function(type_idx);
+            type_idx += 1;
+
+            // print_frames: () -> i32 (unit)
+            self.types.ty().function(vec![], vec![ValType::I32]);
+            self.print_frames_idx = Some(self.num_imports + 2);
+            self.functions.function(type_idx);
             #[allow(unused_assignments)]
             {
-                self.functions.function(type_idx);
                 type_idx += 1;
             }
         }
 
         // Pass C: assign a function + type index to every user `fn` item.
-        let helpers = if self.uses_wasi { 2 } else { 1 }; // string_concat + maybe io_println
+        let helpers = if self.uses_wasi { 3 } else { 1 };
         let mut next_index = self.num_imports + helpers;
         for item in &module.items {
             if let Item::Fn(f) = item {
@@ -295,12 +309,23 @@ impl<'a> Codegen<'a> {
             },
             &ConstExpr::i32_const(self.heap_ptr as i32),
         );
+        // Global 1: frame_chain — head of the error-frame linked list.
+        // 0 = no frames.
+        self.globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i32_const(0),
+        );
         self.exports.export("memory", ExportKind::Memory, 0);
 
         // Pass E: emit helper function bodies.
         self.code.function(&self.emit_string_concat_helper());
         if self.uses_wasi {
             self.code.function(&self.emit_io_println_helper());
+            self.code.function(&self.emit_print_frames_helper());
         }
 
         // Pass F: emit each user function body.
@@ -314,6 +339,112 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    /// Pre-scan every `?` site and intern a formatted frame message
+    /// string for each one: `"  at {fn_name} (<source>:{line}:{col})"`.
+    fn intern_frame_messages(&mut self, module: &ast::Module) {
+        for item in &module.items {
+            if let Item::Fn(f) = item {
+                self.scan_try_sites(&f.name, &f.body);
+            }
+        }
+    }
+
+    fn scan_try_sites(&mut self, fn_name: &str, block: &ast::Block) {
+        for stmt in &block.stmts {
+            match &stmt.kind {
+                StmtKind::Let { value, .. }
+                | StmtKind::Var { value, .. }
+                | StmtKind::Assign { value, .. } => self.scan_try_in_expr(fn_name, value),
+                StmtKind::Expr(e) => self.scan_try_in_expr(fn_name, e),
+                StmtKind::For { iter, body, .. } => {
+                    self.scan_try_in_expr(fn_name, iter);
+                    self.scan_try_sites(fn_name, body);
+                }
+                StmtKind::Return(Some(e)) => self.scan_try_in_expr(fn_name, e),
+                StmtKind::Return(None) => {}
+            }
+        }
+        if let Some(tail) = &block.tail {
+            self.scan_try_in_expr(fn_name, tail);
+        }
+    }
+
+    fn scan_try_in_expr(&mut self, fn_name: &str, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Try(inner) => {
+                self.scan_try_in_expr(fn_name, inner);
+                // Intern the frame message for this `?` site.
+                let msg = format!(
+                    "  at {} (<source>:{}:{})",
+                    fn_name, expr.span.line, expr.span.col
+                );
+                self.intern_string(&msg);
+            }
+            ExprKind::Paren(e) => self.scan_try_in_expr(fn_name, e),
+            ExprKind::Unary { rhs, .. } => self.scan_try_in_expr(fn_name, rhs),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.scan_try_in_expr(fn_name, lhs);
+                self.scan_try_in_expr(fn_name, rhs);
+            }
+            ExprKind::Cast { expr, .. } => self.scan_try_in_expr(fn_name, expr),
+            ExprKind::Call { callee, args } => {
+                self.scan_try_in_expr(fn_name, callee);
+                for a in args {
+                    self.scan_try_in_expr(fn_name, &a.value);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.scan_try_in_expr(fn_name, receiver);
+                for a in args {
+                    self.scan_try_in_expr(fn_name, &a.value);
+                }
+            }
+            ExprKind::Field { receiver, .. } => self.scan_try_in_expr(fn_name, receiver),
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.scan_try_in_expr(fn_name, cond);
+                self.scan_try_sites(fn_name, then_block);
+                self.scan_try_sites(fn_name, else_block);
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.scan_try_in_expr(fn_name, scrutinee);
+                for arm in arms {
+                    self.scan_try_in_expr(fn_name, &arm.body);
+                }
+            }
+            ExprKind::Block(b) => self.scan_try_sites(fn_name, b),
+            ExprKind::StructLit { fields, .. } => {
+                for fi in fields {
+                    self.scan_try_in_expr(fn_name, &fi.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Intern a string into the data section if not already present.
+    fn intern_string(&mut self, s: &str) {
+        if self.string_offsets.contains_key(s) {
+            return;
+        }
+        let offset = self.heap_ptr;
+        self.string_offsets.insert(s.to_string(), offset);
+        let bytes = s.as_bytes();
+        let len = bytes.len() as u32;
+        let mut payload = Vec::with_capacity(4 + bytes.len());
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        self.data
+            .active(0, &ConstExpr::i32_const(offset as i32), payload);
+        self.heap_ptr += 4 + len;
+        while !self.heap_ptr.is_multiple_of(4) {
+            self.heap_ptr += 1;
+        }
+    }
+
     /// Walk the AST and assign a linear-memory offset to every distinct
     /// string literal. The data section payload is `[len: i32 little-endian
     /// | bytes...]` so `string_len(s)` can just `i32.load` at `offset=0`.
@@ -325,26 +456,7 @@ impl<'a> Codegen<'a> {
             }
         }
         for s in seen {
-            if self.string_offsets.contains_key(&s) {
-                continue;
-            }
-            let offset = self.heap_ptr;
-            self.string_offsets.insert(s.clone(), offset);
-
-            let bytes = s.as_bytes();
-            let len = bytes.len() as u32;
-            let mut payload: Vec<u8> = Vec::with_capacity(4 + bytes.len());
-            payload.extend_from_slice(&len.to_le_bytes());
-            payload.extend_from_slice(bytes);
-
-            self.data
-                .active(0, &ConstExpr::i32_const(offset as i32), payload);
-            self.heap_ptr += 4 + len;
-            // Keep the bump pointer i32-aligned so future allocations stay
-            // aligned for i32 loads/stores.
-            while !self.heap_ptr.is_multiple_of(4) {
-                self.heap_ptr += 1;
-            }
+            self.intern_string(&s);
         }
     }
 
@@ -577,6 +689,60 @@ impl<'a> Codegen<'a> {
         f
     }
 
+    /// Emit the body of `print_frames() -> i32`. Walks the global
+    /// frame_chain (global 1) and for each frame calls io_println on
+    /// the frame's message string.
+    fn emit_print_frames_helper(&self) -> Function {
+        let io_println_idx = self.io_println_idx.expect("WASI must be in use");
+        // Locals: 0 = current frame pointer
+        let mut f = Function::new_with_locals_types(vec![ValType::I32]);
+
+        // current = global.get 1 (frame_chain)
+        f.instruction(&Instruction::GlobalGet(1));
+        f.instruction(&Instruction::LocalSet(0));
+
+        // block $break
+        //   loop $continue
+        //     if current == 0: br $break
+        //     io_println(*(current + 0))  // message string pointer
+        //     current = *(current + 4)    // next pointer
+        //     br $continue
+        //   end
+        // end
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+        // Break if current == 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::BrIf(1));
+
+        // io_println(current.message)
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(I32_MEM_ARG)); // message ptr
+        f.instruction(&Instruction::Call(io_println_idx));
+        f.instruction(&Instruction::Drop); // discard unit return
+
+        // current = current.next
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        f.instruction(&Instruction::LocalSet(0));
+
+        f.instruction(&Instruction::Br(0)); // loop
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+
+        // Return unit.
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::End);
+
+        f
+    }
+
     fn finish(self) -> Vec<u8> {
         let mut module = Module::new();
         module.section(&self.types);
@@ -602,6 +768,7 @@ impl<'a> Codegen<'a> {
             .expect("type checker populated sig");
 
         let mut fb = FnBuilder::new(self, sig);
+        fb.current_fn_name = f.name.clone();
         // Parameters occupy slots [0, num_params).
         for (pname, pty) in &sig.params {
             fb.register_param(pname, pty.clone());
@@ -630,6 +797,17 @@ impl<'a> Codegen<'a> {
         // zero i32 so the function signature is satisfied.
         if matches!(sig.ret, Ty::Unit) {
             function.instruction(&Instruction::I32Const(0));
+        }
+
+        // If this is `main` and it returns a Result, call print_frames
+        // before returning. If no error was propagated, the chain is
+        // empty and nothing prints. If there was an error, each `?` site
+        // pushed a frame, and they'll all appear on stdout.
+        if f.name == "main" && matches!(sig.ret, Ty::Result(_, _)) {
+            if let Some(print_frames_idx) = self.print_frames_idx {
+                function.instruction(&Instruction::Call(print_frames_idx));
+                function.instruction(&Instruction::Drop);
+            }
         }
 
         function.instruction(&Instruction::End);
@@ -680,6 +858,9 @@ struct FnBuilder<'a, 'b> {
     /// Read during emit to avoid re-inferring in a scope where the
     /// bindings don't exist yet.
     expr_type_cache: HashMap<u32, Ty>,
+    /// Name of the function currently being compiled, used to format
+    /// error-frame messages.
+    current_fn_name: String,
 }
 
 impl<'a, 'b> FnBuilder<'a, 'b> {
@@ -694,6 +875,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             slot_for_span: HashMap::new(),
             aux_slots: HashMap::new(),
             expr_type_cache: HashMap::new(),
+            current_fn_name: String::new(),
         }
     }
 
@@ -860,10 +1042,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::Try(inner) => {
                 self.walk_expr(inner)?;
-                // `?` needs a scratch slot to stash the sum pointer while
-                // the tag is inspected.
+                // `?` needs a scratch slot for the sum pointer, plus
+                // a scratch for the frame allocation on the Err path.
                 let slot = self.alloc_scratch_i32();
                 self.slot_for_span.insert(expr.span.start, slot);
+                let frame_slot = self.alloc_scratch_i32();
+                self.aux_slots.insert(expr.span.start, vec![frame_slot]);
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk_expr(scrutinee)?;
@@ -2182,12 +2366,58 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         self.compile_expr(inner, f)?;
         f.instruction(&Instruction::LocalSet(scratch));
 
-        // if tag == err_tag { return inner; }
+        // if tag == err_tag { push error frame; return inner; }
         f.instruction(&Instruction::LocalGet(scratch));
         f.instruction(&Instruction::I32Load(I32_MEM_ARG));
         f.instruction(&Instruction::I32Const(err_tag as i32));
         f.instruction(&Instruction::I32Eq);
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+        // Push an error frame onto the global frame_chain (global 1).
+        let frame_msg = format!(
+            "  at {} (<source>:{}:{})",
+            self.current_fn_name, span.line, span.col
+        );
+        if let Some(&msg_offset) = self.cg.string_offsets.get(&frame_msg) {
+            let frame_slot = self.aux_slots.get(&span.start).unwrap()[0];
+
+            // Allocate 8-byte frame { message: i32, next: i32 }.
+            f.instruction(&Instruction::GlobalGet(0));
+            f.instruction(&Instruction::LocalSet(frame_slot));
+            f.instruction(&Instruction::GlobalGet(0));
+            f.instruction(&Instruction::I32Const(8));
+            f.instruction(&Instruction::I32Add);
+            f.instruction(&Instruction::GlobalSet(0));
+
+            // frame.message = msg_offset
+            f.instruction(&Instruction::LocalGet(frame_slot));
+            f.instruction(&Instruction::I32Const(msg_offset as i32));
+            f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+            // frame.next = current frame_chain head
+            f.instruction(&Instruction::LocalGet(frame_slot));
+            f.instruction(&Instruction::GlobalGet(1));
+            f.instruction(&Instruction::I32Store(MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            // frame_chain = &frame
+            f.instruction(&Instruction::LocalGet(frame_slot));
+            f.instruction(&Instruction::GlobalSet(1));
+        }
+
+        // If we're in main, print the accumulated frames before
+        // returning, because the `return` instruction below bypasses
+        // the epilogue at the end of compile_fn.
+        if self.current_fn_name == "main" {
+            if let Some(pf_idx) = self.cg.print_frames_idx {
+                f.instruction(&Instruction::Call(pf_idx));
+                f.instruction(&Instruction::Drop);
+            }
+        }
+
         f.instruction(&Instruction::LocalGet(scratch));
         f.instruction(&Instruction::Return);
         f.instruction(&Instruction::End);
@@ -3307,6 +3537,97 @@ mod tests {
         let output_bytes = stdout_pipe.try_into_inner().unwrap();
         let output = String::from_utf8(output_bytes.into()).unwrap();
         assert_eq!(output, "hello, world\n");
+    }
+
+    // --- Error frames -----------------------------------------------------
+
+    #[test]
+    fn run_error_frames_print_on_err() {
+        let src = r#"
+            import std/io
+
+            fn inner(): Result<i32, i32> {
+                Err(42)
+            }
+
+            fn middle(): Result<i32, i32> {
+                let x = inner()?
+                Ok(x)
+            }
+
+            fn main(): Result<i32, i32> {
+                let y = middle()?
+                Ok(y)
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("module must validate");
+
+        use wasmtime::*;
+        let engine = Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut linker = Linker::new(&engine);
+
+        let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(4096);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout_pipe.clone())
+            .build_p1();
+        let mut store = Store::new(&engine, wasi);
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s).unwrap();
+
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let f = instance.get_typed_func::<(), i32>(&mut store, "main").unwrap();
+        let _ret = f.call(&mut store, ()).unwrap();
+
+        drop(store);
+        let output_bytes = stdout_pipe.try_into_inner().unwrap();
+        let output = String::from_utf8(output_bytes.into()).unwrap();
+
+        // Should have two frames: one from middle's `?` and one from main's `?`.
+        assert!(
+            output.contains("at middle"),
+            "expected frame from middle, got: {output}"
+        );
+        assert!(
+            output.contains("at main"),
+            "expected frame from main, got: {output}"
+        );
+    }
+
+    #[test]
+    fn run_error_frames_empty_on_ok() {
+        // When everything succeeds, no frames should print.
+        let src = r#"
+            import std/io
+
+            fn inner(): Result<i32, i32> { Ok(1) }
+            fn main(): Result<i32, i32> {
+                let x = inner()?
+                Ok(x)
+            }
+        "#;
+        let wasm = compile_src(src);
+
+        use wasmtime::*;
+        let engine = Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut linker = Linker::new(&engine);
+
+        let stdout_pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(4096);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout_pipe.clone())
+            .build_p1();
+        let mut store = Store::new(&engine, wasi);
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s).unwrap();
+
+        let instance = linker.instantiate(&mut store, &module).unwrap();
+        let f = instance.get_typed_func::<(), i32>(&mut store, "main").unwrap();
+        f.call(&mut store, ()).unwrap();
+
+        drop(store);
+        let output_bytes = stdout_pipe.try_into_inner().unwrap();
+        let output = String::from_utf8(output_bytes.into()).unwrap();
+        assert!(output.is_empty(), "expected no output on Ok, got: {output}");
     }
 
     #[test]
