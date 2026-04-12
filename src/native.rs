@@ -392,11 +392,22 @@ impl<'a> NativeCodegen<'a> {
                 fb.name_types.insert(pname.clone(), pty.clone());
             }
 
+            // Save the bump pointer watermark so we can reclaim
+            // temporary allocations on return.
+            let watermark_var = fb.fresh_var(PTR);
+            let watermark = fb.load_bump_offset()?;
+            fb.builder.def_var(watermark_var, watermark);
+
             // Compile body.
             let result = fb.compile_block(&f.body)?;
 
+            // Deep-copy the return value into the watermark region and
+            // reclaim everything the function allocated.
+            let ret_ty = sig.ret.clone();
+            let final_val = fb.emit_reclaim(result, &ret_ty, watermark_var)?;
+
             // Return.
-            fb.builder.ins().return_(&[result]);
+            fb.builder.ins().return_(&[final_val]);
         } // fb dropped here, releasing the mutable borrow on builder
 
         builder.seal_all_blocks();
@@ -1125,7 +1136,34 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         // (sealed later)
         let counter = self.builder.use_var(counter_var);
         self.builder.def_var(binder_var, counter);
+
+        // Per-iteration watermark: save bump, execute body, deep-copy
+        // any outer pointer-typed variables that were assigned, reset bump.
+        let iter_wm_var = self.fresh_var(PTR);
+        let iter_wm = self.load_bump_offset()?;
+        self.builder.def_var(iter_wm_var, iter_wm);
+
+        // Collect outer variables with pointer types that get assigned
+        // inside the loop body.
+        let assigned_ptr_vars = self.find_assigned_ptr_vars(body);
+
         self.compile_block(body)?;
+
+        // Deep-copy assigned outer pointer vars so they survive the
+        // watermark reset.
+        for (var_name, var_ty) in &assigned_ptr_vars {
+            if let Some(&var) = self.names.get(var_name) {
+                let old_val = self.builder.use_var(var);
+                let new_val = self.emit_deep_copy(old_val, var_ty)?;
+                self.builder.def_var(var, new_val);
+            }
+        }
+
+        // Reset bump to the per-iteration watermark, reclaiming all
+        // temporary allocations from this iteration.
+        let wm = self.builder.use_var(iter_wm_var);
+        self.store_bump_offset(wm)?;
+
         let counter = self.builder.use_var(counter_var);
         let one = self.builder.ins().iconst(cl_types::I32, 1);
         let next = self.builder.ins().iadd(counter, one);
@@ -1137,6 +1175,25 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         // (sealed later)
 
         Ok(())
+    }
+
+    /// Scan a block's statements for `var = expr` assignments where the
+    /// target is a pointer-typed variable already in scope (i.e., an
+    /// outer variable). Returns (name, type) pairs.
+    fn find_assigned_ptr_vars(&self, block: &ast::Block) -> Vec<(String, Ty)> {
+        let mut result = Vec::new();
+        for stmt in &block.stmts {
+            if let StmtKind::Assign { name, .. } = &stmt.kind {
+                if let Some(ty) = self.name_types.get(name) {
+                    if !is_scalar(ty) {
+                        result.push((name.clone(), ty.clone()));
+                    }
+                }
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result.dedup_by(|a, b| a.0 == b.0);
+        result
     }
 
     fn compile_struct_lit(
@@ -1202,6 +1259,210 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
         let size_val = self.builder.ins().iconst(PTR, size);
         let new_off = self.builder.ins().iadd(old_off, size_val);
+        let seven = self.builder.ins().iconst(PTR, 7);
+        let new_off = self.builder.ins().iadd(new_off, seven);
+        let mask = self.builder.ins().iconst(PTR, -8i64);
+        let new_off = self.builder.ins().band(new_off, mask);
+        self.builder.ins().store(flags, new_off, bump_addr, 0);
+
+        Ok(result)
+    }
+
+    // --- GC: arena watermark + deep copy ----------------------------------
+
+    /// Load the current bump pointer offset (not absolute address).
+    fn load_bump_offset(&mut self) -> Result<Value, NativeError> {
+        let bump_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.bump_ptr_data, self.builder.func);
+        let bump_addr = self.builder.ins().global_value(PTR, bump_gv);
+        Ok(self.builder.ins().load(PTR, MemFlags::new(), bump_addr, 0))
+    }
+
+    /// Store a new bump pointer offset.
+    fn store_bump_offset(&mut self, val: Value) -> Result<(), NativeError> {
+        let bump_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.bump_ptr_data, self.builder.func);
+        let bump_addr = self.builder.ins().global_value(PTR, bump_gv);
+        self.builder.ins().store(MemFlags::new(), val, bump_addr, 0);
+        Ok(())
+    }
+
+    /// Reset bump to watermark, deep-copy the return value into the
+    /// reclaimed space so it survives, then return the new pointer.
+    fn emit_reclaim(
+        &mut self,
+        result: Value,
+        ret_ty: &Ty,
+        watermark_var: Variable,
+    ) -> Result<Value, NativeError> {
+        // Scalars don't live on the heap — just reset and return.
+        if is_scalar(ret_ty) {
+            let wm = self.builder.use_var(watermark_var);
+            self.store_bump_offset(wm)?;
+            return Ok(result);
+        }
+
+        // Pointer types: save the result, reset bump to watermark,
+        // then deep-copy the result into the fresh space.
+        let saved_result = self.fresh_var(PTR);
+        self.builder.def_var(saved_result, result);
+
+        let wm = self.builder.use_var(watermark_var);
+        self.store_bump_offset(wm)?;
+
+        // Deep copy the saved result into the (now-reclaimed) space.
+        let saved = self.builder.use_var(saved_result);
+        self.emit_deep_copy(saved, ret_ty)
+    }
+
+    /// Recursively deep-copy a heap value. Returns a new pointer
+    /// allocated via bump_alloc in the (reclaimed) parent arena.
+    fn emit_deep_copy(&mut self, src: Value, ty: &Ty) -> Result<Value, NativeError> {
+        match ty {
+            Ty::String => self.emit_string_copy(src),
+            Ty::User(name) => {
+                let fields = get_struct_fields(&self.cg.info.types, name);
+                if fields.is_empty() {
+                    // Might be a sum type — treat as opaque for now.
+                    self.emit_shallow_ptr_copy(src, 16)
+                } else {
+                    self.emit_struct_copy(src, &fields)
+                }
+            }
+            Ty::Option(_) | Ty::Result(_, _) => {
+                // Sum types: copy the 16-byte header + deep-copy payload.
+                self.emit_sum_copy(src, ty)
+            }
+            _ => Ok(src), // scalar fallthrough (shouldn't reach here)
+        }
+    }
+
+    fn emit_string_copy(&mut self, src: Value) -> Result<Value, NativeError> {
+        let flags = MemFlags::new();
+        // Read len from src.
+        let len_i32 = self.builder.ins().load(cl_types::I32, flags, src, 0);
+        let len = self.builder.ins().uextend(PTR, len_i32);
+        // Allocate 4 + len bytes.
+        let four = self.builder.ins().iconst(PTR, 4);
+        let total = self.builder.ins().iadd(len, four);
+        let dst = self.bump_alloc_dynamic(total)?;
+        // memcpy(dst, src, 4 + len)
+        let heap_gv = self.cg.obj.declare_data_in_func(self.cg.heap_data, self.builder.func);
+        let _ = heap_gv; // not needed here, bump_alloc_dynamic returns absolute
+        self.builder.call_memcpy(
+            self.cg.obj.target_config(),
+            dst,
+            src,
+            total,
+        );
+        Ok(dst)
+    }
+
+    fn emit_struct_copy(
+        &mut self,
+        src: Value,
+        fields: &[(String, Ty)],
+    ) -> Result<Value, NativeError> {
+        let size = struct_size(fields);
+        let dst = self.bump_alloc(size as i64)?;
+        let flags = MemFlags::new();
+        for (fname, fty) in fields {
+            let (offset, _) = field_offset(fields, fname);
+            if is_scalar(fty) {
+                let cl_ty = lumen_to_cl(fty);
+                let val = self.builder.ins().load(cl_ty, flags, src, offset);
+                self.builder.ins().store(flags, val, dst, offset);
+            } else {
+                // Pointer field: load, deep-copy, store new pointer.
+                let old_ptr = self.builder.ins().load(PTR, flags, src, offset);
+                let new_ptr = self.emit_deep_copy(old_ptr, fty)?;
+                self.builder.ins().store(flags, new_ptr, dst, offset);
+            }
+        }
+        Ok(dst)
+    }
+
+    fn emit_sum_copy(&mut self, src: Value, ty: &Ty) -> Result<Value, NativeError> {
+        let flags = MemFlags::new();
+        // Allocate 16 bytes for the new sum header.
+        let dst = self.bump_alloc(16)?;
+        // Copy tag.
+        let tag = self.builder.ins().load(cl_types::I32, flags, src, 0);
+        self.builder.ins().store(flags, tag, dst, 0);
+        // Load payload_ptr.
+        let payload = self.builder.ins().load(PTR, flags, src, 8);
+        // If payload is null, store null. Otherwise shallow-copy it.
+        // For a proper deep copy we'd need to know the variant's field
+        // types from the tag at runtime, which requires a dispatch.
+        // For the prototype: shallow-copy the payload block (works for
+        // single-field variants with scalar or string payloads).
+        let zero = self.builder.ins().iconst(PTR, 0);
+        let is_null = self.builder.ins().icmp(IntCC::Equal, payload, zero);
+
+        let copy_bb = self.builder.create_block();
+        let merge_bb = self.builder.create_block();
+        self.builder.append_block_param(merge_bb, PTR);
+        self.builder
+            .ins()
+            .brif(is_null, merge_bb, &[BlockArg::Value(zero)], copy_bb, &[]);
+
+        self.builder.switch_to_block(copy_bb);
+        // Determine payload size. For built-in Option/Result, the payload
+        // is a single value. For user sums, use the max variant size.
+        let payload_size = match ty {
+            Ty::Option(inner) | Ty::Result(inner, _) => native_sizeof(inner).max(8),
+            _ => 8, // conservative default
+        };
+        let new_payload = self.emit_shallow_ptr_copy(payload, payload_size as i64)?;
+        self.builder
+            .ins()
+            .jump(merge_bb, &[BlockArg::Value(new_payload)]);
+
+        self.builder.switch_to_block(merge_bb);
+        let final_payload = self.builder.block_params(merge_bb)[0];
+        self.builder.ins().store(flags, final_payload, dst, 8);
+        Ok(dst)
+    }
+
+    /// Copy `size` bytes from `src` to a new bump allocation.
+    fn emit_shallow_ptr_copy(
+        &mut self,
+        src: Value,
+        size: i64,
+    ) -> Result<Value, NativeError> {
+        let dst = self.bump_alloc(size)?;
+        let len = self.builder.ins().iconst(PTR, size);
+        self.builder.call_memcpy(
+            self.cg.obj.target_config(),
+            dst,
+            src,
+            len,
+        );
+        Ok(dst)
+    }
+
+    /// Bump-allocate a dynamic number of bytes (value known at runtime).
+    fn bump_alloc_dynamic(&mut self, size: Value) -> Result<Value, NativeError> {
+        let flags = MemFlags::new();
+        let bump_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.bump_ptr_data, self.builder.func);
+        let heap_gv = self
+            .cg
+            .obj
+            .declare_data_in_func(self.cg.heap_data, self.builder.func);
+
+        let bump_addr = self.builder.ins().global_value(PTR, bump_gv);
+        let old_off = self.builder.ins().load(PTR, flags, bump_addr, 0);
+        let heap_base = self.builder.ins().global_value(PTR, heap_gv);
+        let result = self.builder.ins().iadd(heap_base, old_off);
+
+        let new_off = self.builder.ins().iadd(old_off, size);
         let seven = self.builder.ins().iconst(PTR, 7);
         let new_off = self.builder.ins().iadd(new_off, seven);
         let mask = self.builder.ins().iconst(PTR, -8i64);
@@ -1678,6 +1939,13 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) => PTR,
         Ty::Error => cl_types::I32,
     }
+}
+
+fn is_scalar(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Bool | Ty::Unit
+    )
 }
 
 fn native_sizeof(ty: &Ty) -> i32 {
