@@ -50,9 +50,12 @@ pub enum Ty {
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
     List(Box<Ty>),
+    /// Raw byte buffer. Same memory layout as String but without the
+    /// UTF-8 assumption. Conversions are zero-cost.
+    Bytes,
     /// A user-declared struct or sum type by name.
     User(String),
-    /// An actor handle. `spawn Counter { ... }` returns `Handle<Counter>`.
+    /// An actor handle.
     Handle(Box<Ty>),
     /// Internal placeholder emitted after a type error. Any comparison
     /// against `Error` silently succeeds so one failure doesn't cascade
@@ -70,6 +73,7 @@ impl Ty {
             Ty::F64 => "f64".into(),
             Ty::Bool => "bool".into(),
             Ty::String => "string".into(),
+            Ty::Bytes => "bytes".into(),
             Ty::Unit => "unit".into(),
             Ty::Option(t) => format!("Option<{}>", t.display()),
             Ty::Result(o, e) => format!("Result<{}, {}>", o.display(), e.display()),
@@ -463,6 +467,7 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
             "f64" if args.is_empty() => Ok(Ty::F64),
             "bool" if args.is_empty() => Ok(Ty::Bool),
             "string" if args.is_empty() => Ok(Ty::String),
+            "bytes" if args.is_empty() => Ok(Ty::Bytes),
             "unit" if args.is_empty() => Ok(Ty::Unit),
             "Option" if args.len() == 1 => {
                 Ok(Ty::Option(Box::new(resolve_type(&args[0], types)?)))
@@ -1282,6 +1287,74 @@ impl<'a> FnChecker<'a> {
                     self.check_expr(&args[0].value, &Ty::String);
                 }
                 Some(Ty::Unit)
+            }
+            ("bytes", "len") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`bytes.len` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::Bytes);
+                }
+                Some(Ty::I32)
+            }
+            ("bytes", "new") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`bytes.new` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::Bytes)
+            }
+            ("bytes", "get") => {
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`bytes.get` expects 2 arguments, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::Bytes);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("bytes", "concat") => {
+                if args.len() != 2 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`bytes.concat` expects 2 arguments, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::Bytes);
+                    self.check_expr(&args[1].value, &Ty::Bytes);
+                }
+                Some(Ty::Bytes)
+            }
+            ("bytes", "from_string") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`bytes.from_string` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::String);
+                }
+                Some(Ty::Bytes)
+            }
+            ("string", "from_bytes") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("`string.from_bytes` expects 1 argument, found {}", args.len()),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::Bytes);
+                }
+                Some(Ty::String)
             }
             _ => None,
         }

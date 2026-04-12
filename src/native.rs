@@ -1509,6 +1509,67 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let call = self.builder.ins().call(func_ref, &[n]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
+            if mod_name == "bytes" && method == "len" {
+                let b = self.compile_expr(&args[0].value)?;
+                let len = self.builder.ins().load(cl_types::I32, MemFlags::new(), b, 0);
+                return Ok(len);
+            }
+            if mod_name == "bytes" && method == "new" {
+                // rc_alloc(4 + size), store size as i32 at offset 0, memset to 0
+                let size_val = self.compile_expr(&args[0].value)?;
+                let size_ptr = self.builder.ins().uextend(PTR, size_val);
+                let four = self.builder.ins().iconst(PTR, 4);
+                let total = self.builder.ins().iadd(size_ptr, four);
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[total]);
+                let ptr = self.builder.inst_results(call)[0];
+                // Store length at offset 0
+                self.builder.ins().store(MemFlags::new(), size_val, ptr, 0);
+                // memset bytes to 0: use call_memset
+                let data_ptr = self.builder.ins().iadd_imm(ptr, 4);
+                let zero = self.builder.ins().iconst(cl_types::I8, 0);
+                self.builder.call_memset(
+                    self.cg.obj.target_config(),
+                    data_ptr,
+                    zero,
+                    size_ptr,
+                );
+                return Ok(ptr);
+            }
+            if mod_name == "bytes" && method == "get" {
+                // load u8 at b + 4 + i, zero-extend to i32
+                let b = self.compile_expr(&args[0].value)?;
+                let i = self.compile_expr(&args[1].value)?;
+                let i_ptr = self.builder.ins().sextend(PTR, i);
+                let base = self.builder.ins().iadd_imm(b, 4);
+                let addr = self.builder.ins().iadd(base, i_ptr);
+                let byte = self.builder.ins().load(cl_types::I8, MemFlags::new(), addr, 0);
+                let result = self.builder.ins().uextend(cl_types::I32, byte);
+                return Ok(result);
+            }
+            if mod_name == "bytes" && method == "concat" {
+                let a = self.compile_expr(&args[0].value)?;
+                let b = self.compile_expr(&args[1].value)?;
+                let func_ref = self
+                    .cg
+                    .obj
+                    .declare_func_in_func(self.cg.helper_concat, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[a, b]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "bytes" && method == "from_string" {
+                // Zero-cost: same layout
+                let s = self.compile_expr(&args[0].value)?;
+                return Ok(s);
+            }
+            if mod_name == "string" && method == "from_bytes" {
+                // Zero-cost: same layout
+                let b = self.compile_expr(&args[0].value)?;
+                return Ok(b);
+            }
         }
         Err(NativeError {
             span,
@@ -1813,8 +1874,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 // the tag, so we just release the payload's own refcount).
                 self.emit_rc_decr(payload);
             }
-            Ty::String => {
-                // Strings have no pointer children.
+            Ty::String | Ty::Bytes => {
+                // Strings/bytes have no pointer children.
             }
             _ => {}
         }
@@ -1907,7 +1968,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     /// allocated via bump_alloc in the (reclaimed) parent arena.
     fn emit_deep_copy(&mut self, src: Value, ty: &Ty) -> Result<Value, NativeError> {
         match ty {
-            Ty::String => self.emit_string_copy(src),
+            Ty::String | Ty::Bytes => self.emit_string_copy(src),
             Ty::User(name) => {
                 let fields = get_struct_fields(&self.cg.info.types, name);
                 if fields.is_empty() {
@@ -2566,6 +2627,24 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     if m == "io" && method == "println" {
                         return Ok(Ty::Unit);
                     }
+                    if m == "bytes" && method == "len" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "bytes" && method == "new" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if m == "bytes" && method == "get" {
+                        return Ok(Ty::I32);
+                    }
+                    if m == "bytes" && method == "concat" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if m == "bytes" && method == "from_string" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if m == "string" && method == "from_bytes" {
+                        return Ok(Ty::String);
+                    }
                 }
                 Ty::I32
             }
@@ -2642,7 +2721,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
-        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => PTR,
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => PTR,
         Ty::Error => cl_types::I32,
     }
 }
@@ -2658,7 +2737,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
     match ty {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
-        Ty::String | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => 8, // pointer
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => 8, // pointer
         Ty::Error => 4,
     }
 }
@@ -2715,7 +2794,7 @@ fn field_offset(fields: &[(String, Ty)], target: &str) -> (i32, Ty) {
     let mut offset = 0i32;
     for (name, ty) in fields {
         let align = match ty {
-            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::Bytes | Ty::User(_) => 8,
             _ => 4,
         };
         offset = (offset + align - 1) & !(align - 1);
@@ -2723,7 +2802,7 @@ fn field_offset(fields: &[(String, Ty)], target: &str) -> (i32, Ty) {
             return (offset, ty.clone());
         }
         let size = match ty {
-            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::Bytes | Ty::User(_) => 8,
             _ => 4,
         };
         offset += size;
@@ -2735,12 +2814,12 @@ fn struct_size(fields: &[(String, Ty)]) -> i32 {
     let mut offset = 0i32;
     for (_, ty) in fields {
         let align = match ty {
-            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::Bytes | Ty::User(_) => 8,
             _ => 4,
         };
         offset = (offset + align - 1) & !(align - 1);
         let size = match ty {
-            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::User(_) => 8,
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::String | Ty::Bytes | Ty::User(_) => 8,
             _ => 4,
         };
         offset += size;

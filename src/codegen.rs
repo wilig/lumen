@@ -1398,6 +1398,7 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 "f64" if args.is_empty() => Ty::F64,
                 "bool" if args.is_empty() => Ty::Bool,
                 "string" if args.is_empty() => Ty::String,
+                "bytes" if args.is_empty() => Ty::Bytes,
                 "unit" if args.is_empty() => Ty::Unit,
                 "Option" if args.len() == 1 => {
                     Ty::Option(Box::new(self.resolve_ast_type(&args[0])?))
@@ -1672,6 +1673,24 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     }
                     if mod_name == "io" && method == "println" {
                         return Ok(Ty::Unit);
+                    }
+                    if mod_name == "bytes" && method == "len" {
+                        return Ok(Ty::I32);
+                    }
+                    if mod_name == "bytes" && method == "new" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if mod_name == "bytes" && method == "get" {
+                        return Ok(Ty::I32);
+                    }
+                    if mod_name == "bytes" && method == "concat" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if mod_name == "bytes" && method == "from_string" {
+                        return Ok(Ty::Bytes);
+                    }
+                    if mod_name == "string" && method == "from_bytes" {
+                        return Ok(Ty::String);
                     }
                 }
                 return Err(CodegenError {
@@ -3163,6 +3182,7 @@ fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
         | Ty::Bool
         | Ty::Unit
         | Ty::String
+        | Ty::Bytes
         | Ty::User(_)
         | Ty::Option(_)
         | Ty::Result(_, _)
