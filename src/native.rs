@@ -717,15 +717,27 @@ impl<'a> NativeCodegen<'a> {
             // Build args: (state, arg0 truncated to the right type).
             let is_mutation = matches!(msg.ret, Ty::User(ref n) if n == actor_name);
             let mut call_args = vec![state];
-            if !msg.params.is_empty() {
-                // Truncate arg0 to the param type.
+            if msg.params.len() == 1 {
+                // Single arg: truncate arg0 to the param type.
                 let (_, pty) = &msg.params[0];
                 let arg = match lumen_to_cl(pty) {
                     cl_types::I32 => builder.ins().ireduce(cl_types::I32, arg0),
                     cl_types::F64 => builder.ins().bitcast(cl_types::F64, flags, arg0),
-                    _ => arg0, // PTR = i64, same
+                    _ => arg0,
                 };
                 call_args.push(arg);
+            } else if msg.params.len() > 1 {
+                // Multi-arg: arg0 is a pointer to a packed struct.
+                // Load each field from the blob.
+                for (pname, pty) in &msg.params {
+                    let (offset, _) = field_offset(
+                        &msg.params.iter().map(|(n, t)| (n.clone(), t.clone())).collect::<Vec<_>>(),
+                        pname,
+                    );
+                    let cl_ty = lumen_to_cl(pty);
+                    let val = builder.ins().load(cl_ty, flags, arg0, offset);
+                    call_args.push(val);
+                }
             }
             let call = builder.ins().call(handler_ref, &call_args);
             let result = builder.inst_results(call)[0];
@@ -2460,17 +2472,35 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let msg_kind = msgs.iter().position(|m| m.name == method).unwrap_or(0) as i64;
         let kind_val = self.builder.ins().iconst(cl_types::I32, msg_kind);
 
-        // Encode arg0 as i64.
-        let arg0 = if let Some(a) = args.first() {
-            let v = self.compile_expr(&a.value)?;
-            let ty = self.infer_ty(&a.value)?;
+        // Encode args into arg0 (i64). For 0 args: 0. For 1 arg: the
+        // value directly. For 2+ args: pack into a malloc'd struct and
+        // pass the pointer.
+        let msg_sig = msgs.iter().find(|m| m.name == method);
+        let arg0 = if args.is_empty() {
+            self.builder.ins().iconst(cl_types::I64, 0)
+        } else if args.len() == 1 {
+            let v = self.compile_expr(&args[0].value)?;
+            let ty = self.infer_ty(&args[0].value)?;
             match lumen_to_cl(&ty) {
                 cl_types::I32 => self.builder.ins().sextend(cl_types::I64, v),
                 cl_types::F64 => self.builder.ins().bitcast(cl_types::I64, MemFlags::new(), v),
-                _ => v, // PTR is already i64
+                _ => v,
             }
         } else {
-            self.builder.ins().iconst(cl_types::I64, 0)
+            // Multi-arg: allocate a struct, store each arg, pass ptr.
+            let param_types: Vec<(String, Ty)> = msg_sig
+                .map(|m| m.params.clone())
+                .unwrap_or_default();
+            let total = struct_size(&param_types);
+            let blob = self.rc_alloc(total as i64)?;
+            for (i, arg) in args.iter().enumerate() {
+                let v = self.compile_expr(&arg.value)?;
+                if let Some((pname, _)) = param_types.get(i) {
+                    let (offset, _) = field_offset(&param_types, pname);
+                    self.builder.ins().store(MemFlags::new(), v, blob, offset);
+                }
+            }
+            blob // ptr is i64, used as arg0
         };
 
         // Get the dispatch function pointer.
