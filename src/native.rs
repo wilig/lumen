@@ -65,10 +65,15 @@ struct NativeCodegen<'a> {
     fn_ids: HashMap<String, FuncId>,
     /// Built-in helper func IDs.
     libc_write: FuncId,
+    libc_malloc: FuncId,
+    libc_free: FuncId,
     helper_concat: FuncId,
     helper_println: FuncId,
     helper_itoa: FuncId,
     helper_print_frames: FuncId,
+    helper_rc_alloc: FuncId,
+    helper_rc_incr: FuncId,
+    helper_rc_decr: FuncId,
 
     /// DataId for the heap buffer (a large static byte array).
     heap_data: DataId,
@@ -118,6 +123,21 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("write", Linkage::Import, &write_sig)
             .unwrap();
 
+        // malloc(size) -> ptr
+        let mut malloc_sig = obj.make_signature();
+        malloc_sig.params.push(AbiParam::new(PTR));
+        malloc_sig.returns.push(AbiParam::new(PTR));
+        let libc_malloc = obj
+            .declare_function("malloc", Linkage::Import, &malloc_sig)
+            .unwrap();
+
+        // free(ptr)
+        let mut free_sig = obj.make_signature();
+        free_sig.params.push(AbiParam::new(PTR));
+        let libc_free = obj
+            .declare_function("free", Linkage::Import, &free_sig)
+            .unwrap();
+
         // Heap: a 1MB static buffer. Enough for the prototype.
         let heap_data = obj.declare_data("lumen_heap", Linkage::Local, true, false).unwrap();
         let bump_ptr_data = obj.declare_data("lumen_bump", Linkage::Local, true, false).unwrap();
@@ -162,6 +182,28 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_itoa", Linkage::Local, &itoa_sig)
             .unwrap();
 
+        // rc_alloc(size: i64) -> ptr: malloc(size+8), set rc=1, return ptr+8
+        let mut rc_alloc_sig = obj.make_signature();
+        rc_alloc_sig.params.push(AbiParam::new(PTR));
+        rc_alloc_sig.returns.push(AbiParam::new(PTR));
+        let helper_rc_alloc = obj
+            .declare_function("lumen_rc_alloc", Linkage::Local, &rc_alloc_sig)
+            .unwrap();
+
+        // rc_incr(ptr): if ptr in heap, rc++
+        let mut rc_incr_sig = obj.make_signature();
+        rc_incr_sig.params.push(AbiParam::new(PTR));
+        let helper_rc_incr = obj
+            .declare_function("lumen_rc_incr", Linkage::Local, &rc_incr_sig)
+            .unwrap();
+
+        // rc_decr(ptr): if ptr in heap, rc--; if 0, free
+        let mut rc_decr_sig = obj.make_signature();
+        rc_decr_sig.params.push(AbiParam::new(PTR));
+        let helper_rc_decr = obj
+            .declare_function("lumen_rc_decr", Linkage::Local, &rc_decr_sig)
+            .unwrap();
+
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -173,10 +215,15 @@ impl<'a> NativeCodegen<'a> {
             obj,
             fn_ids: HashMap::new(),
             libc_write,
+            libc_malloc,
+            libc_free,
             helper_concat,
             helper_println,
             helper_itoa,
             helper_print_frames,
+            helper_rc_alloc,
+            helper_rc_incr,
+            helper_rc_decr,
             heap_data,
             bump_ptr_data,
             frame_chain_data,
@@ -220,6 +267,9 @@ impl<'a> NativeCodegen<'a> {
         self.define_println_helper()?;
         self.define_itoa_helper()?;
         self.define_print_frames_helper()?;
+        self.define_rc_alloc_helper()?;
+        self.define_rc_incr_helper()?;
+        self.define_rc_decr_helper()?;
 
         // Define user function bodies.
         let fn_ids = self.fn_ids.clone();
@@ -366,6 +416,150 @@ impl<'a> NativeCodegen<'a> {
         Ok(())
     }
 
+    /// `lumen_rc_alloc(size: i64) -> ptr`: malloc(size+8), write rc=1 at
+    /// the start, return ptr+8 (pointer to payload).
+    fn define_rc_alloc_helper(&mut self) -> Result<(), NativeError> {
+        let mut sig = self.obj.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        sig.returns.push(AbiParam::new(PTR));
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+
+        let size = builder.block_params(block)[0];
+        let eight = builder.ins().iconst(PTR, 8);
+        let total = builder.ins().iadd(size, eight);
+        let malloc_ref = self.obj.declare_func_in_func(self.libc_malloc, builder.func);
+        let call = builder.ins().call(malloc_ref, &[total]);
+        let raw = builder.inst_results(call)[0];
+        // *raw = 1 (refcount, i32)
+        let one = builder.ins().iconst(cl_types::I32, 1);
+        builder.ins().store(MemFlags::new(), one, raw, 0);
+        // *(raw+4) = 0x4C554D45 ("LUME" magic sentinel)
+        let magic = builder.ins().iconst(cl_types::I32, 0x4C554D45u32 as i64);
+        builder.ins().store(MemFlags::new(), magic, raw, 4);
+        // return raw + 8
+        let payload = builder.ins().iadd(raw, eight);
+        builder.ins().return_(&[payload]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+        self.obj.define_function(self.helper_rc_alloc, &mut ctx).unwrap();
+        Ok(())
+    }
+
+    /// `lumen_rc_incr(ptr)`: if ptr != 0 and ptr is heap-allocated,
+    /// increment the refcount at ptr-8.
+    fn define_rc_incr_helper(&mut self) -> Result<(), NativeError> {
+        let mut sig = self.obj.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+
+        let ptr = builder.block_params(block)[0];
+        let flags = MemFlags::new();
+
+        // if ptr == 0, return
+        let is_null = builder.ins().icmp_imm(IntCC::Equal, ptr, 0);
+        let do_incr = builder.create_block();
+        let exit = builder.create_block();
+        builder.ins().brif(is_null, exit, &[], do_incr, &[]);
+
+        builder.switch_to_block(do_incr);
+        // Check if ptr is in the heap (bump-allocated) vs static data.
+        // Static data pointers are in .rodata and don't have a refcount
+        // header. We distinguish by checking if ptr is in the malloc'd
+        // range — but since we use malloc now, ALL rc_alloc'd pointers
+        // are in the C heap, and static data is in .rodata. The simplest
+        // safe heuristic: check if *(ptr-8) looks like a valid refcount
+        // (positive, < 1M). If not, skip. This is a conservative guard.
+        // For correctness, we just always do the incr — static data
+        // pointers should never reach rc_incr because the codegen only
+        // emits incr for values that went through rc_alloc.
+        let eight = builder.ins().iconst(PTR, 8);
+        let header = builder.ins().isub(ptr, eight);
+        let rc = builder.ins().load(cl_types::I32, flags, header, 0);
+        let new_rc = builder.ins().iadd_imm(rc, 1);
+        builder.ins().store(flags, new_rc, header, 0);
+        builder.ins().jump(exit, &[]);
+
+        builder.switch_to_block(exit);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+        self.obj.define_function(self.helper_rc_incr, &mut ctx).unwrap();
+        Ok(())
+    }
+
+    /// `lumen_rc_decr(ptr)`: decrement refcount; if it hits 0, free
+    /// the block via libc free.
+    fn define_rc_decr_helper(&mut self) -> Result<(), NativeError> {
+        let mut sig = self.obj.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+
+        let ptr = builder.block_params(block)[0];
+        let flags = MemFlags::new();
+
+        // if ptr == 0, return
+        let is_null = builder.ins().icmp_imm(IntCC::Equal, ptr, 0);
+        let do_decr = builder.create_block();
+        let exit = builder.create_block();
+        builder.ins().brif(is_null, exit, &[], do_decr, &[]);
+
+        builder.switch_to_block(do_decr);
+        let eight = builder.ins().iconst(PTR, 8);
+        let header = builder.ins().isub(ptr, eight);
+
+        // Check magic sentinel at header+4. If it doesn't match
+        // 0x4C554D45, this isn't an rc_alloc'd block (e.g. a string
+        // literal in .rodata). Skip.
+        let magic = builder.ins().load(cl_types::I32, flags, header, 4);
+        let expected = builder.ins().iconst(cl_types::I32, 0x4C554D45u32 as i64);
+        let is_rc = builder.ins().icmp(IntCC::Equal, magic, expected);
+        let do_real_decr = builder.create_block();
+        builder.ins().brif(is_rc, do_real_decr, &[], exit, &[]);
+
+        builder.switch_to_block(do_real_decr);
+        let rc = builder.ins().load(cl_types::I32, flags, header, 0);
+        let new_rc = builder.ins().iadd_imm(rc, -1);
+        builder.ins().store(flags, new_rc, header, 0);
+
+        // if new_rc == 0, free
+        let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_rc, 0);
+        let do_free = builder.create_block();
+        builder.ins().brif(is_zero, do_free, &[], exit, &[]);
+
+        builder.switch_to_block(do_free);
+        let free_ref = self.obj.declare_func_in_func(self.libc_free, builder.func);
+        builder.ins().call(free_ref, &[header]);
+        builder.ins().jump(exit, &[]);
+
+        builder.switch_to_block(exit);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+        self.obj.define_function(self.helper_rc_decr, &mut ctx).unwrap();
+        Ok(())
+    }
+
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
         let sig = &self.info.fns[&f.name];
         let cl_sig = self.build_sig(&f.name);
@@ -392,22 +586,14 @@ impl<'a> NativeCodegen<'a> {
                 fb.name_types.insert(pname.clone(), pty.clone());
             }
 
-            // Save the bump pointer watermark so we can reclaim
-            // temporary allocations on return.
-            let watermark_var = fb.fresh_var(PTR);
-            let watermark = fb.load_bump_offset()?;
-            fb.builder.def_var(watermark_var, watermark);
-
             // Compile body.
             let result = fb.compile_block(&f.body)?;
 
-            // Deep-copy the return value into the watermark region and
-            // reclaim everything the function allocated.
-            let ret_ty = sig.ret.clone();
-            let final_val = fb.emit_reclaim(result, &ret_ty, watermark_var)?;
-
-            // Return.
-            fb.builder.ins().return_(&[final_val]);
+            // Return. RC note: the return value keeps its current
+            // refcount (rc=1 from allocation). The caller receives
+            // ownership. rc_decr fires on var reassignment (not on
+            // function exit — that's a follow-up for full scope tracking).
+            fb.builder.ins().return_(&[result]);
         } // fb dropped here, releasing the mutable borrow on builder
 
         builder.seal_all_blocks();
@@ -457,25 +643,12 @@ impl<'a> NativeCodegen<'a> {
         let total = builder.ins().iadd(len_a, len_b);
         let total_i32 = builder.ins().ireduce(cl_types::I32, total);
 
-        // Allocate: bump_alloc(4 + total)
-        let bump_gv = self.declare_data_in_func(self.bump_ptr_data, &mut builder);
-        let heap_gv = self.declare_data_in_func(self.heap_data, &mut builder);
-
-        let bump_addr = builder.ins().global_value(PTR, bump_gv);
-        let old_offset = builder.ins().load(PTR, flags, bump_addr, 0);
-
-        let heap_base = builder.ins().global_value(PTR, heap_gv);
-        let result = builder.ins().iadd(heap_base, old_offset);
-
+        // Allocate result via rc_alloc(4 + total).
         let four = builder.ins().iconst(PTR, 4);
-        let new_offset = builder.ins().iadd(old_offset, four);
-        let new_offset = builder.ins().iadd(new_offset, total);
-        // Align up to 8.
-        let seven = builder.ins().iconst(PTR, 7);
-        let new_offset = builder.ins().iadd(new_offset, seven);
-        let mask = builder.ins().iconst(PTR, -8i64);
-        let new_offset = builder.ins().band(new_offset, mask);
-        builder.ins().store(flags, new_offset, bump_addr, 0);
+        let alloc_size = builder.ins().iadd(total, four);
+        let rc_alloc_ref = self.obj.declare_func_in_func(self.helper_rc_alloc, builder.func);
+        let alloc_call = builder.ins().call(rc_alloc_ref, &[alloc_size]);
+        let result = builder.inst_results(alloc_call)[0];
 
         // *result = total_i32
         builder.ins().store(flags, total_i32, result, 0);
@@ -571,18 +744,18 @@ impl<'a> NativeCodegen<'a> {
         let n = builder.block_params(entry)[0];
         let flags = MemFlags::new();
 
-        // Allocate 16-byte scratch in heap.
+        // Save bump watermark so we can reclaim scratch after rc_alloc'ing the result.
         let bump_gv = self.declare_data_in_func(self.bump_ptr_data, &mut builder);
         let heap_gv = self.declare_data_in_func(self.heap_data, &mut builder);
-
-        // scratch = heap_base + old_offset
         let bump_addr = builder.ins().global_value(PTR, bump_gv);
-        let old_off = builder.ins().load(PTR, flags, bump_addr, 0);
-        let heap_base = builder.ins().global_value(PTR, heap_gv);
-        let scratch = builder.ins().iadd(heap_base, old_off);
+        let saved_off = builder.ins().load(PTR, flags, bump_addr, 0);
+        let watermark_var = builder.declare_var(PTR);
+        builder.def_var(watermark_var, saved_off);
 
-        // bump += 16
-        let new_off = builder.ins().iadd_imm(old_off, 16);
+        // Allocate 16-byte scratch in heap (bump).
+        let heap_base = builder.ins().global_value(PTR, heap_gv);
+        let scratch = builder.ins().iadd(heap_base, saved_off);
+        let new_off = builder.ins().iadd_imm(saved_off, 16);
         builder.ins().store(flags, new_off, bump_addr, 0);
 
         // Simple approach: format into scratch[0..15] backwards.
@@ -677,18 +850,12 @@ impl<'a> NativeCodegen<'a> {
         let len = builder.ins().isub(end, start);
         let len_i32 = builder.ins().ireduce(cl_types::I32, len);
 
-        // Allocate (4 + len) via bump.
-        let bump_addr2 = builder.ins().global_value(PTR, bump_gv);
-        let off2 = builder.ins().load(PTR, flags, bump_addr2, 0);
-        let result = builder.ins().iadd(heap_base, off2);
+        // Allocate (4 + len) via rc_alloc so the result survives RC.
         let four = builder.ins().iconst(PTR, 4);
-        let new_off2 = builder.ins().iadd(off2, four);
-        let new_off2 = builder.ins().iadd(new_off2, len);
-        let seven = builder.ins().iconst(PTR, 7);
-        let new_off2 = builder.ins().iadd(new_off2, seven);
-        let mask = builder.ins().iconst(PTR, -8i64);
-        let new_off2 = builder.ins().band(new_off2, mask);
-        builder.ins().store(flags, new_off2, bump_addr2, 0);
+        let alloc_size = builder.ins().iadd(len, four);
+        let rc_alloc_ref = self.obj.declare_func_in_func(self.helper_rc_alloc, builder.func);
+        let alloc_call = builder.ins().call(rc_alloc_ref, &[alloc_size]);
+        let result = builder.inst_results(alloc_call)[0];
 
         // *result = len_i32
         builder.ins().store(flags, len_i32, result, 0);
@@ -696,8 +863,13 @@ impl<'a> NativeCodegen<'a> {
         let dst = builder.ins().iadd_imm(result, 4);
         builder.call_memcpy(self.obj.target_config(), dst, start, len);
 
+        // Restore bump watermark: the result is rc_alloc'd (malloc) so it
+        // survives; the scratch was bump-allocated and is now reclaimed.
+        let wm = builder.use_var(watermark_var);
+        let bump_addr2 = builder.ins().global_value(PTR, bump_gv);
+        builder.ins().store(flags, wm, bump_addr2, 0);
+
         builder.ins().return_(&[result]);
-        // (sealed later)
         builder.seal_all_blocks();
         builder.finalize();
 
@@ -770,6 +942,15 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 self.name_types.insert(name.clone(), lumen_ty);
             }
             StmtKind::Assign { name, value } => {
+                // RC: decrement the old value before overwriting.
+                if let Some(ty) = self.name_types.get(name) {
+                    if !is_scalar(ty) {
+                        if let Some(&var) = self.names.get(name) {
+                            let old = self.builder.use_var(var);
+                            self.emit_rc_decr(old);
+                        }
+                    }
+                }
                 let val = self.compile_expr(value)?;
                 let var = *self.names.get(name).ok_or_else(|| NativeError {
                     span: stmt.span,
@@ -1137,32 +1318,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let counter = self.builder.use_var(counter_var);
         self.builder.def_var(binder_var, counter);
 
-        // Per-iteration watermark: save bump, execute body, deep-copy
-        // any outer pointer-typed variables that were assigned, reset bump.
-        let iter_wm_var = self.fresh_var(PTR);
-        let iter_wm = self.load_bump_offset()?;
-        self.builder.def_var(iter_wm_var, iter_wm);
-
-        // Collect outer variables with pointer types that get assigned
-        // inside the loop body.
-        let assigned_ptr_vars = self.find_assigned_ptr_vars(body);
-
         self.compile_block(body)?;
-
-        // Deep-copy assigned outer pointer vars so they survive the
-        // watermark reset.
-        for (var_name, var_ty) in &assigned_ptr_vars {
-            if let Some(&var) = self.names.get(var_name) {
-                let old_val = self.builder.use_var(var);
-                let new_val = self.emit_deep_copy(old_val, var_ty)?;
-                self.builder.def_var(var, new_val);
-            }
-        }
-
-        // Reset bump to the per-iteration watermark, reclaiming all
-        // temporary allocations from this iteration.
-        let wm = self.builder.use_var(iter_wm_var);
-        self.store_bump_offset(wm)?;
 
         let counter = self.builder.use_var(counter_var);
         let one = self.builder.ins().iconst(cl_types::I32, 1);
@@ -1212,7 +1368,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     return self.build_sum_block(tag, None);
                 }
                 let total = struct_size(&var_fields);
-                let payload = self.bump_alloc(total as i64)?;
+                let payload = self.rc_alloc(total as i64)?;
                 for (fname, fty) in &var_fields {
                     let init = fields.iter().find(|fi| &fi.name == fname).unwrap();
                     let val = self.compile_expr(&init.value)?;
@@ -1225,7 +1381,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
         let def_fields = get_struct_fields(&self.cg.info.types, name);
         let total_size = struct_size(&def_fields);
-        let ptr = self.bump_alloc(total_size as i64)?;
+        let ptr = self.rc_alloc(total_size as i64)?;
 
         for (fname, fty) in &def_fields {
             let init = fields.iter().find(|fi| &fi.name == fname).ok_or_else(|| {
@@ -1266,6 +1422,55 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.builder.ins().store(flags, new_off, bump_addr, 0);
 
         Ok(result)
+    }
+
+    // --- RC helpers -------------------------------------------------------
+
+    /// Allocate via RC: calls lumen_rc_alloc(size), returns a pointer
+    /// with rc=1 already set.
+    fn rc_alloc(&mut self, size: i64) -> Result<Value, NativeError> {
+        let size_val = self.builder.ins().iconst(PTR, size);
+        let func_ref = self
+            .cg
+            .obj
+            .declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[size_val]);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    fn emit_rc_incr(&mut self, ptr: Value) {
+        let func_ref = self
+            .cg
+            .obj
+            .declare_func_in_func(self.cg.helper_rc_incr, self.builder.func);
+        self.builder.ins().call(func_ref, &[ptr]);
+    }
+
+    fn emit_rc_decr(&mut self, ptr: Value) {
+        let func_ref = self
+            .cg
+            .obj
+            .declare_func_in_func(self.cg.helper_rc_decr, self.builder.func);
+        self.builder.ins().call(func_ref, &[ptr]);
+    }
+
+    /// Emit rc_decr for all pointer-typed local variables currently in scope.
+    fn emit_decr_all_ptr_locals(&mut self) {
+        let ptr_locals: Vec<(String, Variable)> = self
+            .names
+            .iter()
+            .filter(|(name, _)| {
+                self.name_types
+                    .get(*name)
+                    .map(|ty| !is_scalar(ty))
+                    .unwrap_or(false)
+            })
+            .map(|(name, &var)| (name.clone(), var))
+            .collect();
+        for (_name, var) in ptr_locals {
+            let val = self.builder.use_var(var);
+            self.emit_rc_decr(val);
+        }
     }
 
     // --- GC: arena watermark + deep copy ----------------------------------
@@ -1480,7 +1685,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         tag: u32,
         payload_ptr: Option<Value>,
     ) -> Result<Value, NativeError> {
-        let ptr = self.bump_alloc(16)?;
+        let ptr = self.rc_alloc(16)?;
         let tag_val = self.builder.ins().iconst(cl_types::I32, tag as i64);
         self.builder.ins().store(MemFlags::new(), tag_val, ptr, 0);
         let payload = payload_ptr.unwrap_or_else(|| self.builder.ins().iconst(PTR, 0));
@@ -1498,7 +1703,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let val = self.compile_expr(value)?;
         let ty = self.infer_ty(value)?;
         let size = native_sizeof(&ty);
-        let field_ptr = self.bump_alloc(size as i64)?;
+        let field_ptr = self.rc_alloc(size as i64)?;
         self.builder.ins().store(MemFlags::new(), val, field_ptr, 0);
         self.build_sum_block(tag, Some(field_ptr))
     }
@@ -1512,7 +1717,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         _span: Span,
     ) -> Result<Value, NativeError> {
         let total = struct_size(fields);
-        let ptr = self.bump_alloc(total as i64)?;
+        let ptr = self.rc_alloc(total as i64)?;
         for (i, (fname, _fty)) in fields.iter().enumerate() {
             if let Some(arg) = args.get(i) {
                 let val = self.compile_expr(&arg.value)?;

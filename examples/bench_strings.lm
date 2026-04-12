@@ -1,0 +1,19 @@
+// Benchmark: heavy string allocation inside a loop.
+// Each iteration builds a string via concat, which the GC reclaims.
+// Measures the cost of deep-copy + watermark reset per iteration.
+
+import std/io
+
+fn format_num(i: i32): string {
+    "value=" + int.to_string_i32(i)
+}
+
+fn main(): i32 io {
+    var total: i32 = 0
+    for i in range(0, 1000000) {
+        let s = format_num(i)
+        total = total + string_len(s)
+    }
+    io.println("total length: " + int.to_string_i32(total))
+    0
+}

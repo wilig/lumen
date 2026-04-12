@@ -1,0 +1,1 @@
+- [Project direction](project_direction.md) — Lumen is now a general-purpose language, not short-lived scripts

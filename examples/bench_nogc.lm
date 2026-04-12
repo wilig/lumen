@@ -1,0 +1,12 @@
+// Benchmark: pure computation, no heap allocation.
+// The GC watermark save/restore fires on every function call but
+// there's nothing to copy. Measures the overhead of the watermark
+// bookkeeping itself.
+
+fn fib(n: i32): i32 {
+    if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn main(): i32 {
+    fib(40)
+}
