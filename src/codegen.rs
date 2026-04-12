@@ -108,10 +108,10 @@ struct Codegen<'a> {
     /// Function index of the auto-emitted `io_println` helper, if WASI
     /// is in use.
     io_println_idx: Option<u32>,
-    /// Function index of the auto-emitted `print_frames` helper. Present
-    /// whenever WASI is in use so that error frame chains can be printed
-    /// from main's Err epilogue.
+    /// Function index of the auto-emitted `print_frames` helper.
     print_frames_idx: Option<u32>,
+    /// Function index of the auto-emitted `int_to_string_i32` helper.
+    int_to_string_idx: u32,
     types: TypeSection,
     imports: ImportSection,
     functions: FunctionSection,
@@ -159,6 +159,7 @@ impl<'a> Codegen<'a> {
             num_imports: 0,
             io_println_idx: None,
             print_frames_idx: None,
+            int_to_string_idx: 0, // set during compile_module
             types: TypeSection::new(),
             imports: ImportSection::new(),
             functions: FunctionSection::new(),
@@ -261,8 +262,20 @@ impl<'a> Codegen<'a> {
             }
         }
 
+        // int_to_string_i32: (i32) -> i32 (string pointer). Always emitted.
+        let base_helpers: u32 = if self.uses_wasi { 3 } else { 1 };
+        self.types
+            .ty()
+            .function(vec![ValType::I32], vec![ValType::I32]);
+        self.int_to_string_idx = self.num_imports + base_helpers;
+        self.functions.function(type_idx);
+        #[allow(unused_assignments)]
+        {
+            type_idx += 1;
+        }
+
         // Pass C: assign a function + type index to every user `fn` item.
-        let helpers = if self.uses_wasi { 3 } else { 1 };
+        let helpers = base_helpers + 1;
         let mut next_index = self.num_imports + helpers;
         for item in &module.items {
             if let Item::Fn(f) = item {
@@ -327,6 +340,7 @@ impl<'a> Codegen<'a> {
             self.code.function(&self.emit_io_println_helper());
             self.code.function(&self.emit_print_frames_helper());
         }
+        self.code.function(&self.emit_int_to_string_helper());
 
         // Pass F: emit each user function body.
         for item in &module.items {
@@ -684,6 +698,161 @@ impl<'a> Codegen<'a> {
 
         // Return unit (0).
         f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::End);
+
+        f
+    }
+
+    /// Emit the body of `int_to_string_i32(n: i32) -> i32` (string ptr).
+    /// Converts an i32 to its decimal string representation in linear memory.
+    fn emit_int_to_string_helper(&self) -> Function {
+        // Locals: 0=n (param), 1=scratch, 2=pos, 3=is_neg, 4=abs_val, 5=len, 6=result
+        let mut f = Function::new_with_locals_types(vec![
+            ValType::I32, // scratch
+            ValType::I32, // pos
+            ValType::I32, // is_neg
+            ValType::I32, // abs_val
+            ValType::I32, // len
+            ValType::I32, // result
+        ]);
+
+        let store8 = MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        };
+
+        // scratch = bump_alloc(16)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(1));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(16));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // pos = scratch + 15
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(15));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalSet(2));
+
+        // is_neg = n < 0
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32LtS);
+        f.instruction(&Instruction::LocalSet(3));
+
+        // abs_val = is_neg ? (0 - n) : n
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(ValType::I32)));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::Else);
+        f.instruction(&Instruction::LocalGet(0));
+        f.instruction(&Instruction::End);
+        f.instruction(&Instruction::LocalSet(4));
+
+        // if abs_val == 0: write '0'
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(48)); // '0'
+        f.instruction(&Instruction::I32Store8(store8));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::Else);
+
+        // while abs_val > 0: extract digits
+        f.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::BrIf(1));
+
+        // *(pos) = abs_val % 10 + '0'
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(10));
+        f.instruction(&Instruction::I32RemS);
+        f.instruction(&Instruction::I32Const(48));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Store8(store8));
+
+        // pos--
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(2));
+
+        // abs_val /= 10
+        f.instruction(&Instruction::LocalGet(4));
+        f.instruction(&Instruction::I32Const(10));
+        f.instruction(&Instruction::I32DivS);
+        f.instruction(&Instruction::LocalSet(4));
+
+        f.instruction(&Instruction::Br(0));
+        f.instruction(&Instruction::End); // end loop
+        f.instruction(&Instruction::End); // end block
+        f.instruction(&Instruction::End); // end else
+
+        // if is_neg: write '-'
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(45)); // '-'
+        f.instruction(&Instruction::I32Store8(store8));
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(2));
+        f.instruction(&Instruction::End);
+
+        // len = scratch + 15 - pos
+        f.instruction(&Instruction::LocalGet(1));
+        f.instruction(&Instruction::I32Const(15));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Sub);
+        f.instruction(&Instruction::LocalSet(5));
+
+        // result = bump_alloc(4 + len)
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(6));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(3));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Const(-4));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // store len at result+0
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // memory.copy(result+4, pos+1, len)
+        f.instruction(&Instruction::LocalGet(6));
+        f.instruction(&Instruction::I32Const(4));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(2));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::LocalGet(5));
+        f.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // return result
+        f.instruction(&Instruction::LocalGet(6));
         f.instruction(&Instruction::End);
 
         f
@@ -1448,6 +1617,9 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::MethodCall { receiver, method, .. } => {
                 if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if mod_name == "int" && method == "to_string_i32" {
+                        return Ok(Ty::String);
+                    }
                     if mod_name == "io" && method == "println" {
                         return Ok(Ty::Unit);
                     }
@@ -1745,8 +1917,15 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 method,
                 args,
             } => {
-                // Module-qualified stdlib calls, e.g. `io.println(s)`.
+                // Module-qualified stdlib calls.
                 if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if mod_name == "int" && method == "to_string_i32" {
+                        if let Some(arg) = args.first() {
+                            self.compile_expr(&arg.value, f)?;
+                        }
+                        f.instruction(&Instruction::Call(self.cg.int_to_string_idx));
+                        return Ok(());
+                    }
                     if mod_name == "io" && method == "println" {
                         let idx = self.cg.io_println_idx.ok_or_else(|| CodegenError {
                             span: expr.span,
@@ -3537,6 +3716,42 @@ mod tests {
         let output_bytes = stdout_pipe.try_into_inner().unwrap();
         let output = String::from_utf8(output_bytes.into()).unwrap();
         assert_eq!(output, "hello, world\n");
+    }
+
+    // --- Stdlib: int.to_string_i32 -----------------------------------------
+
+    #[test]
+    fn run_int_to_string_positive() {
+        let src = r#"
+            import std/io
+            fn main(): i32 {
+                io.println(int.to_string_i32(42))
+                io.println(int.to_string_i32(0))
+                io.println(int.to_string_i32(-7))
+                io.println(int.to_string_i32(12345))
+                0
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("validate");
+
+        use wasmtime::*;
+        let engine = Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut linker = Linker::new(&engine);
+        let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(4096);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout.clone())
+            .build_p1();
+        let mut store = Store::new(&engine, wasi);
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s).unwrap();
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let f = inst.get_typed_func::<(), i32>(&mut store, "main").unwrap();
+        f.call(&mut store, ()).unwrap();
+        drop(store);
+
+        let out = String::from_utf8(stdout.try_into_inner().unwrap().into()).unwrap();
+        assert_eq!(out, "42\n0\n-7\n12345\n");
     }
 
     // --- Error frames -----------------------------------------------------

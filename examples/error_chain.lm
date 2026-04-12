@@ -1,0 +1,21 @@
+import std/io
+
+fn divide(a: i32, b: i32): Result<i32, string> {
+    if b == 0 {
+        Err("division by zero")
+    } else {
+        Ok(a / b)
+    }
+}
+
+fn compute(): Result<i32, string> {
+    let x = divide(100, 5)?
+    let y = divide(x, 0)?
+    Ok(x + y)
+}
+
+fn main(): Result<i32, string> {
+    let result = compute()?
+    io.println("result = " + int.to_string_i32(result))
+    Ok(0)
+}

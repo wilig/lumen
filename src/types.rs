@@ -1046,6 +1046,20 @@ impl<'a> FnChecker<'a> {
         span: Span,
     ) -> Option<Ty> {
         match (module, method) {
+            ("int", "to_string_i32") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "`int.to_string_i32` expects 1 argument, found {}",
+                            args.len()
+                        ),
+                    });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::String)
+            }
             ("io", "println") => {
                 if args.len() != 1 {
                     self.errors.push(TypeError {

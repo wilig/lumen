@@ -16,11 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 wasm-encoder = "0.246"
+wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = "43"
 
 [dev-dependencies]
 wasmparser = "0.246"
-wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
-wasmtime-wasi = "43"
 
 [profile.dev]
 opt-level = 0
