@@ -387,12 +387,36 @@ impl<'a> Codegen<'a> {
         match &expr.kind {
             ExprKind::Try(inner) => {
                 self.scan_try_in_expr(fn_name, inner);
-                // Intern the frame message for this `?` site.
+                // Intern the frame message (used as fallback for fns with
+                // no params) and the fragments needed for runtime arg
+                // capture.
                 let msg = format!(
                     "  at {} (<source>:{}:{})",
                     fn_name, expr.span.line, expr.span.col
                 );
                 self.intern_string(&msg);
+                // Fragments for runtime arg-capture message building.
+                let prefix = format!(
+                    "  at {}(",
+                    fn_name
+                );
+                let suffix = format!(
+                    ") (<source>:{}:{})",
+                    expr.span.line, expr.span.col
+                );
+                self.intern_string(&prefix);
+                self.intern_string(&suffix);
+                self.intern_string(", ");
+                self.intern_string("=");
+                self.intern_string("true");
+                self.intern_string("false");
+                // Intern each param name for the function. We look up the
+                // function's params from info.fns.
+                if let Some(sig) = self.info.fns.get(fn_name) {
+                    for (pname, _) in &sig.params {
+                        self.intern_string(pname);
+                    }
+                }
             }
             ExprKind::Paren(e) => self.scan_try_in_expr(fn_name, e),
             ExprKind::Unary { rhs, .. } => self.scan_try_in_expr(fn_name, rhs),
@@ -1211,12 +1235,16 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::Try(inner) => {
                 self.walk_expr(inner)?;
-                // `?` needs a scratch slot for the sum pointer, plus
-                // a scratch for the frame allocation on the Err path.
+                // `?` needs: primary slot for the sum pointer, plus
+                // aux[0] for the frame block pointer and aux[1] for
+                // the message string pointer (used during runtime
+                // arg-capture message building).
                 let slot = self.alloc_scratch_i32();
                 self.slot_for_span.insert(expr.span.start, slot);
                 let frame_slot = self.alloc_scratch_i32();
-                self.aux_slots.insert(expr.span.start, vec![frame_slot]);
+                let msg_slot = self.alloc_scratch_i32();
+                self.aux_slots
+                    .insert(expr.span.start, vec![frame_slot, msg_slot]);
             }
             ExprKind::Match { scrutinee, arms } => {
                 self.walk_expr(scrutinee)?;
@@ -2553,39 +2581,122 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
         f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
 
         // Push an error frame onto the global frame_chain (global 1).
-        let frame_msg = format!(
-            "  at {} (<source>:{}:{})",
-            self.current_fn_name, span.line, span.col
-        );
-        if let Some(&msg_offset) = self.cg.string_offsets.get(&frame_msg) {
-            let frame_slot = self.aux_slots.get(&span.start).unwrap()[0];
+        // If the function has parameters, build the message at runtime
+        // with argument values captured from locals. Otherwise use the
+        // compile-time-interned static message.
+        let frame_slot = self.aux_slots.get(&span.start).unwrap()[0];
+        let has_params = !self.sig.params.is_empty();
+        let concat_idx = self.cg.num_imports; // string_concat fn index
 
-            // Allocate 8-byte frame { message: i32, next: i32 }.
-            f.instruction(&Instruction::GlobalGet(0));
-            f.instruction(&Instruction::LocalSet(frame_slot));
-            f.instruction(&Instruction::GlobalGet(0));
-            f.instruction(&Instruction::I32Const(8));
-            f.instruction(&Instruction::I32Add);
-            f.instruction(&Instruction::GlobalSet(0));
+        if has_params {
+            // Build: "  at fn_name(p1=v1, p2=v2) (<source>:L:C)"
+            let prefix = format!("  at {}(", self.current_fn_name);
+            let suffix = format!(") (<source>:{}:{})", span.line, span.col);
+            let prefix_offset = *self.cg.string_offsets.get(&prefix).unwrap();
+            let suffix_offset = *self.cg.string_offsets.get(&suffix).unwrap();
+            let comma_offset = *self.cg.string_offsets.get(", ").unwrap();
+            let eq_offset = *self.cg.string_offsets.get("=").unwrap();
 
-            // frame.message = msg_offset
-            f.instruction(&Instruction::LocalGet(frame_slot));
+            // Start with the prefix on the stack.
+            f.instruction(&Instruction::I32Const(prefix_offset as i32));
+
+            let params: Vec<(String, Ty)> = self.sig.params.clone();
+            for (i, (pname, pty)) in params.iter().enumerate() {
+                // If not the first param, concat ", "
+                if i > 0 {
+                    f.instruction(&Instruction::I32Const(comma_offset as i32));
+                    f.instruction(&Instruction::Call(concat_idx));
+                }
+                // Concat "param_name"
+                let name_offset = *self.cg.string_offsets.get(pname).unwrap();
+                f.instruction(&Instruction::I32Const(name_offset as i32));
+                f.instruction(&Instruction::Call(concat_idx));
+                // Concat "="
+                f.instruction(&Instruction::I32Const(eq_offset as i32));
+                f.instruction(&Instruction::Call(concat_idx));
+                // Concat the value
+                let param_slot = i as u32;
+                match pty {
+                    Ty::I32 | Ty::U32 => {
+                        f.instruction(&Instruction::LocalGet(param_slot));
+                        f.instruction(&Instruction::Call(self.cg.int_to_string_idx));
+                        f.instruction(&Instruction::Call(concat_idx));
+                    }
+                    Ty::Bool => {
+                        let true_offset = *self.cg.string_offsets.get("true").unwrap();
+                        let false_offset = *self.cg.string_offsets.get("false").unwrap();
+                        f.instruction(&Instruction::LocalGet(param_slot));
+                        f.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                            ValType::I32,
+                        )));
+                        f.instruction(&Instruction::I32Const(true_offset as i32));
+                        f.instruction(&Instruction::Else);
+                        f.instruction(&Instruction::I32Const(false_offset as i32));
+                        f.instruction(&Instruction::End);
+                        f.instruction(&Instruction::Call(concat_idx));
+                    }
+                    Ty::String => {
+                        // String params are already string pointers.
+                        f.instruction(&Instruction::LocalGet(param_slot));
+                        f.instruction(&Instruction::Call(concat_idx));
+                    }
+                    _ => {
+                        // For unsupported types, just concat the type name.
+                        let type_name = format!("<{}>", pty.display());
+                        // This may not be interned; use prefix as fallback.
+                        if let Some(&offset) = self.cg.string_offsets.get(&type_name) {
+                            f.instruction(&Instruction::I32Const(offset as i32));
+                        } else {
+                            f.instruction(&Instruction::I32Const(prefix_offset as i32));
+                        }
+                        f.instruction(&Instruction::Call(concat_idx));
+                    }
+                }
+            }
+            // Concat the suffix.
+            f.instruction(&Instruction::I32Const(suffix_offset as i32));
+            f.instruction(&Instruction::Call(concat_idx));
+            // Stack now has the runtime message string pointer.
+        } else {
+            // No params — use the static message.
+            let frame_msg = format!(
+                "  at {} (<source>:{}:{})",
+                self.current_fn_name, span.line, span.col
+            );
+            let msg_offset = *self.cg.string_offsets.get(&frame_msg).unwrap();
             f.instruction(&Instruction::I32Const(msg_offset as i32));
-            f.instruction(&Instruction::I32Store(I32_MEM_ARG));
-
-            // frame.next = current frame_chain head
-            f.instruction(&Instruction::LocalGet(frame_slot));
-            f.instruction(&Instruction::GlobalGet(1));
-            f.instruction(&Instruction::I32Store(MemArg {
-                offset: 4,
-                align: 2,
-                memory_index: 0,
-            }));
-
-            // frame_chain = &frame
-            f.instruction(&Instruction::LocalGet(frame_slot));
-            f.instruction(&Instruction::GlobalSet(1));
         }
+
+        // Stack has: [message_ptr]. Stash it in msg_slot, allocate the
+        // frame, then write both fields.
+        let msg_slot = self.aux_slots.get(&span.start).unwrap()[1];
+        f.instruction(&Instruction::LocalSet(msg_slot));
+
+        // Allocate 8-byte frame { message: i32, next: i32 }.
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::LocalSet(frame_slot));
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::I32Const(8));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::GlobalSet(0));
+
+        // frame.message = msg_slot
+        f.instruction(&Instruction::LocalGet(frame_slot));
+        f.instruction(&Instruction::LocalGet(msg_slot));
+        f.instruction(&Instruction::I32Store(I32_MEM_ARG));
+
+        // frame.next = current frame_chain head
+        f.instruction(&Instruction::LocalGet(frame_slot));
+        f.instruction(&Instruction::GlobalGet(1));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // frame_chain = &frame
+        f.instruction(&Instruction::LocalGet(frame_slot));
+        f.instruction(&Instruction::GlobalSet(1));
 
         // If we're in main, print the accumulated frames before
         // returning, because the `return` instruction below bypasses
@@ -3807,6 +3918,53 @@ mod tests {
             output.contains("at main"),
             "expected frame from main, got: {output}"
         );
+    }
+
+    #[test]
+    fn run_error_frames_with_arg_capture() {
+        let src = r#"
+            import std/io
+
+            fn divide(a: i32, b: i32): Result<i32, string> {
+                if b == 0 { Err("division by zero") } else { Ok(a / b) }
+            }
+
+            fn compute(x: i32): Result<i32, string> {
+                let r = divide(x, 0)?
+                Ok(r)
+            }
+
+            fn main(): Result<i32, string> io {
+                let v = compute(42)?
+                Ok(v)
+            }
+        "#;
+        let wasm = compile_src(src);
+        wasmparser::validate(&wasm).expect("validate");
+
+        use wasmtime::*;
+        let engine = Engine::default();
+        let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+        let mut linker = Linker::new(&engine);
+        let stdout = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(4096);
+        let wasi = wasmtime_wasi::WasiCtxBuilder::new()
+            .stdout(stdout.clone())
+            .build_p1();
+        let mut store = Store::new(&engine, wasi);
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| s).unwrap();
+        let inst = linker.instantiate(&mut store, &module).unwrap();
+        let f = inst.get_typed_func::<(), i32>(&mut store, "main").unwrap();
+        let _ = f.call(&mut store, ());
+        drop(store);
+
+        let out = String::from_utf8(stdout.try_into_inner().unwrap().into()).unwrap();
+        // compute's frame should include `x=42`
+        assert!(
+            out.contains("x=42"),
+            "expected arg capture x=42, got: {out}"
+        );
+        // main has no params, so no arg values
+        assert!(out.contains("at main"), "expected main frame, got: {out}");
     }
 
     #[test]
