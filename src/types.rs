@@ -274,6 +274,41 @@ pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
         }
     }
 
+    // Pass 3b: collect extern fn signatures (auto-marked io).
+    for item in &module.items {
+        if let Item::ExternFn(ef) = item {
+            if info.fns.contains_key(&ef.name) {
+                errors.push(TypeError {
+                    span: ef.name_span,
+                    message: format!("duplicate function `{}`", ef.name),
+                });
+                continue;
+            }
+            let mut params = Vec::new();
+            for p in &ef.params {
+                match resolve_type(&p.ty, &info.types) {
+                    Ok(t) => params.push((p.name.clone(), t)),
+                    Err(e) => errors.push(e),
+                }
+            }
+            let ret = match resolve_type(&ef.return_type, &info.types) {
+                Ok(t) => t,
+                Err(e) => {
+                    errors.push(e);
+                    Ty::Error
+                }
+            };
+            info.fns.insert(
+                ef.name.clone(),
+                FnSig {
+                    params,
+                    ret,
+                    effect: Effect::Io,
+                },
+            );
+        }
+    }
+
     // Pass 4: check each fn body.
     for item in &module.items {
         if let Item::Fn(f) = item {

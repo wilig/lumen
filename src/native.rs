@@ -203,6 +203,18 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
+        // Declare extern fns as imported symbols.
+        for item in &module.items {
+            if let Item::ExternFn(ef) = item {
+                let sig = self.build_sig(&ef.name);
+                let id = self
+                    .obj
+                    .declare_function(&ef.name, Linkage::Import, &sig)
+                    .unwrap();
+                self.fn_ids.insert(ef.name.clone(), id);
+            }
+        }
+
         // Define helper bodies.
         self.define_concat_helper()?;
         self.define_println_helper()?;
@@ -377,6 +389,7 @@ impl<'a> NativeCodegen<'a> {
                 let val = fb.builder.block_params(entry)[i];
                 fb.builder.def_var(var, val);
                 fb.names.insert(pname.clone(), var);
+                fb.name_types.insert(pname.clone(), pty.clone());
             }
 
             // Compile body.
@@ -700,6 +713,7 @@ struct FnEmitter<'a, 'b, 'c> {
     sig: &'a crate::types::FnSig,
     fn_name: String,
     names: HashMap<String, Variable>,
+    name_types: HashMap<String, Ty>,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -715,6 +729,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             sig,
             fn_name: fn_name.to_string(),
             names: HashMap::new(),
+            name_types: HashMap::new(),
         }
     }
 
@@ -735,11 +750,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     fn compile_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), NativeError> {
         match &stmt.kind {
             StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
+                let lumen_ty = self.infer_ty(value)?;
                 let val = self.compile_expr(value)?;
-                let ty = lumen_to_cl(&self.infer_ty(value)?);
-                let var = self.fresh_var(ty);
+                let cl_ty = lumen_to_cl(&lumen_ty);
+                let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
                 self.names.insert(name.clone(), var);
+                self.name_types.insert(name.clone(), lumen_ty);
             }
             StmtKind::Assign { name, value } => {
                 let val = self.compile_expr(value)?;
@@ -1543,11 +1560,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ExprKind::UnitLit => Ty::Unit,
             ExprKind::StringLit(_) => Ty::String,
             ExprKind::Ident(name) => {
-                // Look up in sig params.
-                for (pname, pty) in &self.sig.params {
-                    if pname == name {
-                        return Ok(pty.clone());
-                    }
+                if let Some(ty) = self.name_types.get(name) {
+                    return Ok(ty.clone());
                 }
                 Ty::I32 // fallback
             }

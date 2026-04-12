@@ -173,11 +173,43 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::Fn => self.parse_fn_decl().map(Item::Fn),
             TokenKind::Type => self.parse_type_decl().map(Item::Type),
+            TokenKind::Extern => self.parse_extern_fn_decl().map(Item::ExternFn),
             other => Err(self.error_here(format!(
-                "expected `fn` or `type` at top level, found {}",
+                "expected `fn`, `type`, or `extern` at top level, found {}",
                 describe_token(other)
             ))),
         }
+    }
+
+    fn parse_extern_fn_decl(&mut self) -> Result<ExternFnDecl, ParseError> {
+        let start = self.peek().span;
+        self.expect(&TokenKind::Extern, "`extern`")?;
+        self.expect(&TokenKind::Fn, "`fn` after `extern`")?;
+        let (name, name_span) = self.expect_ident("extern function name")?;
+
+        self.expect(&TokenKind::LParen, "`(` after function name")?;
+        let mut params = Vec::new();
+        if !matches!(self.peek_kind(), TokenKind::RParen) {
+            loop {
+                params.push(self.parse_param()?);
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen, "`)` to close parameter list")?;
+
+        self.expect(&TokenKind::Colon, "`:` before return type")?;
+        let return_type = self.parse_type()?;
+        let end = return_type.span;
+
+        Ok(ExternFnDecl {
+            name,
+            name_span,
+            params,
+            return_type,
+            span: merge(start, end),
+        })
     }
 
     // --- Function declarations --------------------------------------------
@@ -1113,6 +1145,7 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::For => "`for`".into(),
         TokenKind::In => "`in`".into(),
         TokenKind::Return => "`return`".into(),
+        TokenKind::Extern => "`extern`".into(),
         TokenKind::As => "`as`".into(),
         TokenKind::True => "`true`".into(),
         TokenKind::False => "`false`".into(),

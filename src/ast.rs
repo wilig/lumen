@@ -28,6 +28,18 @@ pub struct Import {
 pub enum Item {
     Fn(FnDecl),
     Type(TypeDecl),
+    ExternFn(ExternFnDecl),
+}
+
+/// `extern fn malloc(size: i64): i64`
+/// Declares an external C-ABI function resolved by the linker.
+#[derive(Debug, Clone)]
+pub struct ExternFnDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub return_type: Type,
+    pub span: Span,
 }
 
 // ---------------------------------------------------------------------------
