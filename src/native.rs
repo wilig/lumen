@@ -68,6 +68,7 @@ struct NativeCodegen<'a> {
     helper_concat: FuncId,
     helper_println: FuncId,
     helper_itoa: FuncId,
+    helper_print_frames: FuncId,
 
     /// DataId for the heap buffer (a large static byte array).
     heap_data: DataId,
@@ -161,6 +162,12 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_itoa", Linkage::Local, &itoa_sig)
             .unwrap();
 
+        // print_frames: () -> void. Walks the frame_chain and prints each.
+        let print_frames_sig = obj.make_signature();
+        let helper_print_frames = obj
+            .declare_function("lumen_print_frames", Linkage::Local, &print_frames_sig)
+            .unwrap();
+
         Ok(Self {
             info,
             obj,
@@ -169,6 +176,7 @@ impl<'a> NativeCodegen<'a> {
             helper_concat,
             helper_println,
             helper_itoa,
+            helper_print_frames,
             heap_data,
             bump_ptr_data,
             frame_chain_data,
@@ -199,6 +207,7 @@ impl<'a> NativeCodegen<'a> {
         self.define_concat_helper()?;
         self.define_println_helper()?;
         self.define_itoa_helper()?;
+        self.define_print_frames_helper()?;
 
         // Define user function bodies.
         let fn_ids = self.fn_ids.clone();
@@ -285,6 +294,65 @@ impl<'a> NativeCodegen<'a> {
     }
 
     // --- Function definition --------------------------------------------
+
+    /// Emit `lumen_print_frames()`: walk the frame_chain linked list
+    /// and call lumen_println on each frame's message string.
+    /// Frame layout (64-bit): { message: ptr @+0, next: ptr @+8 } = 16 bytes.
+    fn define_print_frames_helper(&mut self) -> Result<(), NativeError> {
+        let sig = self.obj.make_signature(); // () -> void
+        let mut ctx = self.obj.make_context();
+        ctx.func.signature = sig;
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+
+        let flags = MemFlags::new();
+        let chain_gv = self.obj.declare_data_in_func(self.frame_chain_data, builder.func);
+        let chain_addr = builder.ins().global_value(PTR, chain_gv);
+        let current_init = builder.ins().load(PTR, flags, chain_addr, 0);
+
+        let cur_var = builder.declare_var(PTR);
+        builder.def_var(cur_var, current_init);
+
+        let header_bb = builder.create_block();
+        let body_bb = builder.create_block();
+        let exit_bb = builder.create_block();
+
+        builder.ins().jump(header_bb, &[]);
+
+        // Header: if current == 0, exit.
+        builder.switch_to_block(header_bb);
+        let cur = builder.use_var(cur_var);
+        let zero = builder.ins().iconst(PTR, 0);
+        let done = builder.ins().icmp(IntCC::Equal, cur, zero);
+        builder.ins().brif(done, exit_bb, &[], body_bb, &[]);
+
+        // Body: println(current.message), current = current.next.
+        builder.switch_to_block(body_bb);
+        let cur = builder.use_var(cur_var);
+        let msg = builder.ins().load(PTR, flags, cur, 0); // message @+0
+        let println_ref = self.obj.declare_func_in_func(self.helper_println, builder.func);
+        builder.ins().call(println_ref, &[msg]);
+
+        let cur = builder.use_var(cur_var);
+        let next = builder.ins().load(PTR, flags, cur, 8); // next @+8
+        builder.def_var(cur_var, next);
+        builder.ins().jump(header_bb, &[]);
+
+        // Exit.
+        builder.switch_to_block(exit_bb);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+
+        self.obj
+            .define_function(self.helper_print_frames, &mut ctx)
+            .unwrap();
+        Ok(())
+    }
 
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
         let sig = &self.info.fns[&f.name];
@@ -1358,8 +1426,39 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let ok_bb = self.builder.create_block();
         self.builder.ins().brif(is_err, err_bb, &[], ok_bb, &[]);
 
-        // Err path: return the sum pointer directly.
+        // Err path: push an error frame, optionally print, return.
         self.builder.switch_to_block(err_bb);
+
+        // Allocate 16-byte frame { message: ptr @+0, next: ptr @+8 }.
+        let frame_msg = format!(
+            "  at {} (<source>:{}:{})",
+            self.fn_name, _span.line, _span.col
+        );
+        if let Some(&msg_data_id) = self.cg.string_data.get(&frame_msg) {
+            let frame_ptr = self.bump_alloc(16)?;
+            // frame.message = interned string
+            let msg_gv = self.cg.obj.declare_data_in_func(msg_data_id, self.builder.func);
+            let msg_val = self.builder.ins().global_value(PTR, msg_gv);
+            self.builder.ins().store(MemFlags::new(), msg_val, frame_ptr, 0);
+            // frame.next = current frame_chain head
+            let chain_gv = self.cg.obj.declare_data_in_func(
+                self.cg.frame_chain_data, self.builder.func,
+            );
+            let chain_addr = self.builder.ins().global_value(PTR, chain_gv);
+            let old_head = self.builder.ins().load(PTR, MemFlags::new(), chain_addr, 0);
+            self.builder.ins().store(MemFlags::new(), old_head, frame_ptr, 8);
+            // frame_chain = &frame
+            self.builder.ins().store(MemFlags::new(), frame_ptr, chain_addr, 0);
+        }
+
+        // If we're in main, print all accumulated frames before returning.
+        if self.fn_name == "main" {
+            let pf_ref = self.cg.obj.declare_func_in_func(
+                self.cg.helper_print_frames, self.builder.func,
+            );
+            self.builder.ins().call(pf_ref, &[]);
+        }
+
         let err_ptr = self.builder.use_var(scrut_var);
         self.builder.ins().return_(&[err_ptr]);
 
