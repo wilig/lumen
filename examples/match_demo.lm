@@ -5,7 +5,7 @@ type Shape =
     | Rectangle { width: i32, height: i32 }
 
 fn approx_area(s: Shape): i32 {
-    match s {
+    return match s {
         Circle { radius: r } => 3 * r * r,
         Rectangle { width: w, height: h } => w * h,
     }
@@ -17,5 +17,5 @@ fn main(): i32 io {
 
     io.println("circle area ~ " + int.to_string_i32(approx_area(c)))
     io.println("rect area   = " + int.to_string_i32(approx_area(r)))
-    0
+    return 0
 }

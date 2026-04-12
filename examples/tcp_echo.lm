@@ -9,5 +9,5 @@ fn main(): i32 io {
     net.tcp_write(client, data)
     net.tcp_close(client)
     net.tcp_close(server)
-    0
+    return 0
 }

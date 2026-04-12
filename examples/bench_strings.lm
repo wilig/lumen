@@ -5,7 +5,7 @@
 import std/io
 
 fn format_num(i: i32): string {
-    "value=" + int.to_string_i32(i)
+    return "value=" + int.to_string_i32(i)
 }
 
 fn main(): i32 io {
@@ -15,5 +15,5 @@ fn main(): i32 io {
         total = total + string_len(s)
     }
     io.println("total length: " + int.to_string_i32(total))
-    0
+    return 0
 }

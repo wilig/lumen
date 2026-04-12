@@ -7,11 +7,11 @@ actor Counter {
 }
 
 msg Counter.increment(self, n: i32): Counter {
-    Counter { count: self.count + n }
+    return Counter { count: self.count + n }
 }
 
 msg Counter.get(self): i32 {
-    self.count
+    return self.count
 }
 
 fn main(): i32 io {
@@ -20,5 +20,5 @@ fn main(): i32 io {
     send c.increment(3)
     let result = ask c.get()
     io.println("counter = " + int.to_string_i32(result))
-    0
+    return 0
 }

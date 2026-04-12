@@ -9,11 +9,11 @@ actor Counter {
 }
 
 msg Counter.add(self, n: i32): Counter {
-    Counter { count: self.count + n }
+    return Counter { count: self.count + n }
 }
 
 msg Counter.value(self): i32 {
-    self.count
+    return self.count
 }
 
 fn main(): i32 io {
@@ -32,5 +32,5 @@ fn main(): i32 io {
 
     io.println("a = " + int.to_string_i32(va))
     io.println("b = " + int.to_string_i32(vb))
-    0
+    return 0
 }

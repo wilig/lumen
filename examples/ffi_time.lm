@@ -8,5 +8,5 @@ extern fn time(tloc: i64): i64
 fn main(): i32 io {
     let secs = time(0i64)
     io.println("seconds since epoch: " + int.to_string_i32(secs as i32))
-    0
+    return 0
 }

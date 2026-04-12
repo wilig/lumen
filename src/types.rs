@@ -585,14 +585,22 @@ impl<'a> FnChecker<'a> {
         }
         let ret = self.sig.ret.clone();
         let body_ty = self.check_block(&f.body, Some(&ret));
-        if !compatible(&body_ty, &ret) {
+        let ends_with_return = f
+            .body
+            .stmts
+            .last()
+            .is_some_and(|s| matches!(s.kind, StmtKind::Return(_)));
+        // Non-unit functions MUST use explicit `return`. Tail expressions
+        // are reserved for sub-blocks (if/match/closures), not function
+        // bodies. This eliminates the tuple-on-new-line ambiguity and
+        // gives AI agents one clear rule.
+        if !matches!(ret, Ty::Unit | Ty::Error) && !ends_with_return {
             self.errors.push(TypeError {
                 span: f.body.span,
                 message: format!(
-                    "function `{}` returns {} but body produces {}",
+                    "function `{}` returns {} — use `return expr` (explicit return required for non-unit functions)",
                     f.name,
-                    ret.display(),
-                    body_ty.display()
+                    ret.display()
                 ),
             });
         }

@@ -5,7 +5,7 @@
 import std/io
 
 fn format_line(i: i32): string {
-    "iteration " + int.to_string_i32(i) + " of 100000"
+    return "iteration " + int.to_string_i32(i) + " of 100000"
 }
 
 fn main(): i32 io {
@@ -14,5 +14,5 @@ fn main(): i32 io {
         last = format_line(i)
     }
     io.println(last)
-    0
+    return 0
 }

@@ -8,7 +8,7 @@ fn handle_request(raw: bytes): bytes {
     let path = http.parse_path(raw)
     let method = http.parse_method(raw)
 
-    if string_len(path) == 1 {
+    return if string_len(path) == 1 {
         http.format_response(200, "Welcome to Lumen! Try /hello or /count")
     } else {
         http.format_response(200, method + " " + path)
@@ -28,5 +28,5 @@ fn main(): i32 io {
     }
 
     net.tcp_close(server)
-    0
+    return 0
 }
