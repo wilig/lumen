@@ -1334,6 +1334,45 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let val = self.compile_expr(e)?;
                 self.builder.ins().return_(&[val]);
             }
+            StmtKind::LetTuple { names, value } => {
+                let ptr = self.compile_expr(value)?;
+                let val_ty = self.infer_ty(value)?;
+                let elems = match val_ty {
+                    Ty::Tuple(ref e) => e.clone(),
+                    _ => {
+                        return Err(NativeError {
+                            span: stmt.span,
+                            message: "let tuple destructuring requires a tuple value".into(),
+                        });
+                    }
+                };
+                if names.len() != elems.len() {
+                    return Err(NativeError {
+                        span: stmt.span,
+                        message: format!(
+                            "tuple destructuring expects {} names, found {}",
+                            elems.len(),
+                            names.len()
+                        ),
+                    });
+                }
+                let fields = tuple_as_fields(&elems);
+                for (i, name) in names.iter().enumerate() {
+                    let field_name = format!("_{i}");
+                    let (offset, fty) = field_offset(&fields, &field_name);
+                    let cl_ty = lumen_to_cl(&fty);
+                    let val = self.builder.ins().load(cl_ty, MemFlags::new(), ptr, offset);
+                    let var = self.fresh_var(cl_ty);
+                    self.builder.def_var(var, val);
+                    self.names.insert(name.clone(), var);
+                    self.name_types.insert(name.clone(), fty.clone());
+                    if !is_scalar(&fty) {
+                        if let Some(list) = self.cleanup_stack.last_mut() {
+                            list.push((name.clone(), var, fty));
+                        }
+                    }
+                }
+            }
             StmtKind::Return(None) => {
                 let zero = self.builder.ins().iconst(cl_types::I32, 0);
                 self.builder.ins().return_(&[zero]);
@@ -1448,6 +1487,38 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ExprKind::Ask {
                 handle, method, args,
             } => self.compile_ask(handle, method, args, expr.span),
+            ExprKind::TupleLit(elems) => {
+                // Build field list from element types.
+                let elem_tys: Result<Vec<Ty>, NativeError> =
+                    elems.iter().map(|e| self.infer_ty(e)).collect();
+                let elem_tys = elem_tys?;
+                let fields = tuple_as_fields(&elem_tys);
+                let size = struct_size(&fields);
+                let ptr = self.rc_alloc(size as i64)?;
+                for (i, elem_expr) in elems.iter().enumerate() {
+                    let val = self.compile_expr(elem_expr)?;
+                    let (offset, _) = field_offset(&fields, &format!("_{i}"));
+                    self.builder.ins().store(MemFlags::new(), val, ptr, offset);
+                }
+                Ok(ptr)
+            }
+            ExprKind::TupleField { receiver, index } => {
+                let ptr = self.compile_expr(receiver)?;
+                let recv_ty = self.infer_ty(receiver)?;
+                match recv_ty {
+                    Ty::Tuple(ref elems) => {
+                        let fields = tuple_as_fields(elems);
+                        let field_name = format!("_{index}");
+                        let (offset, fty) = field_offset(&fields, &field_name);
+                        let cl_ty = lumen_to_cl(&fty);
+                        Ok(self.builder.ins().load(cl_ty, MemFlags::new(), ptr, offset))
+                    }
+                    _ => Err(NativeError {
+                        span: expr.span,
+                        message: "tuple field access on non-tuple".into(),
+                    }),
+                }
+            }
             _ => Err(NativeError {
                 span: expr.span,
                 message: "expression not supported in native backend".into(),
@@ -2069,6 +2140,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 // the tag, so we just release the payload's own refcount).
                 self.emit_rc_decr(payload);
             }
+            Ty::Tuple(elems) => {
+                let fields = tuple_as_fields(elems);
+                for (fname, fty) in &fields {
+                    if !is_scalar(fty) {
+                        let (offset, _) = field_offset(&fields, fname);
+                        let child = self.builder.ins().load(PTR, flags, ptr, offset);
+                        self.emit_rc_decr_typed(child, fty);
+                    }
+                }
+            }
             Ty::String | Ty::Bytes => {
                 // Strings/bytes have no pointer children.
             }
@@ -2085,6 +2166,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 fields.iter().any(|(_, fty)| !is_scalar(fty))
             }
             Ty::Option(_) | Ty::Result(_, _) => true, // payload ptr
+            Ty::Tuple(_) => true, // tuple fields might be pointers
             _ => false,
         }
     }
@@ -2176,6 +2258,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             Ty::Option(_) | Ty::Result(_, _) => {
                 // Sum types: copy the 16-byte header + deep-copy payload.
                 self.emit_sum_copy(src, ty)
+            }
+            Ty::Tuple(elems) => {
+                let fields = tuple_as_fields(elems);
+                self.emit_struct_copy(src, &fields)
             }
             _ => Ok(src), // scalar fallthrough (shouldn't reach here)
         }
@@ -2928,6 +3014,21 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     _ => Ty::Error,
                 }
             }
+            ExprKind::TupleLit(elems) => {
+                let types: Result<Vec<Ty>, NativeError> =
+                    elems.iter().map(|e| self.infer_ty(e)).collect();
+                Ty::Tuple(types?)
+            }
+            ExprKind::TupleField { receiver, index } => {
+                let recv_ty = self.infer_ty(receiver)?;
+                match recv_ty {
+                    Ty::Tuple(elems) => {
+                        let idx = *index as usize;
+                        elems.get(idx).cloned().unwrap_or(Ty::I32)
+                    }
+                    _ => Ty::I32,
+                }
+            }
             _ => Ty::I32,
         })
     }
@@ -2952,12 +3053,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn tuple_as_fields(elems: &[Ty]) -> Vec<(String, Ty)> {
+    elems.iter().enumerate().map(|(i, t)| (format!("_{i}"), t.clone())).collect()
+}
+
 fn lumen_to_cl(ty: &Ty) -> CLType {
     match ty {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
-        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => PTR,
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
         Ty::Error => cl_types::I32,
     }
 }
@@ -2973,7 +3078,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
     match ty {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
-        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) => 8, // pointer
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
         Ty::Error => 4,
     }
 }
@@ -3077,6 +3182,7 @@ fn collect_strings_stmt(stmt: &ast::Stmt, acc: &mut Vec<String>) {
         StmtKind::Let { value, .. }
         | StmtKind::Var { value, .. }
         | StmtKind::Assign { value, .. } => collect_strings_expr(value, acc),
+        StmtKind::LetTuple { value, .. } => collect_strings_expr(value, acc),
         StmtKind::Expr(e) => collect_strings_expr(e, acc),
         StmtKind::For { iter, body, .. } => {
             collect_strings_expr(iter, acc);
@@ -3132,6 +3238,23 @@ fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
                 collect_strings_expr(&fi.value, acc);
             }
         }
+        ExprKind::TupleLit(elems) => {
+            for e in elems {
+                collect_strings_expr(e, acc);
+            }
+        }
+        ExprKind::TupleField { receiver, .. } => collect_strings_expr(receiver, acc),
+        ExprKind::Spawn { fields, .. } => {
+            for fi in fields {
+                collect_strings_expr(&fi.value, acc);
+            }
+        }
+        ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
+            collect_strings_expr(handle, acc);
+            for a in args {
+                collect_strings_expr(&a.value, acc);
+            }
+        }
         _ => {}
     }
 }
@@ -3142,6 +3265,7 @@ fn collect_try_frame_strings(fn_name: &str, block: &ast::Block, acc: &mut Vec<St
             StmtKind::Let { value, .. }
             | StmtKind::Var { value, .. }
             | StmtKind::Assign { value, .. } => collect_try_frame_expr(fn_name, value, acc),
+            StmtKind::LetTuple { value, .. } => collect_try_frame_expr(fn_name, value, acc),
             StmtKind::Expr(e) => collect_try_frame_expr(fn_name, e, acc),
             StmtKind::For { iter, body, .. } => {
                 collect_try_frame_expr(fn_name, iter, acc);

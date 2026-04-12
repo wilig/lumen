@@ -431,6 +431,25 @@ impl Parser {
     // --- Types ------------------------------------------------------------
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        // Tuple type: (T1, T2, ...)
+        if matches!(self.peek_kind(), TokenKind::LParen) {
+            let start = self.bump().span;
+            let mut elems = Vec::new();
+            if !matches!(self.peek_kind(), TokenKind::RParen) {
+                loop {
+                    elems.push(self.parse_type()?);
+                    if self.eat(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+            }
+            let end = self.expect(&TokenKind::RParen, "`)` to close tuple type")?.span;
+            return Ok(Type {
+                kind: TypeKind::Tuple(elems),
+                span: merge(start, end),
+            });
+        }
+
         let (name, name_span) = match self.peek_kind() {
             TokenKind::Unit => {
                 let tok = self.bump();
@@ -535,6 +554,26 @@ impl Parser {
     fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
         let start = self.peek().span;
         self.expect(&TokenKind::Let, "`let`")?;
+        // Destructuring let: `let (a, b) = expr`
+        if matches!(self.peek_kind(), TokenKind::LParen) {
+            self.bump();
+            let mut names = Vec::new();
+            loop {
+                let (name, _) = self.expect_ident("binding name in tuple destructure")?;
+                names.push(name);
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)` to close destructuring")?;
+            self.expect(&TokenKind::Eq, "`=` in let binding")?;
+            let value = self.parse_expr(ExprCtx::normal())?;
+            let span = merge(start, value.span);
+            return Ok(Stmt {
+                kind: StmtKind::LetTuple { names, value },
+                span,
+            });
+        }
         let (name, _) = self.expect_ident("binding name")?;
         let ty = if self.eat(&TokenKind::Colon).is_some() {
             Some(self.parse_type()?)
@@ -898,6 +937,20 @@ impl Parser {
             match self.peek_kind() {
                 TokenKind::Dot => {
                     self.bump();
+                    // Tuple field access: `.0`, `.1`, etc.
+                    if let TokenKind::IntLit { value, .. } = self.peek_kind() {
+                        let index = *value as u32;
+                        let idx_span = self.bump().span;
+                        let span = merge(expr.span, idx_span);
+                        expr = Expr {
+                            kind: ExprKind::TupleField {
+                                receiver: Box::new(expr),
+                                index,
+                            },
+                            span,
+                        };
+                        continue;
+                    }
                     let (name, name_span) = self.expect_ident("field or method name")?;
                     if matches!(self.peek_kind(), TokenKind::LParen) {
                         let (args, args_end) = self.parse_call_args()?;
@@ -1039,12 +1092,34 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.bump();
-                let inner = self.parse_expr(ExprCtx::normal())?;
-                let end = self.expect(&TokenKind::RParen, "`)` to close parenthesized expression")?.span;
-                Ok(Expr {
-                    kind: ExprKind::Paren(Box::new(inner)),
-                    span: merge(tok.span, end),
-                })
+                let first = self.parse_expr(ExprCtx::normal())?;
+                if self.eat(&TokenKind::Comma).is_some() {
+                    // Tuple literal: (e1, e2, ...)
+                    let mut elems = vec![first];
+                    if !matches!(self.peek_kind(), TokenKind::RParen) {
+                        loop {
+                            elems.push(self.parse_expr(ExprCtx::normal())?);
+                            if self.eat(&TokenKind::Comma).is_none() {
+                                break;
+                            }
+                            if matches!(self.peek_kind(), TokenKind::RParen) {
+                                break;
+                            }
+                        }
+                    }
+                    let end = self.expect(&TokenKind::RParen, "`)` to close tuple")?.span;
+                    Ok(Expr {
+                        kind: ExprKind::TupleLit(elems),
+                        span: merge(tok.span, end),
+                    })
+                } else {
+                    // Paren expression: (e)
+                    let end = self.expect(&TokenKind::RParen, "`)` to close parenthesized expression")?.span;
+                    Ok(Expr {
+                        kind: ExprKind::Paren(Box::new(first)),
+                        span: merge(tok.span, end),
+                    })
+                }
             }
             TokenKind::LBrace => {
                 let block = self.parse_block()?;

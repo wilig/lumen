@@ -148,15 +148,13 @@ pub struct Type {
 
 #[derive(Debug, Clone)]
 pub enum TypeKind {
-    /// A named type, possibly with type arguments. Covers both user-declared
-    /// types and the built-in primitives (`i32`, `i64`, `u32`, `u64`, `f64`,
-    /// `bool`, `string`, `unit`) and generics (`Option<T>`, `Result<T, E>`,
-    /// `List<T>`). The typechecker is responsible for resolving which is
-    /// which; at parse time they all look like named type references.
+    /// A named type, possibly with type arguments.
     Named {
         name: String,
         args: Vec<Type>,
     },
+    /// `(T1, T2, ...)` — tuple type.
+    Tuple(Vec<Type>),
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +189,14 @@ pub enum StmtKind {
         ty: Option<Type>,
         value: Expr,
     },
-    /// Re-assignment of an existing `var` binding. `name` must already be in
-    /// scope and declared with `var`; the typechecker enforces this.
+    /// Re-assignment of an existing `var` binding.
     Assign {
         name: String,
+        value: Expr,
+    },
+    /// `let (a, b) = expr` — destructuring a tuple into multiple bindings.
+    LetTuple {
+        names: Vec<String>,
         value: Expr,
     },
     Expr(Expr),
@@ -254,6 +256,14 @@ pub enum ExprKind {
     },
     /// `expr?` — error propagation.
     Try(Box<Expr>),
+
+    /// `(expr, expr, ...)` — tuple literal.
+    TupleLit(Vec<Expr>),
+    /// `expr.0`, `expr.1` — tuple field access by index.
+    TupleField {
+        receiver: Box<Expr>,
+        index: u32,
+    },
 
     /// `spawn Counter { count: 0 }`
     Spawn {

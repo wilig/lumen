@@ -53,6 +53,8 @@ pub enum Ty {
     /// Raw byte buffer. Same memory layout as String but without the
     /// UTF-8 assumption. Conversions are zero-cost.
     Bytes,
+    /// Anonymous product type: `(i32, string)`, `(Counter, i32)`, etc.
+    Tuple(Vec<Ty>),
     /// A user-declared struct or sum type by name.
     User(String),
     /// An actor handle.
@@ -74,6 +76,10 @@ impl Ty {
             Ty::Bool => "bool".into(),
             Ty::String => "string".into(),
             Ty::Bytes => "bytes".into(),
+            Ty::Tuple(elems) => {
+                let inner: Vec<String> = elems.iter().map(|t| t.display()).collect();
+                format!("({})", inner.join(", "))
+            }
             Ty::Unit => "unit".into(),
             Ty::Option(t) => format!("Option<{}>", t.display()),
             Ty::Result(o, e) => format!("Result<{}, {}>", o.display(), e.display()),
@@ -488,6 +494,11 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
                 message: format!("unknown type `{name}`"),
             }),
         },
+        TypeKind::Tuple(elems) => {
+            let resolved: Result<Vec<Ty>, TypeError> =
+                elems.iter().map(|e| resolve_type(e, types)).collect();
+            Ok(Ty::Tuple(resolved?))
+        }
     }
 }
 
@@ -685,6 +696,38 @@ impl<'a> FnChecker<'a> {
                 self.declare(binder, elem_ty, false, stmt.span);
                 self.check_block(body, Some(&Ty::Unit));
                 self.pop_scope();
+            }
+            StmtKind::LetTuple { names, value } => {
+                let val_ty = self.infer_expr(value);
+                match val_ty {
+                    Ty::Tuple(ref elems) => {
+                        if names.len() != elems.len() {
+                            self.errors.push(TypeError {
+                                span: stmt.span,
+                                message: format!(
+                                    "tuple destructuring expects {} names, found {}",
+                                    elems.len(),
+                                    names.len()
+                                ),
+                            });
+                        } else {
+                            for (i, name) in names.iter().enumerate() {
+                                let elem_ty = elems[i].clone();
+                                self.declare(name, elem_ty, false, stmt.span);
+                            }
+                        }
+                    }
+                    Ty::Error => {}
+                    other => {
+                        self.errors.push(TypeError {
+                            span: stmt.span,
+                            message: format!(
+                                "`let (...)` destructuring requires a tuple type, found {}",
+                                other.display()
+                            ),
+                        });
+                    }
+                }
             }
             StmtKind::Return(value) => match value {
                 None => {
@@ -940,6 +983,44 @@ impl<'a> FnChecker<'a> {
                 };
                 self.check_msg_args(actor_name, method, args, expr.span)
             }
+            ExprKind::TupleLit(elems) => {
+                let types: Vec<Ty> = elems.iter().map(|e| self.infer_expr(e)).collect();
+                Ty::Tuple(types)
+            }
+
+            ExprKind::TupleField { receiver, index } => {
+                let recv_ty = self.infer_expr(receiver);
+                match recv_ty {
+                    Ty::Tuple(ref elems) => {
+                        let idx = *index as usize;
+                        if idx < elems.len() {
+                            elems[idx].clone()
+                        } else {
+                            self.errors.push(TypeError {
+                                span: expr.span,
+                                message: format!(
+                                    "tuple index {} out of bounds for tuple with {} elements",
+                                    index,
+                                    elems.len()
+                                ),
+                            });
+                            Ty::Error
+                        }
+                    }
+                    Ty::Error => Ty::Error,
+                    other => {
+                        self.errors.push(TypeError {
+                            span: expr.span,
+                            message: format!(
+                                "tuple field access on a non-tuple type {}",
+                                other.display()
+                            ),
+                        });
+                        Ty::Error
+                    }
+                }
+            }
+
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expr.span),
         }
     }
@@ -1998,6 +2079,10 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
                 || (matches!(**eb, Ty::Error) && compatible(oa, ob))
                 || (matches!(**oa, Ty::Error) && compatible(ea, eb))
                 || (matches!(**ob, Ty::Error) && compatible(ea, eb))
+        }
+        (Ty::Tuple(a_elems), Ty::Tuple(b_elems)) => {
+            a_elems.len() == b_elems.len()
+                && a_elems.iter().zip(b_elems.iter()).all(|(a, b)| compatible(a, b))
         }
         _ => a == b,
     }

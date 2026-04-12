@@ -369,6 +369,7 @@ impl<'a> Codegen<'a> {
                 StmtKind::Let { value, .. }
                 | StmtKind::Var { value, .. }
                 | StmtKind::Assign { value, .. } => self.scan_try_in_expr(fn_name, value),
+                StmtKind::LetTuple { value, .. } => self.scan_try_in_expr(fn_name, value),
                 StmtKind::Expr(e) => self.scan_try_in_expr(fn_name, e),
                 StmtKind::For { iter, body, .. } => {
                     self.scan_try_in_expr(fn_name, iter);
@@ -512,6 +513,7 @@ impl<'a> Codegen<'a> {
             StmtKind::Let { value, .. }
             | StmtKind::Var { value, .. }
             | StmtKind::Assign { value, .. } => self.scan_string_lits_in_expr(value, acc),
+            StmtKind::LetTuple { value, .. } => self.scan_string_lits_in_expr(value, acc),
             StmtKind::Expr(e) => self.scan_string_lits_in_expr(e, acc),
             StmtKind::For { iter, body, .. } => {
                 self.scan_string_lits_in_expr(iter, acc);
@@ -582,6 +584,12 @@ impl<'a> Codegen<'a> {
                     self.scan_string_lits_in_expr(&a.value, acc);
                 }
             }
+            ExprKind::TupleLit(elems) => {
+                for e in elems {
+                    self.scan_string_lits_in_expr(e, acc);
+                }
+            }
+            ExprKind::TupleField { receiver, .. } => self.scan_string_lits_in_expr(receiver, acc),
             ExprKind::IntLit { .. }
             | ExprKind::FloatLit(_)
             | ExprKind::BoolLit(_)
@@ -1193,6 +1201,9 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 self.walk_block(body)?;
                 self.pop_scope();
             }
+            StmtKind::LetTuple { value, .. } => {
+                self.walk_expr(value)?;
+            }
             StmtKind::Return(Some(e)) => self.walk_expr(e)?,
             StmtKind::Return(None) => {}
         }
@@ -1325,6 +1336,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     self.walk_expr(&a.value)?;
                 }
             }
+            ExprKind::TupleLit(elems) => {
+                for e in elems {
+                    self.walk_expr(e)?;
+                }
+            }
+            ExprKind::TupleField { receiver, .. } => self.walk_expr(receiver)?,
             // Leaves
             ExprKind::IntLit { .. }
             | ExprKind::FloatLit(_)
@@ -1420,6 +1437,11 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                     });
                 }
             }),
+            ast::TypeKind::Tuple(elems) => {
+                let resolved: Result<Vec<Ty>, CodegenError> =
+                    elems.iter().map(|e| self.resolve_ast_type(e)).collect();
+                Ok(Ty::Tuple(resolved?))
+            }
         }
     }
 
@@ -1702,6 +1724,21 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
                 Some(tail) => self.infer_expr_ty(tail)?,
                 None => Ty::Unit,
             },
+            ExprKind::TupleLit(elems) => {
+                let types: Result<Vec<Ty>, CodegenError> =
+                    elems.iter().map(|e| self.infer_expr_ty(e)).collect();
+                Ty::Tuple(types?)
+            }
+            ExprKind::TupleField { receiver, index } => {
+                let recv_ty = self.infer_expr_ty(receiver)?;
+                match recv_ty {
+                    Ty::Tuple(elems) => {
+                        let idx = *index as usize;
+                        elems.get(idx).cloned().unwrap_or(Ty::Error)
+                    }
+                    _ => Ty::Error,
+                }
+            }
             ExprKind::Spawn { actor_name, .. } => {
                 Ty::Handle(Box::new(Ty::User(actor_name.clone())))
             }
@@ -1778,6 +1815,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             StmtKind::For { binder, iter, body } => {
                 self.compile_for_range(binder, iter, body, stmt.span, f)?;
+            }
+            StmtKind::LetTuple { .. } => {
+                return Err(CodegenError {
+                    span: stmt.span,
+                    message: "tuples not supported in Wasm backend".into(),
+                });
             }
             StmtKind::Return(Some(e)) => {
                 self.compile_expr(e, f)?;
@@ -2039,6 +2082,12 @@ impl<'a, 'b> FnBuilder<'a, 'b> {
             }
             ExprKind::Field { receiver, name } => {
                 self.compile_field_access(receiver, name, f)?;
+            }
+            ExprKind::TupleLit(_) | ExprKind::TupleField { .. } => {
+                return Err(CodegenError {
+                    span: expr.span,
+                    message: "tuples not supported in Wasm backend".into(),
+                });
             }
             ExprKind::Spawn { .. } | ExprKind::Send { .. } | ExprKind::Ask { .. } => {
                 return Err(CodegenError {
@@ -3187,7 +3236,8 @@ fn wasm_val_type(ty: &Ty, span: Span) -> Result<ValType, CodegenError> {
         | Ty::Option(_)
         | Ty::Result(_, _)
         | Ty::List(_)
-        | Ty::Handle(_) => ValType::I32,
+        | Ty::Handle(_)
+        | Ty::Tuple(_) => ValType::I32,
         Ty::I64 | Ty::U64 => ValType::I64,
         Ty::F64 => ValType::F64,
         Ty::Error => {
