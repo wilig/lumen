@@ -1,0 +1,527 @@
+// Bricks! — A breakout clone ported from Odin to Lumen.
+// Uses raylib via the C bridge layer.
+
+// --- Constants ---
+
+// Window
+fn WIN_WIDTH(): i32 { return 800 }
+fn WIN_HEIGHT(): i32 { return 600 }
+
+// Block layout
+fn BLOCK_WIDTH(): f64 { return 79.0 }
+fn BLOCK_HEIGHT(): f64 { return 25.0 }
+fn BLOCK_GAP(): f64 { return 10.0 }
+fn BLOCK_Y_OFFSET(): f64 { return 50.0 }
+fn SCOREBOARD_HEIGHT(): f64 { return 18.0 }
+
+// Physics
+fn BASE_SPEED(): f64 { return 300.0 }
+fn SPEED_DECAY(): f64 { return 1.015 }
+
+// Raylib key codes
+fn KEY_LEFT(): i32 { return 263 }
+fn KEY_RIGHT(): i32 { return 262 }
+fn KEY_SPACE(): i32 { return 32 }
+fn KEY_ENTER(): i32 { return 257 }
+fn KEY_P(): i32 { return 80 }
+
+// --- Types ---
+
+type Vec2 = { x: f64, y: f64 }
+type Rect = { x: f64, y: f64, w: f64, h: f64 }
+type Line = { x1: f64, y1: f64, x2: f64, y2: f64 }
+
+type Collision = { hit: i32, px: f64, py: f64, nx: f64, ny: f64 }
+
+type Puck = {
+    x: f64, y: f64,
+    dx: f64, dy: f64,
+    speed: f64,
+    radius: f64,
+    active: i32
+}
+
+type Paddle = {
+    x: f64, y: f64, w: f64, h: f64,
+    direction: f64,
+    default_speed: f64,
+    current_speed: f64
+}
+
+type Block = {
+    x: f64, y: f64, w: f64, h: f64,
+    color: i32,
+    active: i32,
+    value: i32
+}
+
+type Game = {
+    lives: i32,
+    score: i32,
+    active: i32,
+    puck_x: f64, puck_y: f64,
+    puck_dx: f64, puck_dy: f64,
+    puck_speed: f64,
+    puck_active: i32,
+    paddle: Paddle,
+    screen: i32,
+    frames: i32
+}
+
+// --- Collision Detection ---
+
+fn distance(x1: f64, y1: f64, x2: f64, y2: f64): f64 {
+    return math.abs(x1 - x2) + math.abs(y1 - y2)
+}
+
+fn find_line_intersection(l1x1: f64, l1y1: f64, l1x2: f64, l1y2: f64,
+                          l2x1: f64, l2y1: f64, l2x2: f64, l2y2: f64): (i32, f64, f64) {
+    let denom = (l1x1 - l1x2) * (l2y1 - l2y2) - (l1y1 - l1y2) * (l2x1 - l2x2)
+    if math.abs(denom) < 0.000001 {
+        return (0, 0.0, 0.0)
+    }
+    let t_num = (l1x1 - l2x1) * (l2y1 - l2y2) - (l1y1 - l2y1) * (l2x1 - l2x2)
+    let u_num = (l1x1 - l2x1) * (l1y1 - l1y2) - (l1y1 - l2y1) * (l1x1 - l1x2)
+    let t = t_num / denom
+    let u = u_num / denom
+    if t >= 0.0 {
+        if t <= 1.0 {
+            if u >= 0.0 {
+                if u <= 1.0 {
+                    let ix = l1x1 + t * (l1x2 - l1x1)
+                    let iy = l1y1 + t * (l1y2 - l1y1)
+                    return (1, ix, iy)
+                }
+            }
+        }
+    }
+    return (0, 0.0, 0.0)
+}
+
+fn calc_normal(lx1: f64, ly1: f64, lx2: f64, ly2: f64): (f64, f64) {
+    let ex = lx2 - lx1
+    let ey = ly2 - ly1
+    let nx = 0.0 - ey
+    let ny = ex
+    let len = math.sqrt(nx * nx + ny * ny)
+    if len > 0.000001 {
+        return (nx / len, ny / len)
+    }
+    return (0.0, 1.0)
+}
+
+fn ray_vs_rect(ray_x: f64, ray_y: f64, ray_ex: f64, ray_ey: f64,
+               bx: f64, by: f64, bw: f64, bh: f64, radius: f64): Collision {
+    // 4 edges of the rectangle expanded by radius
+    var best = Collision { hit: 0, px: 0.0, py: 0.0, nx: 0.0, ny: 0.0 }
+
+    // Top edge
+    let (hit0, ix0, iy0) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx - radius, by - radius, bx + bw + radius, by - radius)
+    if hit0 == 1 {
+        if best.hit == 0 {
+            let (tnx, tny) = calc_normal(bx - radius, by - radius, bx + bw + radius, by - radius)
+            best = Collision { hit: 1, px: ix0, py: iy0, nx: tnx, ny: tny }
+        }
+    }
+
+    // Bottom edge
+    let (hit1, ix1, iy1) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx - radius, by + bh + radius, bx + bw + radius, by + bh + radius)
+    if hit1 == 1 {
+        if best.hit == 0 {
+            let (bnx, bny) = calc_normal(bx - radius, by + bh + radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix1, py: iy1, nx: bnx, ny: bny }
+        }
+        if distance(ray_x, ray_y, ix1, iy1) < distance(ray_x, ray_y, best.px, best.py) {
+            let (bnx2, bny2) = calc_normal(bx - radius, by + bh + radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix1, py: iy1, nx: bnx2, ny: bny2 }
+        }
+    }
+
+    // Left edge
+    let (hit2, ix2, iy2) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx - radius, by - radius, bx - radius, by + bh + radius)
+    if hit2 == 1 {
+        if best.hit == 0 {
+            let (lnx, lny) = calc_normal(bx - radius, by - radius, bx - radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix2, py: iy2, nx: lnx, ny: lny }
+        }
+        if distance(ray_x, ray_y, ix2, iy2) < distance(ray_x, ray_y, best.px, best.py) {
+            let (lnx2, lny2) = calc_normal(bx - radius, by - radius, bx - radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix2, py: iy2, nx: lnx2, ny: lny2 }
+        }
+    }
+
+    // Right edge
+    let (hit3, ix3, iy3) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+    if hit3 == 1 {
+        if best.hit == 0 {
+            let (rnx, rny) = calc_normal(bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix3, py: iy3, nx: rnx, ny: rny }
+        }
+        if distance(ray_x, ray_y, ix3, iy3) < distance(ray_x, ray_y, best.px, best.py) {
+            let (rnx2, rny2) = calc_normal(bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix3, py: iy3, nx: rnx2, ny: rny2 }
+        }
+    }
+
+    return best
+}
+
+fn ray_vs_paddle(ray_x: f64, ray_y: f64, ray_ex: f64, ray_ey: f64,
+                 bx: f64, by: f64, bw: f64, bh: f64, radius: f64): Collision {
+    // Same as ray_vs_rect but skip bottom edge
+    var best = Collision { hit: 0, px: 0.0, py: 0.0, nx: 0.0, ny: 0.0 }
+
+    // Top edge only (main paddle surface)
+    let (hit0, ix0, iy0) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx - radius, by - radius, bx + bw + radius, by - radius)
+    if hit0 == 1 {
+        let (tnx, tny) = calc_normal(bx - radius, by - radius, bx + bw + radius, by - radius)
+        best = Collision { hit: 1, px: ix0, py: iy0, nx: tnx, ny: tny }
+    }
+
+    // Left edge
+    let (hit2, ix2, iy2) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx - radius, by - radius, bx - radius, by + bh + radius)
+    if hit2 == 1 {
+        if best.hit == 0 {
+            let (lnx, lny) = calc_normal(bx - radius, by - radius, bx - radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix2, py: iy2, nx: lnx, ny: lny }
+        }
+        if distance(ray_x, ray_y, ix2, iy2) < distance(ray_x, ray_y, best.px, best.py) {
+            let (lnx2, lny2) = calc_normal(bx - radius, by - radius, bx - radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix2, py: iy2, nx: lnx2, ny: lny2 }
+        }
+    }
+
+    // Right edge
+    let (hit3, ix3, iy3) = find_line_intersection(ray_x, ray_y, ray_ex, ray_ey,
+        bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+    if hit3 == 1 {
+        if best.hit == 0 {
+            let (rnx, rny) = calc_normal(bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix3, py: iy3, nx: rnx, ny: rny }
+        }
+        if distance(ray_x, ray_y, ix3, iy3) < distance(ray_x, ray_y, best.px, best.py) {
+            let (rnx2, rny2) = calc_normal(bx + bw + radius, by - radius, bx + bw + radius, by + bh + radius)
+            best = Collision { hit: 1, px: ix3, py: iy3, nx: rnx2, ny: rny2 }
+        }
+    }
+
+    return best
+}
+
+// --- Level Data ---
+// Colors for rows (packed RGBA): red, purple, green, yellow, blue, violet
+fn row_color(row: i32): i32 {
+    if row == 0 { return rl.red() }
+    if row == 1 { return rl.purple() }
+    if row == 2 { return rl.green() }
+    if row == 3 { return rl.yellow() }
+    if row == 4 { return rl.blue() }
+    return rl.purple()
+}
+
+fn init_blocks(): i64 {
+    var blocks = list.new()
+    for row in range(0, 6) {
+        for col in range(0, 10) {
+            let bx = BLOCK_GAP() + col as f64 * BLOCK_WIDTH()
+            let by = BLOCK_Y_OFFSET() + row as f64 * BLOCK_HEIGHT()
+            let b = Block {
+                x: bx, y: by,
+                w: BLOCK_WIDTH() - BLOCK_GAP(),
+                h: BLOCK_HEIGHT() - BLOCK_GAP(),
+                color: row_color(row),
+                active: 1,
+                value: 1
+            }
+            blocks = list.push(blocks, b)
+        }
+    }
+    return blocks
+}
+
+// --- Paddle ---
+
+fn update_paddle(p: Paddle, dt: f64): Paddle {
+    var dir = 0.0
+    if rl.is_key_down(KEY_LEFT()) == 1 {
+        dir = 0.0 - 1.0
+    }
+    if rl.is_key_down(KEY_RIGHT()) == 1 {
+        dir = 1.0
+    }
+    let new_x = math.clamp(p.x + dir * p.current_speed * dt, 0.0, 800.0 - p.w)
+    return Paddle { x: new_x, direction: dir, ..p }
+}
+
+fn draw_paddle(p: Paddle): unit {
+    rl.draw_rect(p.x, p.y, p.w, p.h, rl.darkblue())
+}
+
+// --- Puck ---
+
+fn redirect_puck(px: f64, py: f64, dx: f64, dy: f64, speed: f64,
+                 col: Collision, dt: f64): (f64, f64, f64, f64) {
+    let dot = dx * col.nx + dy * col.ny
+    let new_dx = math.clamp(dx - 2.0 * dot * col.nx, 0.0 - 1.0, 1.0)
+    let new_dy = math.clamp(dy - 2.0 * dot * col.ny, 0.0 - 1.0, 1.0)
+    let fx = col.px + new_dx * speed * dt
+    let fy = col.py + new_dy * speed * dt
+    return (fx, fy, new_dx, new_dy)
+}
+
+// --- Draw ---
+
+fn draw_blocks(blocks: i64): unit {
+    for i in range(0, list.len(blocks)) {
+        let b = list.get(blocks, i)
+        if b.active == 1 {
+            rl.draw_rect(b.x, b.y, b.w, b.h, b.color)
+        }
+    }
+}
+
+fn draw_scoreboard(score: i32, lives: i32): unit {
+    rl.draw_text("SCORE: " + int.to_string_i32(score), 10, 5, 10, rl.gray())
+    rl.draw_text("LIVES: " + int.to_string_i32(lives), 725, 5, 10, rl.gray())
+    rl.draw_line(0, 18, 800, 18, rl.gray())
+}
+
+// --- Main Game Loop ---
+
+fn main(): i32 {
+    rl.init_window(WIN_WIDTH(), WIN_HEIGHT(), "Bricks!")
+    rl.set_target_fps(60)
+
+    var lives = 3
+    var score = 0
+    var active = 1
+    var screen = 0
+
+    // Puck state
+    var px = 200.0
+    var py = 540.0
+    var pdx = 1.0
+    var pdy = 0.0 - 1.0
+    var pspeed = BASE_SPEED()
+    var puck_active = 0
+    var puck_radius = 5.0
+
+    // Paddle
+    var paddle = Paddle {
+        x: 200.0, y: 550.0,
+        w: BLOCK_WIDTH() - BLOCK_GAP(),
+        h: BLOCK_HEIGHT() - BLOCK_GAP(),
+        direction: 0.0,
+        default_speed: BASE_SPEED() * 2.0,
+        current_speed: BASE_SPEED() * 2.0
+    }
+
+    var blocks = init_blocks()
+    var frames = 0
+
+    for tick in range(0, 999999) {
+        if rl.window_should_close() == 1 {
+            return 0
+        }
+        let dt = rl.get_frame_time()
+        rl.begin_drawing()
+        rl.clear_background(rl.black())
+
+        // --- LOGO screen ---
+        if screen == 0 {
+            if frames < 120 {
+                rl.draw_text("This is the beginning!", 20, 300, 40, rl.green())
+            }
+            if frames >= 120 {
+                screen = 1
+            }
+        }
+
+        // --- TITLE screen ---
+        if screen == 1 {
+            rl.draw_rect(50.0, 300.0, 700.0, 200.0, rl.blue())
+            rl.draw_text("BRICKS!", 250, 350, 60, rl.white())
+            rl.draw_text("Press [Enter] to play", 250, 430, 20, rl.white())
+            if rl.is_key_pressed(KEY_ENTER()) == 1 {
+                screen = 2
+            }
+        }
+
+        // --- GAME screen ---
+        if screen == 2 {
+            if rl.is_key_pressed(KEY_P()) == 1 {
+                if active == 1 { active = 0 }
+                if active == 0 { active = 1 }
+            }
+
+            if active == 1 {
+                if lives > 0 {
+                    // Update paddle
+                    paddle = update_paddle(paddle, dt)
+
+                    // Launch puck
+                    if rl.is_key_down(KEY_SPACE()) == 1 {
+                        if puck_active == 0 {
+                            puck_active = 1
+                        }
+                    }
+
+                    // Puck follows paddle before launch
+                    if puck_active == 0 {
+                        px = paddle.x + 25.0
+                        py = paddle.y - puck_radius - 1.0
+                    }
+
+                    if puck_active == 1 {
+                        // Ray for collision
+                        let ray_ex = px + pdx * pspeed * dt
+                        let ray_ey = py + pdy * pspeed * dt
+
+                        // Check block collisions
+                        var hit_block = 0 - 1
+                        var best_col = Collision { hit: 0, px: 0.0, py: 0.0, nx: 0.0, ny: 0.0 }
+                        var best_dist = 999999.0
+
+                        for i in range(0, list.len(blocks)) {
+                            let b = list.get(blocks, i)
+                            if b.active == 1 {
+                                let col = ray_vs_rect(px, py, ray_ex, ray_ey, b.x, b.y, b.w, b.h, puck_radius)
+                                if col.hit == 1 {
+                                    let d = distance(px, py, col.px, col.py)
+                                    if d < best_dist {
+                                        best_dist = d
+                                        best_col = col
+                                        hit_block = i
+                                    }
+                                }
+                            }
+                        }
+
+                        if hit_block >= 0 {
+                            // Deactivate block
+                            let old_b = list.get(blocks, hit_block)
+                            let dead_b = Block { active: 0, ..old_b }
+                            blocks = list.set(blocks, hit_block, dead_b)
+                            score = score + old_b.value
+
+                            // Redirect puck
+                            let (npx, npy, ndx, ndy) = redirect_puck(px, py, pdx, pdy, pspeed, best_col, dt)
+                            px = npx
+                            py = npy
+                            pdx = ndx
+                            pdy = ndy
+                        }
+
+                        // Check paddle collision
+                        if hit_block < 0 {
+                            let pcol = ray_vs_paddle(px, py, ray_ex, ray_ey,
+                                paddle.x, paddle.y, paddle.w, paddle.h, puck_radius)
+                            if pcol.hit == 1 {
+                                let adj_col = Collision { nx: pcol.nx - paddle.direction * 0.05, ..pcol }
+                                let (npx2, npy2, ndx2, ndy2) = redirect_puck(px, py, pdx, pdy, pspeed, adj_col, dt)
+                                px = npx2
+                                py = npy2
+                                pdx = ndx2
+                                pdy = ndy2
+                            }
+
+                            // No collision — move normally
+                            if pcol.hit == 0 {
+                                px = px + pdx * pspeed * dt
+                                py = py + pdy * pspeed * dt
+
+                                // Speed decay
+                                if math.abs(pspeed - BASE_SPEED()) > 0.000001 {
+                                    pspeed = BASE_SPEED() + (pspeed - BASE_SPEED()) / SPEED_DECAY()
+                                }
+                            }
+                        }
+
+                        // Wall bounces
+                        if py - puck_radius <= SCOREBOARD_HEIGHT() {
+                            pdy = 1.0
+                        }
+                        if px - puck_radius <= 0.0 {
+                            pdx = 1.0
+                        }
+                        if px + puck_radius >= 800.0 {
+                            pdx = 0.0 - 1.0
+                        }
+
+                        // Ball lost
+                        if py + puck_radius >= 600.0 {
+                            lives = lives - 1
+                            puck_active = 0
+                            px = paddle.x + 25.0
+                            py = paddle.y - puck_radius - 1.0
+                            pdx = 1.0
+                            pdy = 0.0 - 1.0
+                            pspeed = BASE_SPEED()
+                        }
+                    }
+
+                    // Check level complete
+                    var any_active = 0
+                    for i in range(0, list.len(blocks)) {
+                        let b = list.get(blocks, i)
+                        if b.active == 1 {
+                            any_active = 1
+                        }
+                    }
+                    if any_active == 0 {
+                        // Reset level
+                        blocks = init_blocks()
+                        puck_active = 0
+                        px = paddle.x + 25.0
+                        py = paddle.y - puck_radius - 1.0
+                    }
+                }
+            }
+
+            // Draw
+            draw_blocks(blocks)
+            draw_paddle(paddle)
+            if puck_active == 1 {
+                rl.draw_circle(px, py, puck_radius, rl.white())
+            }
+            if puck_active == 0 {
+                rl.draw_circle(px, py, puck_radius, rl.darkgray())
+            }
+            draw_scoreboard(score, lives)
+
+            // Game over
+            if lives <= 0 {
+                screen = 3
+            }
+        }
+
+        // --- GAME OVER screen ---
+        if screen == 3 {
+            rl.draw_rect(100.0, 300.0, 600.0, 200.0, rl.blue())
+            rl.draw_text("Game Over! Final score: " + int.to_string_i32(score), 150, 350, 25, rl.white())
+            rl.draw_text("Press [Enter] to try again", 220, 430, 20, rl.white())
+            if rl.is_key_pressed(KEY_ENTER()) == 1 {
+                lives = 3
+                score = 0
+                blocks = init_blocks()
+                puck_active = 0
+                px = paddle.x + 25.0
+                py = paddle.y - puck_radius - 1.0
+                pspeed = BASE_SPEED()
+                screen = 2
+            }
+        }
+
+        rl.end_drawing()
+        frames = frames + 1
+    }
+
+    rl.close_window()
+    return 0
+}

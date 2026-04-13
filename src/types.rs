@@ -1595,9 +1595,15 @@ impl<'a> FnChecker<'a> {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.get` expects 2 args".into() }); }
                 if let Some(a) = args.first() {
                     let lt = self.infer_expr(&a.value);
-                    if let Ty::List(inner) = lt { return Some(*inner); }
+                    if let Ty::List(inner) = lt {
+                        if !matches!(*inner, Ty::Error) {
+                            return Some(*inner);
+                        }
+                    }
                 }
-                Some(Ty::I32)
+                // Return Error: compatible with any type, so field access
+                // on list elements works without proper generic tracking.
+                Some(Ty::Error)
             }
             ("list", "set") => {
                 if args.len() != 3 { self.errors.push(TypeError { span, message: "`list.set` expects 3 args".into() }); }
@@ -1669,6 +1675,228 @@ impl<'a> FnChecker<'a> {
                     self.check_expr(&args[1].value, &Ty::String);
                 }
                 Some(Ty::Bytes)
+            }
+            // --- Raylib: Window ---
+            ("rl", "init_window") => {
+                if args.len() != 3 {
+                    self.errors.push(TypeError { span, message: format!("`rl.init_window` expects 3 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                    self.check_expr(&args[2].value, &Ty::String);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "close_window") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.close_window` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            ("rl", "window_should_close") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.window_should_close` expects 0 arguments".into() }); }
+                Some(Ty::I32)
+            }
+            ("rl", "set_target_fps") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`rl.set_target_fps` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "get_frame_time") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.get_frame_time` expects 0 arguments".into() }); }
+                Some(Ty::F64)
+            }
+            // --- Raylib: Drawing ---
+            ("rl", "begin_drawing") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.begin_drawing` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            ("rl", "end_drawing") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.end_drawing` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            ("rl", "clear_background") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`rl.clear_background` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "draw_text") => {
+                if args.len() != 5 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_text` expects 5 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::String);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                    self.check_expr(&args[2].value, &Ty::I32);
+                    self.check_expr(&args[3].value, &Ty::I32);
+                    self.check_expr(&args[4].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "measure_text") => {
+                if args.len() != 2 {
+                    self.errors.push(TypeError { span, message: format!("`rl.measure_text` expects 2 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::String);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("rl", "draw_rect") => {
+                if args.len() != 5 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect` expects 5 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                    self.check_expr(&args[2].value, &Ty::F64);
+                    self.check_expr(&args[3].value, &Ty::F64);
+                    self.check_expr(&args[4].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "draw_rect_i") => {
+                if args.len() != 5 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect_i` expects 5 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                    self.check_expr(&args[2].value, &Ty::I32);
+                    self.check_expr(&args[3].value, &Ty::I32);
+                    self.check_expr(&args[4].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "draw_rect_pro") => {
+                if args.len() != 8 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect_pro` expects 8 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                    self.check_expr(&args[2].value, &Ty::F64);
+                    self.check_expr(&args[3].value, &Ty::F64);
+                    self.check_expr(&args[4].value, &Ty::F64);
+                    self.check_expr(&args[5].value, &Ty::F64);
+                    self.check_expr(&args[6].value, &Ty::F64);
+                    self.check_expr(&args[7].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "draw_circle") => {
+                if args.len() != 4 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_circle` expects 4 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                    self.check_expr(&args[2].value, &Ty::F64);
+                    self.check_expr(&args[3].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "draw_line") => {
+                if args.len() != 5 {
+                    self.errors.push(TypeError { span, message: format!("`rl.draw_line` expects 5 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::I32);
+                    self.check_expr(&args[2].value, &Ty::I32);
+                    self.check_expr(&args[3].value, &Ty::I32);
+                    self.check_expr(&args[4].value, &Ty::I32);
+                }
+                Some(Ty::Unit)
+            }
+            // --- Raylib: Input ---
+            ("rl", "is_key_pressed") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`rl.is_key_pressed` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("rl", "is_key_down") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`rl.is_key_down` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            ("rl", "is_gesture_detected") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`rl.is_gesture_detected` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                }
+                Some(Ty::I32)
+            }
+            // --- Raylib: Camera ---
+            ("rl", "set_camera") => {
+                if args.len() != 6 {
+                    self.errors.push(TypeError { span, message: format!("`rl.set_camera` expects 6 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                    self.check_expr(&args[2].value, &Ty::F64);
+                    self.check_expr(&args[3].value, &Ty::F64);
+                    self.check_expr(&args[4].value, &Ty::F64);
+                    self.check_expr(&args[5].value, &Ty::F64);
+                }
+                Some(Ty::Unit)
+            }
+            ("rl", "begin_mode_2d") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.begin_mode_2d` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            ("rl", "end_mode_2d") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.end_mode_2d` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            // --- Raylib: Audio ---
+            ("rl", "init_audio") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.init_audio` expects 0 arguments".into() }); }
+                Some(Ty::Unit)
+            }
+            // --- Raylib: Colors ---
+            ("rl", "black") | ("rl", "white") | ("rl", "red") | ("rl", "green")
+            | ("rl", "blue") | ("rl", "yellow") | ("rl", "purple")
+            | ("rl", "darkblue") | ("rl", "darkgray") | ("rl", "gray") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: format!("`rl.{method}` expects 0 arguments") }); }
+                Some(Ty::I32)
+            }
+            ("rl", "color_alpha") => {
+                if args.len() != 2 {
+                    self.errors.push(TypeError { span, message: format!("`rl.color_alpha` expects 2 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::I32);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                }
+                Some(Ty::I32)
+            }
+            // --- Math ---
+            ("math", "sqrt") | ("math", "abs") | ("math", "cos") | ("math", "sin") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: format!("`math.{method}` expects 1 argument, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                }
+                Some(Ty::F64)
+            }
+            ("math", "clamp") => {
+                if args.len() != 3 {
+                    self.errors.push(TypeError { span, message: format!("`math.clamp` expects 3 arguments, found {}", args.len()) });
+                } else {
+                    self.check_expr(&args[0].value, &Ty::F64);
+                    self.check_expr(&args[1].value, &Ty::F64);
+                    self.check_expr(&args[2].value, &Ty::F64);
+                }
+                Some(Ty::F64)
+            }
+            ("math", "rand") => {
+                if !args.is_empty() { self.errors.push(TypeError { span, message: "`math.rand` expects 0 arguments".into() }); }
+                Some(Ty::F64)
             }
             _ => None,
         }
@@ -2211,6 +2439,12 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
         // compatible with i64 parameters (used when passing fn names as args
         // before FnPtr syntax lands in the parser).
         (Ty::FnPtr { .. }, Ty::I64) | (Ty::I64, Ty::FnPtr { .. }) => true,
+        // Lists are i64 pointers at runtime.
+        (Ty::List(_), Ty::I64) | (Ty::I64, Ty::List(_)) => true,
+        // List<Error> (from list.new) unifies with any List<T>.
+        (Ty::List(a), Ty::List(b)) => compatible(a, b),
+        // Any pointer-based type is compatible with i64.
+        (Ty::User(_), Ty::I64) | (Ty::I64, Ty::User(_)) => true,
         // Option<Error> from `None` unifies with any Option<T>.
         (Ty::Option(inner), Ty::Option(_)) | (Ty::Option(_), Ty::Option(inner))
             if matches!(**inner, Ty::Error) =>

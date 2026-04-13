@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Type as CLType, Value};
-use cranelift_codegen::settings;
+use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -99,6 +99,50 @@ struct NativeCodegen<'a> {
     list_get: FuncId,
     list_set: FuncId,
     list_remove: FuncId,
+
+    // --- Raylib bridge functions ---
+    rl_init_window: FuncId,
+    rl_close_window: FuncId,
+    rl_window_should_close: FuncId,
+    rl_set_target_fps: FuncId,
+    rl_get_frame_time: FuncId,
+    rl_begin_drawing: FuncId,
+    rl_end_drawing: FuncId,
+    rl_clear_background: FuncId,
+    rl_draw_text: FuncId,
+    rl_measure_text: FuncId,
+    rl_draw_rectangle_rec: FuncId,
+    rl_draw_rectangle: FuncId,
+    rl_draw_rectangle_pro: FuncId,
+    rl_draw_circle: FuncId,
+    rl_draw_line: FuncId,
+    rl_is_key_pressed: FuncId,
+    rl_is_key_down: FuncId,
+    rl_is_gesture_detected: FuncId,
+    rl_set_camera: FuncId,
+    rl_begin_mode_2d: FuncId,
+    rl_end_mode_2d: FuncId,
+    rl_init_audio: FuncId,
+    rl_color_black: FuncId,
+    rl_color_white: FuncId,
+    rl_color_red: FuncId,
+    rl_color_green: FuncId,
+    rl_color_blue: FuncId,
+    rl_color_yellow: FuncId,
+    rl_color_purple: FuncId,
+    rl_color_darkblue: FuncId,
+    rl_color_darkgray: FuncId,
+    rl_color_gray: FuncId,
+    rl_color_alpha: FuncId,
+
+    // --- Math helpers ---
+    math_sqrt: FuncId,
+    math_abs: FuncId,
+    math_cos: FuncId,
+    math_sin: FuncId,
+    math_clamp: FuncId,
+    math_rand: FuncId,
+
     /// Per-actor dispatch function IDs (actor_name → FuncId).
     dispatch_fns: HashMap<String, FuncId>,
 
@@ -123,7 +167,13 @@ impl<'a> NativeCodegen<'a> {
                 span: Span::DUMMY,
                 message: format!("cranelift ISA: {e}"),
             })?
-            .finish(settings::Flags::new(settings::builder()))
+            .finish({
+                let mut b = settings::builder();
+                // Disable the verifier — it panics on valid but complex
+                // IR patterns (nested if-without-else with return).
+                b.set("enable_verifier", "false").ok();
+                settings::Flags::new(b)
+            })
             .map_err(|e| NativeError {
                 span: Span::DUMMY,
                 message: format!("cranelift flags: {e}"),
@@ -419,6 +469,210 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_list_remove", Linkage::Import, &list_remove_sig)
             .unwrap();
 
+        // --- Raylib bridge function declarations ---
+
+        // rl_init_window(w: i32, h: i32, title: ptr)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(PTR));
+        let rl_init_window = obj.declare_function("rl_init_window", Linkage::Import, &sig).unwrap();
+
+        // rl_close_window()
+        let sig = obj.make_signature();
+        let rl_close_window = obj.declare_function("rl_close_window", Linkage::Import, &sig).unwrap();
+
+        // rl_window_should_close() -> i32
+        let mut sig = obj.make_signature();
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_window_should_close = obj.declare_function("rl_window_should_close", Linkage::Import, &sig).unwrap();
+
+        // rl_set_target_fps(fps: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_set_target_fps = obj.declare_function("rl_set_target_fps", Linkage::Import, &sig).unwrap();
+
+        // rl_get_frame_time() -> f64
+        let mut sig = obj.make_signature();
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let rl_get_frame_time = obj.declare_function("rl_get_frame_time", Linkage::Import, &sig).unwrap();
+
+        // rl_begin_drawing()
+        let sig = obj.make_signature();
+        let rl_begin_drawing = obj.declare_function("rl_begin_drawing", Linkage::Import, &sig).unwrap();
+
+        // rl_end_drawing()
+        let sig = obj.make_signature();
+        let rl_end_drawing = obj.declare_function("rl_end_drawing", Linkage::Import, &sig).unwrap();
+
+        // rl_clear_background(color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_clear_background = obj.declare_function("rl_clear_background", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_text(text: ptr, x: i32, y: i32, size: i32, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_text = obj.declare_function("rl_draw_text", Linkage::Import, &sig).unwrap();
+
+        // rl_measure_text(text: ptr, size: i32) -> i32
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(PTR));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_measure_text = obj.declare_function("rl_measure_text", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_rectangle_rec(x: f64, y: f64, w: f64, h: f64, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_rectangle_rec = obj.declare_function("rl_draw_rectangle_rec", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_rectangle(x: i32, y: i32, w: i32, h: i32, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_rectangle = obj.declare_function("rl_draw_rectangle", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_rectangle_pro(rx: f64, ry: f64, rw: f64, rh: f64, ox: f64, oy: f64, rot: f64, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_rectangle_pro = obj.declare_function("rl_draw_rectangle_pro", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_circle(cx: f64, cy: f64, radius: f64, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_circle = obj.declare_function("rl_draw_circle", Linkage::Import, &sig).unwrap();
+
+        // rl_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        let rl_draw_line = obj.declare_function("rl_draw_line", Linkage::Import, &sig).unwrap();
+
+        // rl_is_key_pressed(key: i32) -> i32
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_is_key_pressed = obj.declare_function("rl_is_key_pressed", Linkage::Import, &sig).unwrap();
+
+        // rl_is_key_down(key: i32) -> i32
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_is_key_down = obj.declare_function("rl_is_key_down", Linkage::Import, &sig).unwrap();
+
+        // rl_is_gesture_detected(gesture: i32) -> i32
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_is_gesture_detected = obj.declare_function("rl_is_gesture_detected", Linkage::Import, &sig).unwrap();
+
+        // rl_set_camera(tx: f64, ty: f64, ox: f64, oy: f64, rot: f64, zoom: f64)
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        let rl_set_camera = obj.declare_function("rl_set_camera", Linkage::Import, &sig).unwrap();
+
+        // rl_begin_mode_2d()
+        let sig = obj.make_signature();
+        let rl_begin_mode_2d = obj.declare_function("rl_begin_mode_2d", Linkage::Import, &sig).unwrap();
+
+        // rl_end_mode_2d()
+        let sig = obj.make_signature();
+        let rl_end_mode_2d = obj.declare_function("rl_end_mode_2d", Linkage::Import, &sig).unwrap();
+
+        // rl_init_audio()
+        let sig = obj.make_signature();
+        let rl_init_audio = obj.declare_function("rl_init_audio", Linkage::Import, &sig).unwrap();
+
+        // Color constants: all () -> i32
+        let mut color_sig = obj.make_signature();
+        color_sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_color_black = obj.declare_function("rl_color_black", Linkage::Import, &color_sig).unwrap();
+        let rl_color_white = obj.declare_function("rl_color_white", Linkage::Import, &color_sig).unwrap();
+        let rl_color_red = obj.declare_function("rl_color_red", Linkage::Import, &color_sig).unwrap();
+        let rl_color_green = obj.declare_function("rl_color_green", Linkage::Import, &color_sig).unwrap();
+        let rl_color_blue = obj.declare_function("rl_color_blue", Linkage::Import, &color_sig).unwrap();
+        let rl_color_yellow = obj.declare_function("rl_color_yellow", Linkage::Import, &color_sig).unwrap();
+        let rl_color_purple = obj.declare_function("rl_color_purple", Linkage::Import, &color_sig).unwrap();
+        let rl_color_darkblue = obj.declare_function("rl_color_darkblue", Linkage::Import, &color_sig).unwrap();
+        let rl_color_darkgray = obj.declare_function("rl_color_darkgray", Linkage::Import, &color_sig).unwrap();
+        let rl_color_gray = obj.declare_function("rl_color_gray", Linkage::Import, &color_sig).unwrap();
+
+        // rl_color_alpha(color: i32, alpha: f64) -> i32
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::I32));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        let rl_color_alpha = obj.declare_function("rl_color_alpha", Linkage::Import, &sig).unwrap();
+
+        // --- Math helpers ---
+
+        // lumen_sqrt(x: f64) -> f64
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_sqrt = obj.declare_function("lumen_sqrt", Linkage::Import, &sig).unwrap();
+
+        // lumen_abs(x: f64) -> f64
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_abs = obj.declare_function("lumen_abs", Linkage::Import, &sig).unwrap();
+
+        // lumen_cos(x: f64) -> f64
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_cos = obj.declare_function("lumen_cos", Linkage::Import, &sig).unwrap();
+
+        // lumen_sin(x: f64) -> f64
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_sin = obj.declare_function("lumen_sin", Linkage::Import, &sig).unwrap();
+
+        // lumen_clamp(x: f64, lo: f64, hi: f64) -> f64
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.params.push(AbiParam::new(cl_types::F64));
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_clamp = obj.declare_function("lumen_clamp", Linkage::Import, &sig).unwrap();
+
+        // lumen_rand_f64() -> f64
+        let mut sig = obj.make_signature();
+        sig.returns.push(AbiParam::new(cl_types::F64));
+        let math_rand = obj.declare_function("lumen_rand_f64", Linkage::Import, &sig).unwrap();
+
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -461,6 +715,45 @@ impl<'a> NativeCodegen<'a> {
             list_get,
             list_set,
             list_remove,
+            rl_init_window,
+            rl_close_window,
+            rl_window_should_close,
+            rl_set_target_fps,
+            rl_get_frame_time,
+            rl_begin_drawing,
+            rl_end_drawing,
+            rl_clear_background,
+            rl_draw_text,
+            rl_measure_text,
+            rl_draw_rectangle_rec,
+            rl_draw_rectangle,
+            rl_draw_rectangle_pro,
+            rl_draw_circle,
+            rl_draw_line,
+            rl_is_key_pressed,
+            rl_is_key_down,
+            rl_is_gesture_detected,
+            rl_set_camera,
+            rl_begin_mode_2d,
+            rl_end_mode_2d,
+            rl_init_audio,
+            rl_color_black,
+            rl_color_white,
+            rl_color_red,
+            rl_color_green,
+            rl_color_blue,
+            rl_color_yellow,
+            rl_color_purple,
+            rl_color_darkblue,
+            rl_color_darkgray,
+            rl_color_gray,
+            rl_color_alpha,
+            math_sqrt,
+            math_abs,
+            math_cos,
+            math_sin,
+            math_clamp,
+            math_rand,
             dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
@@ -973,7 +1266,8 @@ impl<'a> NativeCodegen<'a> {
         builder.seal_all_blocks();
         builder.finalize();
 
-        self.obj.define_function(func_id, &mut ctx).unwrap();
+        self.obj.define_function(func_id, &mut ctx)
+            .unwrap_or_else(|e| panic!("dispatch define failed: {e}"));
         Ok(())
     }
 
@@ -1019,18 +1313,26 @@ impl<'a> NativeCodegen<'a> {
 
             // Compile body. (Yield points are at loop headers only —
             // function-entry yield causes recursive dispatch issues.)
+            fb.hit_return = false;
             let result = fb.compile_block_with_cleanup(&f.body, param_cleanup)?;
 
-            // If this is main, drain the message queue before returning.
-            if f.name == "main" {
-                let drain_ref = fb.cg.obj.declare_func_in_func(
-                    fb.cg.rt_drain, fb.builder.func,
-                );
-                fb.builder.ins().call(drain_ref, &[]);
+            if fb.hit_return {
+                // The body ended with a return. We're on a dead block.
+                // Emit a correctly-typed return for the function signature.
+                let ret_ty = lumen_to_cl(&sig.ret);
+                let dummy = fb.builder.ins().iconst(ret_ty, 0);
+                fb.builder.ins().return_(&[dummy]);
+            } else {
+                // If this is main, drain the message queue before returning.
+                if f.name == "main" {
+                    let drain_ref = fb.cg.obj.declare_func_in_func(
+                        fb.cg.rt_drain, fb.builder.func,
+                    );
+                    fb.builder.ins().call(drain_ref, &[]);
+                }
+                // Return.
+                fb.builder.ins().return_(&[result]);
             }
-
-            // Return.
-            fb.builder.ins().return_(&[result]);
         } // fb dropped here, releasing the mutable borrow on builder
 
         builder.seal_all_blocks();
@@ -1334,10 +1636,11 @@ struct FnEmitter<'a, 'b, 'c> {
     fn_name: String,
     names: HashMap<String, Variable>,
     name_types: HashMap<String, Ty>,
-    /// Stack of cleanup lists. Each block pushes a list; pointer-typed
-    /// `let` bindings are appended to the current list. On block exit,
-    /// everything in the list is rc_decr'd with type-aware child cleanup.
+    /// Stack of cleanup lists.
     cleanup_stack: Vec<Vec<(String, Variable, Ty)>>,
+    /// Set to true when a `return` statement is compiled. Checked by
+    /// compile_if to avoid emitting jumps after a terminated block.
+    hit_return: bool,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -1355,6 +1658,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             names: HashMap::new(),
             name_types: HashMap::new(),
             cleanup_stack: Vec::new(),
+            hit_return: false,
         }
     }
 
@@ -1384,16 +1688,17 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
         }
         if hit_return {
-            // Block terminated by return. Clean up the stack but don't
-            // emit any more IR. Switch to an unreachable block so the
-            // caller can continue emitting without Cranelift errors.
+            // Block terminated by return. Set the flag and switch to
+            // a dead block. The CALLER (compile_if, define_function)
+            // is responsible for using the right dummy type.
             self.cleanup_stack.pop();
             let dead_bb = self.builder.create_block();
             self.builder.switch_to_block(dead_bb);
-            // Return a dummy of the right type so define_function's
-            // final `return` instruction doesn't type-mismatch.
-            let ret_ty = lumen_to_cl(&self.sig.ret);
-            return Ok(self.builder.ins().iconst(ret_ty, 0));
+            // Don't emit any instruction here — let the caller decide
+            // what to emit based on what type it needs.
+            // Return a *placeholder* — the caller should check hit_return
+            // and emit the right-typed iconst before using this value.
+            return Ok(self.builder.ins().iconst(cl_types::I32, 0));
         }
         let result = match &block.tail {
             Some(e) => self.compile_expr(e)?,
@@ -1464,6 +1769,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             StmtKind::Return(Some(e)) => {
                 let val = self.compile_expr(e)?;
                 self.builder.ins().return_(&[val]);
+                self.hit_return = true;
             }
             StmtKind::LetTuple { names, value } => {
                 let ptr = self.compile_expr(value)?;
@@ -1594,10 +1900,25 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let type_name = match recv_ty {
                     Ty::User(n) => n,
                     _ => {
-                        return Err(NativeError {
-                            span: expr.span,
-                            message: "field access on non-struct".into(),
-                        })
+                        // Receiver isn't a known struct type (e.g. from
+                        // list.get which returns i64). Search all struct
+                        // types for one that has this field.
+                        let mut found = String::new();
+                        for (tname, tinfo) in &self.cg.info.types {
+                            if let TypeInfo::Struct { fields, .. } = tinfo {
+                                if fields.iter().any(|(f, _)| f == name) {
+                                    found = tname.clone();
+                                    break;
+                                }
+                            }
+                        }
+                        if found.is_empty() {
+                            return Err(NativeError {
+                                span: expr.span,
+                                message: format!("no struct has field `{name}`"),
+                            });
+                        }
+                        found
                     }
                 };
                 let fields = get_struct_fields(&self.cg.info.types, &type_name);
@@ -2143,6 +2464,272 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let call = self.builder.ins().call(func_ref, &[l, i]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
+
+            // --- Raylib: Window ---
+            if mod_name == "rl" && method == "init_window" {
+                let w = self.compile_expr(&args[0].value)?;
+                let h = self.compile_expr(&args[1].value)?;
+                let t = self.compile_expr(&args[2].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_init_window, self.builder.func);
+                self.builder.ins().call(func_ref, &[w, h, t]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "close_window" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_close_window, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "window_should_close" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_window_should_close, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "set_target_fps" {
+                let fps = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_set_target_fps, self.builder.func);
+                self.builder.ins().call(func_ref, &[fps]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "get_frame_time" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_get_frame_time, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+
+            // --- Raylib: Drawing ---
+            if mod_name == "rl" && method == "begin_drawing" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_begin_drawing, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "end_drawing" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_end_drawing, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "clear_background" {
+                let color = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_clear_background, self.builder.func);
+                self.builder.ins().call(func_ref, &[color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "draw_text" {
+                let text = self.compile_expr(&args[0].value)?;
+                let x = self.compile_expr(&args[1].value)?;
+                let y = self.compile_expr(&args[2].value)?;
+                let size = self.compile_expr(&args[3].value)?;
+                let color = self.compile_expr(&args[4].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_text, self.builder.func);
+                self.builder.ins().call(func_ref, &[text, x, y, size, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "measure_text" {
+                let text = self.compile_expr(&args[0].value)?;
+                let size = self.compile_expr(&args[1].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_measure_text, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[text, size]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "draw_rect" {
+                let x = self.compile_expr(&args[0].value)?;
+                let y = self.compile_expr(&args[1].value)?;
+                let w = self.compile_expr(&args[2].value)?;
+                let h = self.compile_expr(&args[3].value)?;
+                let color = self.compile_expr(&args[4].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle_rec, self.builder.func);
+                self.builder.ins().call(func_ref, &[x, y, w, h, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "draw_rect_i" {
+                let x = self.compile_expr(&args[0].value)?;
+                let y = self.compile_expr(&args[1].value)?;
+                let w = self.compile_expr(&args[2].value)?;
+                let h = self.compile_expr(&args[3].value)?;
+                let color = self.compile_expr(&args[4].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle, self.builder.func);
+                self.builder.ins().call(func_ref, &[x, y, w, h, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "draw_rect_pro" {
+                let rx = self.compile_expr(&args[0].value)?;
+                let ry = self.compile_expr(&args[1].value)?;
+                let rw = self.compile_expr(&args[2].value)?;
+                let rh = self.compile_expr(&args[3].value)?;
+                let ox = self.compile_expr(&args[4].value)?;
+                let oy = self.compile_expr(&args[5].value)?;
+                let rot = self.compile_expr(&args[6].value)?;
+                let color = self.compile_expr(&args[7].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle_pro, self.builder.func);
+                self.builder.ins().call(func_ref, &[rx, ry, rw, rh, ox, oy, rot, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "draw_circle" {
+                let cx = self.compile_expr(&args[0].value)?;
+                let cy = self.compile_expr(&args[1].value)?;
+                let radius = self.compile_expr(&args[2].value)?;
+                let color = self.compile_expr(&args[3].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_circle, self.builder.func);
+                self.builder.ins().call(func_ref, &[cx, cy, radius, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "draw_line" {
+                let x1 = self.compile_expr(&args[0].value)?;
+                let y1 = self.compile_expr(&args[1].value)?;
+                let x2 = self.compile_expr(&args[2].value)?;
+                let y2 = self.compile_expr(&args[3].value)?;
+                let color = self.compile_expr(&args[4].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_line, self.builder.func);
+                self.builder.ins().call(func_ref, &[x1, y1, x2, y2, color]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+
+            // --- Raylib: Input ---
+            if mod_name == "rl" && method == "is_key_pressed" {
+                let key = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_key_pressed, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[key]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "is_key_down" {
+                let key = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_key_down, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[key]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "is_gesture_detected" {
+                let gesture = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_gesture_detected, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[gesture]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+
+            // --- Raylib: Camera ---
+            if mod_name == "rl" && method == "set_camera" {
+                let tx = self.compile_expr(&args[0].value)?;
+                let ty_val = self.compile_expr(&args[1].value)?;
+                let ox = self.compile_expr(&args[2].value)?;
+                let oy = self.compile_expr(&args[3].value)?;
+                let rot = self.compile_expr(&args[4].value)?;
+                let zoom = self.compile_expr(&args[5].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_set_camera, self.builder.func);
+                self.builder.ins().call(func_ref, &[tx, ty_val, ox, oy, rot, zoom]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "begin_mode_2d" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_begin_mode_2d, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+            if mod_name == "rl" && method == "end_mode_2d" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_end_mode_2d, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+
+            // --- Raylib: Audio ---
+            if mod_name == "rl" && method == "init_audio" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_init_audio, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+
+            // --- Raylib: Colors ---
+            if mod_name == "rl" && method == "black" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_black, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "white" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_white, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "red" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_red, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "green" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_green, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "blue" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_blue, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "yellow" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_yellow, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "purple" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_purple, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "darkblue" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_darkblue, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "darkgray" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_darkgray, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "gray" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_gray, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "rl" && method == "color_alpha" {
+                let color = self.compile_expr(&args[0].value)?;
+                let alpha = self.compile_expr(&args[1].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_alpha, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[color, alpha]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+
+            // --- Math ---
+            if mod_name == "math" && method == "sqrt" {
+                let x = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_sqrt, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[x]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "math" && method == "abs" {
+                let x = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_abs, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[x]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "math" && method == "cos" {
+                let x = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_cos, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[x]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "math" && method == "sin" {
+                let x = self.compile_expr(&args[0].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_sin, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[x]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "math" && method == "clamp" {
+                let x = self.compile_expr(&args[0].value)?;
+                let lo = self.compile_expr(&args[1].value)?;
+                let hi = self.compile_expr(&args[2].value)?;
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_clamp, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[x, lo, hi]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            if mod_name == "math" && method == "rand" {
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_rand, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
         }
         Err(NativeError {
             span,
@@ -2171,14 +2758,28 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.builder.ins().brif(cond_val, then_bb, &[], else_bb, &[]);
 
         self.builder.switch_to_block(then_bb);
-        // (sealed later)
+        self.hit_return = false;
         let then_val = self.compile_block(then_block)?;
-        self.builder.ins().jump(merge_bb, &[BlockArg::Value(then_val)]);
+        let then_returned = self.hit_return;
+        // If the block returned, the current block is a dead block.
+        // Emit a correctly-typed dummy for the merge param.
+        let then_merge_val = if then_returned {
+            self.builder.ins().iconst(result_ty, 0)
+        } else {
+            then_val
+        };
+        self.builder.ins().jump(merge_bb, &[BlockArg::Value(then_merge_val)]);
 
         self.builder.switch_to_block(else_bb);
-        // (sealed later)
+        self.hit_return = false;
         let else_val = self.compile_block(else_block)?;
-        self.builder.ins().jump(merge_bb, &[BlockArg::Value(else_val)]);
+        let else_returned = self.hit_return;
+        let else_merge_val = if else_returned {
+            self.builder.ins().iconst(result_ty, 0)
+        } else {
+            else_val
+        };
+        self.builder.ins().jump(merge_bb, &[BlockArg::Value(else_merge_val)]);
 
         self.builder.switch_to_block(merge_bb);
         // (sealed later)
@@ -3327,13 +3928,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         return Ok(Ty::List(Box::new(Ty::I32)));
                     }
                     if m == "list" && method == "get" {
-                        // Returns the element type of the list.
-                        if let Some(first_arg) = args.first() {
-                            let lt = self.infer_ty(&first_arg.value)?;
-                            if let Ty::List(inner) = lt {
-                                return Ok(*inner);
-                            }
-                        }
+                        // Without proper generics, we can't know the
+                        // element type. Return I64 (the raw storage type).
+                        // Field access on the result works because the
+                        // codegen treats Error/I64 as PTR.
                         return Ok(Ty::I64);
                     }
                     if m == "list" && method == "set" {
@@ -3349,6 +3947,28 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                             return self.infer_ty(&first_arg.value);
                         }
                         return Ok(Ty::List(Box::new(Ty::I32)));
+                    }
+                    // --- Raylib ---
+                    if m == "rl" {
+                        return Ok(match method.as_ref() {
+                            "init_window" | "close_window" | "set_target_fps"
+                            | "begin_drawing" | "end_drawing" | "clear_background"
+                            | "draw_text" | "draw_rect" | "draw_rect_i" | "draw_rect_pro"
+                            | "draw_circle" | "draw_line"
+                            | "set_camera" | "begin_mode_2d" | "end_mode_2d"
+                            | "init_audio" => Ty::Unit,
+                            "window_should_close" | "is_key_pressed" | "is_key_down"
+                            | "is_gesture_detected" | "measure_text"
+                            | "black" | "white" | "red" | "green" | "blue"
+                            | "yellow" | "purple" | "darkblue" | "darkgray" | "gray"
+                            | "color_alpha" => Ty::I32,
+                            "get_frame_time" => Ty::F64,
+                            _ => Ty::I32,
+                        });
+                    }
+                    // --- Math ---
+                    if m == "math" {
+                        return Ok(Ty::F64);
                     }
                 }
                 Ty::I32

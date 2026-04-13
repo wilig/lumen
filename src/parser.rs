@@ -746,9 +746,15 @@ impl Parser {
         self.expect(&TokenKind::If, "`if`")?;
         let cond = self.parse_expr(ExprCtx::no_struct())?;
         let then_block = self.parse_block()?;
-        self.expect(&TokenKind::Else, "`else` branch is required")?;
-        let else_block = self.parse_block()?;
-        let span = merge(start, else_block.span);
+        // else is optional: `if cond { ... }` without else has unit type.
+        let (else_block, end_span) = if self.eat(&TokenKind::Else).is_some() {
+            let eb = self.parse_block()?;
+            let sp = eb.span;
+            (eb, sp)
+        } else {
+            (Block { stmts: Vec::new(), tail: None, span: then_block.span }, then_block.span)
+        };
+        let span = merge(start, end_span);
         Ok(Expr {
             kind: ExprKind::If {
                 cond: Box::new(cond),
@@ -1536,9 +1542,10 @@ mod tests {
     }
 
     #[test]
-    fn if_expression_requires_else() {
-        let err = parse_err("fn f(): i32 { if true { 1 } }");
-        assert!(err.message.contains("else"));
+    fn if_without_else_parses_as_unit() {
+        // else is now optional — if without else produces unit.
+        let m = parse_ok("fn f(): unit { if true { let x = 1 } }");
+        assert_eq!(m.items.len(), 1);
     }
 
     #[test]

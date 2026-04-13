@@ -69,6 +69,8 @@ fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
     let rt_src = rt_dir.join("rt.c");
     let rt_obj = format!("{stem}_rt.o");
     let mut link_args = vec![obj_path.clone(), "-o".to_string(), exe_path.clone(), "-lc".to_string()];
+
+    // Compile the main runtime.
     if rt_src.exists() {
         let cc_status = std::process::Command::new("cc")
             .args(["-c", "-O2", rt_src.to_str().unwrap(), "-o", &rt_obj])
@@ -80,12 +82,34 @@ fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
         link_args.insert(1, rt_obj.clone());
     }
 
+    // Compile the raylib bridge if present.
+    let rl_bridge_src = rt_dir.join("raylib_bridge.c");
+    let rl_bridge_obj = format!("{stem}_rl.o");
+    if rl_bridge_src.exists() {
+        let cc_status = std::process::Command::new("cc")
+            .args(["-c", "-O2", rl_bridge_src.to_str().unwrap(), "-o", &rl_bridge_obj])
+            .status()
+            .map_err(|e| format!("failed to compile raylib bridge: {e}"))?;
+        if cc_status.success() {
+            link_args.insert(2, rl_bridge_obj.clone());
+            // Add raylib link flags.
+            for flag in [
+                "-L/usr/lib/odin/vendor/raylib/linux",
+                "-Wl,-rpath,/usr/lib/odin/vendor/raylib/linux",
+                "-lraylib", "-lm", "-lGL", "-ldl", "-lpthread",
+            ] {
+                link_args.push(flag.to_string());
+            }
+        }
+    }
+
     let status = std::process::Command::new("cc")
         .args(&link_args)
         .status()
         .map_err(|e| format!("failed to run cc: {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
     let _ = std::fs::remove_file(&rt_obj);
+    let _ = std::fs::remove_file(&rl_bridge_obj);
     if !status.success() {
         return Err(format!("linker failed with {status}"));
     }
