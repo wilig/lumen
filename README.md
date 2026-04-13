@@ -1,8 +1,8 @@
 # Lumen
 
-A statically-typed, AI-first programming language compiling to WebAssembly. Targets Wasmtime.
+A statically-typed, AI-first programming language compiling to native code via Cranelift.
 
-**Status:** planning / pre-implementation.
+**Status:** working compiler — examples include a breakout clone, concurrent web server, actors, and pattern matching.
 
 See:
 - [`docs/design.md`](docs/design.md) — design rationale and decisions

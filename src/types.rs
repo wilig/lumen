@@ -133,6 +133,8 @@ pub struct ModuleInfo {
     pub fns: HashMap<String, FnSig>,
     /// Actor types: actor_name → list of message handler signatures.
     pub actors: HashMap<String, Vec<MsgSig>>,
+    /// Imported module paths: e.g. ["std/io", "std/raylib"].
+    pub imports: Vec<String>,
 }
 
 /// Signature of an actor message handler.
@@ -187,6 +189,7 @@ pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
         types: HashMap::new(),
         fns: HashMap::new(),
         actors: HashMap::new(),
+        imports: module.imports.iter().map(|i| i.path.join("/")).collect(),
     };
 
     // Pass 1: register all type decl names so the next pass can resolve
@@ -1677,6 +1680,13 @@ impl<'a> FnChecker<'a> {
                 Some(Ty::Bytes)
             }
             // --- Raylib: Window ---
+            ("rl", _) if !self.module.imports.iter().any(|i| i == "std/raylib") => {
+                self.errors.push(TypeError {
+                    span,
+                    message: format!("`rl.{method}` requires `import std/raylib`"),
+                });
+                None
+            }
             ("rl", "init_window") => {
                 if args.len() != 3 {
                     self.errors.push(TypeError { span, message: format!("`rl.init_window` expects 3 arguments, found {}", args.len()) });

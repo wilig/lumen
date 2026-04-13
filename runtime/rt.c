@@ -1,6 +1,10 @@
 // Lumen actor runtime: single-threaded event loop with message queue.
 // Compiled to rt.o and linked with Lumen programs.
 
+#ifdef __APPLE__
+#define _XOPEN_SOURCE 600
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +14,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ucontext.h>
+#ifdef __linux__
 #include <sys/epoll.h>
+#endif
+#ifdef __APPLE__
+#include <sys/event.h>
+#endif
 #include <fcntl.h>
 #include <errno.h>
 
@@ -377,11 +386,15 @@ static GreenThread gt_pool[GT_MAX];
 static int gt_count = 0;
 static int gt_current = -1;
 static ucontext_t gt_sched_ctx;
-static int gt_epoll_fd = -1;
+static int gt_event_fd = -1;
 
 static void gt_init(void) {
-    if (gt_epoll_fd < 0) {
-        gt_epoll_fd = epoll_create1(0);
+    if (gt_event_fd < 0) {
+#ifdef __linux__
+        gt_event_fd = epoll_create1(0);
+#elif defined(__APPLE__)
+        gt_event_fd = kqueue();
+#endif
         for (int i = 0; i < GT_MAX; i++) gt_pool[i].state = GT_FREE;
     }
 }
@@ -425,16 +438,34 @@ static void gt_spawn(void (*fn)(int), int arg) {
     if (id >= gt_count) gt_count = id + 1;
 }
 
+// Portable event flag constants for callsites below.
+#ifdef __linux__
+#define GT_EV_READ  EPOLLIN
+#define GT_EV_WRITE EPOLLOUT
+#else
+#define GT_EV_READ  0x001
+#define GT_EV_WRITE 0x004
+#endif
+
 // Block current green thread until fd is ready.
 static void gt_wait_fd(int fd, int events) {
     if (gt_current < 0) return;
+#ifdef __linux__
     struct epoll_event ev = { .events = events | EPOLLONESHOT,
                               .data.fd = gt_current };
-    epoll_ctl(gt_epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    epoll_ctl(gt_event_fd, EPOLL_CTL_ADD, fd, &ev);
+#elif defined(__APPLE__)
+    int16_t filter = (events & GT_EV_WRITE) ? EVFILT_WRITE : EVFILT_READ;
+    struct kevent kev;
+    EV_SET(&kev, fd, filter, EV_ADD | EV_ONESHOT, 0, 0, (void *)(uintptr_t)gt_current);
+    kevent(gt_event_fd, &kev, 1, NULL, 0, NULL);
+#endif
     gt_pool[gt_current].state = GT_BLOCKED;
     gt_pool[gt_current].wait_fd = fd;
     swapcontext(&gt_pool[gt_current].ctx, &gt_sched_ctx);
-    epoll_ctl(gt_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+#ifdef __linux__
+    epoll_ctl(gt_event_fd, EPOLL_CTL_DEL, fd, NULL);
+#endif
 }
 
 static void gt_schedule(void) {
@@ -456,13 +487,24 @@ static void gt_schedule(void) {
             if (gt_pool[i].state == GT_BLOCKED) alive++;
         if (alive == 0) break;
 
+#ifdef __linux__
         struct epoll_event events[64];
-        int n = epoll_wait(gt_epoll_fd, events, 64, 100);
+        int n = epoll_wait(gt_event_fd, events, 64, 100);
         for (int i = 0; i < n; i++) {
             int tid = events[i].data.fd;
             if (tid >= 0 && tid < gt_count && gt_pool[tid].state == GT_BLOCKED)
                 gt_pool[tid].state = GT_RUNNABLE;
         }
+#elif defined(__APPLE__)
+        struct kevent events[64];
+        struct timespec timeout = { .tv_sec = 0, .tv_nsec = 100000000 };
+        int n = kevent(gt_event_fd, NULL, 0, events, 64, &timeout);
+        for (int i = 0; i < n; i++) {
+            int tid = (int)(uintptr_t)events[i].udata;
+            if (tid >= 0 && tid < gt_count && gt_pool[tid].state == GT_BLOCKED)
+                gt_pool[tid].state = GT_RUNNABLE;
+        }
+#endif
     }
 }
 
@@ -481,7 +523,7 @@ static void gt_accept_loop(int server_fd) {
         int client = accept(server_fd, NULL, NULL);
         if (client < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                gt_wait_fd(server_fd, EPOLLIN);
+                gt_wait_fd(server_fd, GT_EV_READ);
                 continue;
             }
             break;
@@ -499,7 +541,7 @@ void lumen_net_serve(int port, void (*handler)(int)) {
         fprintf(stderr, "net.serve: failed to listen on port %d\n", port);
         return;
     }
-    fprintf(stderr, "Listening on :%d (green threads + epoll)\n", port);
+    fprintf(stderr, "Listening on :%d (green threads)\n", port);
     gt_spawn(gt_accept_loop, server_fd);
     gt_schedule();
 }
@@ -515,7 +557,7 @@ int64_t lumen_gt_read(int fd, int max) {
             return (int64_t)(uintptr_t)buf;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            gt_wait_fd(fd, EPOLLIN);
+            gt_wait_fd(fd, GT_EV_READ);
             continue;
         }
         *(int32_t *)buf = 0;
@@ -533,7 +575,7 @@ int32_t lumen_gt_write(int fd, int64_t bytes_ptr) {
         if (n >= 0) {
             written += n;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            gt_wait_fd(fd, EPOLLOUT);
+            gt_wait_fd(fd, GT_EV_WRITE);
         } else {
             break;
         }

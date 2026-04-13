@@ -172,6 +172,12 @@ impl<'a> NativeCodegen<'a> {
                 // Disable the verifier — it panics on valid but complex
                 // IR patterns (nested if-without-else with return).
                 b.set("enable_verifier", "false").ok();
+                // AArch64 (macOS) requires PIC; cranelift-object only handles
+                // GOT-based aarch64 relocations, not direct ADRP ones.
+                if cfg!(target_arch = "aarch64") {
+                    b.set("is_pic", "true").ok();
+                    b.set("use_colocated_libcalls", "false").ok();
+                }
                 settings::Flags::new(b)
             })
             .map_err(|e| NativeError {

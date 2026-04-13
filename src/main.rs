@@ -3,7 +3,6 @@
 //! Usage:
 //!   lumen build <path.lm>    # compile to a native executable
 //!   lumen run   <path.lm>    # compile and run
-//!   lumen build --wasm <path.lm>  # compile to .wasm (legacy)
 
 use std::process::ExitCode;
 
@@ -12,7 +11,6 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match argv.as_slice() {
-        [_, "build", "--wasm", path] => cmd_build_wasm(path),
         [_, "build", path] => cmd_build_native(path),
         [_, "run", path] => cmd_run(path),
         [_, "--version"] | [_, "-V"] => {
@@ -21,14 +19,14 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage:\n  lumen build <path.lm>          # native executable\n  lumen build --wasm <path.lm>   # WebAssembly\n  lumen run   <path.lm>          # compile + run\n  lumen --version"
+                "usage:\n  lumen build <path.lm>   # native executable\n  lumen run   <path.lm>   # compile + run\n  lumen --version"
             );
             ExitCode::from(1)
         }
     }
 }
 
-fn compile_wasm(path: &str) -> Result<Vec<u8>, String> {
+fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let tokens = lumen::lexer::lex(&src).map_err(|e| format!("lex error: {e}"))?;
     let module = lumen::parser::parse(tokens).map_err(|e| format!("parse error: {e}"))?;
@@ -38,28 +36,14 @@ fn compile_wasm(path: &str) -> Result<Vec<u8>, String> {
             .collect::<Vec<_>>()
             .join("\n")
     })?;
-    let wasm =
-        lumen::codegen::compile(&module, &info).map_err(|e| format!("codegen error: {e}"))?;
-    Ok(wasm)
-}
-
-fn compile_to_object(path: &str) -> Result<(Vec<u8>, String), String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let tokens = lumen::lexer::lex(&src).map_err(|e| format!("lex error: {e}"))?;
-    let module = lumen::parser::parse(tokens).map_err(|e| format!("parse error: {e}"))?;
-    let info = lumen::types::typecheck(&module).map_err(|errs| {
-        errs.iter()
-            .map(|e| format!("type error: {e}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let imports = info.imports.clone();
     let obj = lumen::native::compile_native(&module, &info)
         .map_err(|e| format!("native codegen error: {e}"))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
-    Ok((obj, stem.to_string()))
+    Ok((obj, stem.to_string(), imports))
 }
 
-fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
+fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, String> {
     let obj_path = format!("{stem}.o");
     let exe_path = stem.to_string();
     std::fs::write(&obj_path, obj_bytes).map_err(|e| format!("write {obj_path}: {e}"))?;
@@ -82,23 +66,48 @@ fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
         link_args.insert(1, rt_obj.clone());
     }
 
-    // Compile the raylib bridge if present.
+    // Compile and link the raylib bridge only when the source imports std/raylib.
     let rl_bridge_src = rt_dir.join("raylib_bridge.c");
     let rl_bridge_obj = format!("{stem}_rl.o");
-    if rl_bridge_src.exists() {
+    let uses_raylib = imports.iter().any(|i| i == "std/raylib");
+    if uses_raylib && rl_bridge_src.exists() {
         let cc_status = std::process::Command::new("cc")
             .args(["-c", "-O2", rl_bridge_src.to_str().unwrap(), "-o", &rl_bridge_obj])
             .status()
             .map_err(|e| format!("failed to compile raylib bridge: {e}"))?;
         if cc_status.success() {
             link_args.insert(2, rl_bridge_obj.clone());
-            // Add raylib link flags.
+            // Add raylib link flags (platform-specific).
+            #[cfg(target_os = "linux")]
             for flag in [
                 "-L/usr/lib/odin/vendor/raylib/linux",
                 "-Wl,-rpath,/usr/lib/odin/vendor/raylib/linux",
                 "-lraylib", "-lm", "-lGL", "-ldl", "-lpthread",
             ] {
                 link_args.push(flag.to_string());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // Check for homebrew raylib.
+                if let Ok(out) = std::process::Command::new("brew")
+                    .args(["--prefix", "raylib"])
+                    .output()
+                {
+                    if out.status.success() {
+                        let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        link_args.push(format!("-L{prefix}/lib"));
+                        link_args.push(format!("-I{prefix}/include"));
+                    }
+                }
+                for flag in [
+                    "-lraylib", "-lm",
+                    "-framework", "OpenGL",
+                    "-framework", "Cocoa",
+                    "-framework", "IOKit",
+                    "-framework", "CoreVideo",
+                ] {
+                    link_args.push(flag.to_string());
+                }
             }
         }
     }
@@ -116,27 +125,9 @@ fn link(obj_bytes: &[u8], stem: &str) -> Result<String, String> {
     Ok(exe_path)
 }
 
-fn cmd_build_wasm(path: &str) -> ExitCode {
-    match compile_wasm(path) {
-        Ok(wasm) => {
-            let out = path.replace(".lm", ".wasm");
-            if let Err(e) = std::fs::write(&out, &wasm) {
-                eprintln!("error writing {out}: {e}");
-                return ExitCode::from(2);
-            }
-            eprintln!("wrote {out} ({} bytes)", wasm.len());
-            ExitCode::SUCCESS
-        }
-        Err(msg) => {
-            eprintln!("{msg}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 fn cmd_build_native(path: &str) -> ExitCode {
     match compile_to_object(path) {
-        Ok((obj, stem)) => match link(&obj, &stem) {
+        Ok((obj, stem, imports)) => match link(&obj, &stem, &imports) {
             Ok(exe) => {
                 eprintln!("wrote {exe}");
                 ExitCode::SUCCESS
@@ -154,14 +145,14 @@ fn cmd_build_native(path: &str) -> ExitCode {
 }
 
 fn cmd_run(path: &str) -> ExitCode {
-    let (obj, stem) = match compile_to_object(path) {
+    let (obj, stem, imports) = match compile_to_object(path) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::from(1);
         }
     };
-    let exe = match link(&obj, &stem) {
+    let exe = match link(&obj, &stem, &imports) {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{msg}");
