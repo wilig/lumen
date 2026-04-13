@@ -356,8 +356,9 @@ fn main(): i32 {
         // --- GAME screen ---
         if screen == 2 {
             if rl.is_key_pressed(KEY_P()) == 1 {
-                if active == 1 { active = 0 }
-                if active == 0 { active = 1 }
+                let was = active
+                if was == 1 { active = 0 }
+                if was == 0 { active = 1 }
             }
 
             if active == 1 {

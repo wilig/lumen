@@ -1744,7 +1744,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
             }
             StmtKind::Assign { name, value } => {
-                // RC: decrement the old value before overwriting (typed).
+                // Compile the new value FIRST, before decrementing the old.
+                // This prevents use-after-free when the RHS references the
+                // variable being assigned to (e.g. `x = update(x)`).
+                let val = self.compile_expr(value)?;
+                // RC: if the RHS is a reference copy (variable read, field
+                // access), rc_incr because we're creating an additional
+                // reference. Fresh values (calls, struct lits) already have
+                // rc=1 from allocation — no extra incr needed.
+                if let Some(ty) = self.name_types.get(name).cloned() {
+                    if !is_scalar(&ty) && is_borrowing_expr(&value.kind) {
+                        self.emit_rc_incr(val);
+                    }
+                }
+                // RC: decrement the old value now that the new one is ready.
                 if let Some(ty) = self.name_types.get(name).cloned() {
                     if !is_scalar(&ty) {
                         if let Some(&var) = self.names.get(name) {
@@ -1753,7 +1766,6 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         }
                     }
                 }
-                let val = self.compile_expr(value)?;
                 let var = *self.names.get(name).ok_or_else(|| NativeError {
                     span: stmt.span,
                     message: format!("unknown `{name}`"),
@@ -1903,22 +1915,24 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         // Receiver isn't a known struct type (e.g. from
                         // list.get which returns i64). Search all struct
                         // types for one that has this field.
-                        let mut found = String::new();
+                        // Collect all candidates sorted alphabetically
+                        // for deterministic resolution.
+                        let mut candidates: Vec<&str> = Vec::new();
                         for (tname, tinfo) in &self.cg.info.types {
                             if let TypeInfo::Struct { fields, .. } = tinfo {
                                 if fields.iter().any(|(f, _)| f == name) {
-                                    found = tname.clone();
-                                    break;
+                                    candidates.push(tname.as_str());
                                 }
                             }
                         }
-                        if found.is_empty() {
+                        if candidates.is_empty() {
                             return Err(NativeError {
                                 span: expr.span,
                                 message: format!("no struct has field `{name}`"),
                             });
                         }
-                        found
+                        candidates.sort();
+                        candidates[0].to_string()
                     }
                 };
                 let fields = get_struct_fields(&self.cg.info.types, &type_name);
@@ -2400,6 +2414,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let l = self.compile_expr(&args[0].value)?;
                 let val_raw = self.compile_expr(&args[1].value)?;
                 let val_ty = self.infer_ty(&args[1].value)?;
+                // The list now holds a reference to the element — rc_incr
+                // pointer-typed values so they survive scope cleanup.
+                if !is_scalar(&val_ty) {
+                    self.emit_rc_incr(val_raw);
+                }
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
                 } else {
@@ -2825,11 +2844,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.builder.ins().jump(header_bb, &[]);
 
         self.builder.switch_to_block(header_bb);
-        // Yield point at loop header: cooperative scheduling.
-        let yield_ref = self.cg.obj.declare_func_in_func(
-            self.cg.rt_yield, self.builder.func,
-        );
-        self.builder.ins().call(yield_ref, &[]);
+        // Yield point disabled for now — interferes with raylib games.
+        // TODO: only emit yield when the program imports std/net or uses actors.
 
         let counter = self.builder.use_var(counter_var);
         let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, counter, end);
@@ -3915,7 +3931,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     // List<T> operations
                     if m == "list" && method == "new" {
-                        return Ok(Ty::List(Box::new(Ty::I32)));
+                        return Ok(Ty::List(Box::new(Ty::I64)));
                     }
                     if m == "list" && method == "len" {
                         return Ok(Ty::I32);
@@ -3976,7 +3992,22 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ExprKind::StructLit { name, .. } => Ty::User(name.clone()),
             ExprKind::Field { receiver, name } => {
                 let recv_ty = self.infer_ty(receiver)?;
-                if let Ty::User(tn) = recv_ty {
+                let type_name = if let Ty::User(tn) = recv_ty {
+                    Some(tn)
+                } else {
+                    // Same alphabetical struct resolution as compile_expr.
+                    let mut candidates: Vec<&str> = Vec::new();
+                    for (tname, tinfo) in &self.cg.info.types {
+                        if let TypeInfo::Struct { fields, .. } = tinfo {
+                            if fields.iter().any(|(f, _)| f == name) {
+                                candidates.push(tname.as_str());
+                            }
+                        }
+                    }
+                    candidates.sort();
+                    candidates.first().map(|s| s.to_string())
+                };
+                if let Some(tn) = type_name {
                     let fields = get_struct_fields(&self.cg.info.types, &tn);
                     fields
                         .iter()
@@ -4055,6 +4086,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Returns true when the expression reads an existing reference rather than
+/// producing a fresh allocation. Used to decide whether `var = expr` needs
+/// rc_incr (copies need it, fresh values already have rc=1).
+fn is_borrowing_expr(kind: &ExprKind) -> bool {
+    matches!(
+        kind,
+        ExprKind::Ident(_) | ExprKind::Field { .. } | ExprKind::TupleField { .. }
+    ) || matches!(kind, ExprKind::Paren(inner) if is_borrowing_expr(&inner.kind))
+}
 
 fn tuple_as_fields(elems: &[Ty]) -> Vec<(String, Ty)> {
     elems.iter().enumerate().map(|(i, t)| (format!("_{i}"), t.clone())).collect()

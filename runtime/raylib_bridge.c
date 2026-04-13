@@ -5,8 +5,10 @@
 // Vector2/Rectangle are passed as individual f64 components.
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
 
 // Raylib types (we declare them here to avoid needing raylib.h)
@@ -15,12 +17,14 @@ typedef struct { float x, y, width, height; } Rectangle;
 typedef struct { unsigned char r, g, b, a; } Color;
 typedef struct { Vector2 offset; Vector2 target; float rotation; float zoom; } Camera2D;
 typedef struct { int width, height, mipmaps, format; } Texture2D_header;
-// Font and Sound are opaque — we pass them as i64 (pointer-sized)
 
-// Raylib function declarations
+// Raylib function declarations.
+// IMPORTANT: functions returning bool MUST be declared as bool, not int.
+// On x86-64, bool returns in AL (1 byte) with undefined upper bits.
+// Declaring as int reads garbage from the upper 24 bits of EAX.
 void InitWindow(int width, int height, const char *title);
 void CloseWindow(void);
-int WindowShouldClose(void);
+bool WindowShouldClose(void);
 void SetTargetFPS(int fps);
 void BeginDrawing(void);
 void EndDrawing(void);
@@ -34,9 +38,9 @@ void DrawLine(int x1, int y1, int x2, int y2, Color c);
 void DrawTexture(void *tex, int x, int y, Color c);
 void DrawTexturePro(void *tex, Rectangle src, Rectangle dst, Vector2 origin, float rot, Color c);
 int MeasureText(const char *text, int fontSize);
-int IsKeyPressed(int key);
-int IsKeyDown(int key);
-int IsGestureDetected(int gesture);
+bool IsKeyPressed(int key);
+bool IsKeyDown(int key);
+bool IsGestureDetected(int gesture);
 float GetFrameTime(void);
 void *LoadFont(const char *path);
 void DrawTextEx(void *font, const char *text, Vector2 pos, float fontSize, float spacing, Color c);
@@ -95,7 +99,10 @@ void rl_init_window(int32_t w, int32_t h, int64_t title) {
     InitWindow(w, h, t);
     free((void*)t);
 }
-int32_t rl_window_should_close(void) { return WindowShouldClose(); }
+int32_t rl_window_should_close(void) {
+    if (WindowShouldClose()) return 1;
+    return 0;
+}
 void rl_close_window(void) { CloseWindow(); }
 void rl_set_target_fps(int32_t fps) { SetTargetFPS(fps); }
 double rl_get_frame_time(void) { return (double)GetFrameTime(); }
@@ -141,9 +148,18 @@ void rl_draw_line(int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t c) {
 }
 
 // --- Input ---
-int32_t rl_is_key_pressed(int32_t key) { return IsKeyPressed(key); }
-int32_t rl_is_key_down(int32_t key) { return IsKeyDown(key); }
-int32_t rl_is_gesture_detected(int32_t gesture) { return IsGestureDetected(gesture); }
+int32_t rl_is_key_pressed(int32_t key) {
+    if (IsKeyPressed(key)) return 1;
+    return 0;
+}
+int32_t rl_is_key_down(int32_t key) {
+    if (IsKeyDown(key)) return 1;
+    return 0;
+}
+int32_t rl_is_gesture_detected(int32_t gesture) {
+    if (IsGestureDetected(gesture)) return 1;
+    return 0;
+}
 
 // --- Audio ---
 void rl_init_audio(void) { InitAudioDevice(); }
