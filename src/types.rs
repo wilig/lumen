@@ -554,6 +554,13 @@ impl<'a> FnChecker<'a> {
         }
     }
 
+    fn resolve_or_error(&mut self, t: &Type) -> Ty {
+        match resolve_type(t, &self.module.types) {
+            Ok(ty) => ty,
+            Err(e) => { self.errors.push(e); Ty::Error }
+        }
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(Scope::default());
     }
@@ -604,7 +611,7 @@ impl<'a> FnChecker<'a> {
             self.declare(pname, pty.clone(), false, f.name_span);
         }
         let ret = self.sig.ret.clone();
-        let body_ty = self.check_block(&f.body, Some(&ret));
+        let _body_ty = self.check_block(&f.body, Some(&ret));
         let ends_with_return = f
             .body
             .stmts
@@ -647,32 +654,22 @@ impl<'a> FnChecker<'a> {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
                 let bound_ty = match ty {
-                    Some(ann) => match resolve_type(ann, &self.module.types) {
-                        Ok(t) => {
-                            self.check_expr(value, &t);
-                            t
-                        }
-                        Err(e) => {
-                            self.errors.push(e);
-                            Ty::Error
-                        }
-                    },
+                    Some(ann) => {
+                        let t = self.resolve_or_error(ann);
+                        self.check_expr(value, &t);
+                        t
+                    }
                     None => self.infer_expr(value),
                 };
                 self.declare(name, bound_ty, false, stmt.span);
             }
             StmtKind::Var { name, ty, value } => {
                 let bound_ty = match ty {
-                    Some(ann) => match resolve_type(ann, &self.module.types) {
-                        Ok(t) => {
-                            self.check_expr(value, &t);
-                            t
-                        }
-                        Err(e) => {
-                            self.errors.push(e);
-                            Ty::Error
-                        }
-                    },
+                    Some(ann) => {
+                        let t = self.resolve_or_error(ann);
+                        self.check_expr(value, &t);
+                        t
+                    }
                     None => self.infer_expr(value),
                 };
                 self.declare(name, bound_ty, true, stmt.span);
@@ -934,13 +931,8 @@ impl<'a> FnChecker<'a> {
 
             ExprKind::Cast { expr: inner, to } => {
                 let from = self.infer_expr(inner);
-                let to_ty = match resolve_type(to, &self.module.types) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        self.errors.push(e);
-                        return Ty::Error;
-                    }
-                };
+                let to_ty = self.resolve_or_error(to);
+                if matches!(to_ty, Ty::Error) { return Ty::Error; }
                 if !from.is_numeric() && !matches!(from, Ty::Error) {
                     self.errors.push(TypeError {
                         span: expr.span,
@@ -1071,10 +1063,7 @@ impl<'a> FnChecker<'a> {
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expr.span),
 
             ExprKind::Lambda { params, return_type, body } => {
-                let ret = match resolve_type(return_type, &self.module.types) {
-                    Ok(t) => t,
-                    Err(e) => { self.errors.push(e); Ty::Error }
-                };
+                let ret = self.resolve_or_error(return_type);
                 // Set scope floor to prevent lambda from capturing outer
                 // variables — lookup will only see this scope and above.
                 let old_floor = self.lambda_scope_floor;
@@ -1082,10 +1071,7 @@ impl<'a> FnChecker<'a> {
                 self.lambda_scope_floor = Some(self.scopes.len() - 1);
                 let mut param_tys = Vec::new();
                 for p in params {
-                    let pty = match resolve_type(&p.ty, &self.module.types) {
-                        Ok(t) => t,
-                        Err(e) => { self.errors.push(e); Ty::Error }
-                    };
+                    let pty = self.resolve_or_error(&p.ty);
                     param_tys.push(pty.clone());
                     self.declare(&p.name, pty, false, p.span);
                 }
@@ -2925,5 +2911,63 @@ mod tests {
                 return g(1, 2)
             }"#,
         );
+    }
+
+    #[test]
+    fn for_loop_binds_i32_variable() {
+        tc_ok("fn f(): i32 { for i in range(0, 10) { let x = i + 1 } \n return 0 }");
+    }
+
+    #[test]
+    fn tuple_destructuring_types() {
+        tc_ok(
+            r#"fn pair(): (i32, f64) { return (1, 2.0) }
+               fn f(): i32 {
+                   let (a, b) = pair()
+                   return a
+               }"#,
+        );
+    }
+
+    #[test]
+    fn tuple_field_access() {
+        tc_ok(
+            r#"fn f(): i32 {
+                   let t = (10, 20)
+                   return t.0 + t.1
+               }"#,
+        );
+    }
+
+    #[test]
+    fn fn_ptr_type_annotation() {
+        tc_ok(
+            r#"fn apply(f: fn(i32): i32, x: i32): i32 { return f(x) }
+               fn double(n: i32): i32 { return n * 2 }
+               fn main(): i32 { return apply(double, 5) }"#,
+        );
+    }
+
+    #[test]
+    fn list_push_and_get() {
+        tc_ok(
+            r#"type Item = { val: i32 }
+               fn f(): i32 {
+                   var items = list.new()
+                   items = list.push(items, Item { val: 42 })
+                   let x = list.get(items, 0)
+                   return x.val
+               }"#,
+        );
+    }
+
+    #[test]
+    fn math_module_returns_f64() {
+        tc_ok("fn f(): f64 { return math.sqrt(4.0) + math.abs(1.0 - 3.0) }");
+    }
+
+    #[test]
+    fn int_module_returns_string() {
+        tc_ok(r#"fn f(): string { return int.to_string_i32(42) }"#);
     }
 }

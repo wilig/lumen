@@ -690,7 +690,7 @@ impl Parser {
     fn parse_spawn_expr(&mut self) -> Result<Expr, ParseError> {
         let start = self.peek().span;
         self.expect(&TokenKind::Spawn, "`spawn`")?;
-        let (name, name_span) = self.expect_ident("actor type name")?;
+        let (name, _name_span) = self.expect_ident("actor type name")?;
         // Parse struct literal body.
         self.expect(&TokenKind::LBrace, "`{` for initial state")?;
         let mut fields = Vec::new();
@@ -1814,5 +1814,55 @@ mod tests {
         let m = parse_ok("fn apply(f: fn(i32): i32, x: i32): i32 { f(x) }");
         let Item::Fn(f) = &m.items[0] else { panic!() };
         assert!(matches!(f.params[0].ty.kind, TypeKind::FnPtr { .. }));
+    }
+
+    #[test]
+    fn extern_fn_parses() {
+        let m = parse_ok("extern fn malloc(size: i64): i64");
+        assert!(matches!(&m.items[0], Item::ExternFn(_)));
+    }
+
+    #[test]
+    fn actor_and_msg_handler_parse() {
+        let src = r#"
+            actor Counter { count: i32 }
+            msg Counter.increment(self, n: i32): Counter {
+                return Counter { count: self.count + n }
+            }
+        "#;
+        let m = parse_ok(src);
+        assert!(matches!(&m.items[0], Item::Actor(_)));
+        assert!(matches!(&m.items[1], Item::MsgHandler(_)));
+    }
+
+    #[test]
+    fn tuple_destructuring_parses() {
+        let m = parse_ok("fn f(): i32 { let (a, b) = (1, 2) \n a }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        assert!(matches!(&f.body.stmts[0].kind, StmtKind::LetTuple { .. }));
+    }
+
+    #[test]
+    fn block_expression_parses() {
+        let m = parse_ok("fn f(): i32 { let x = { 42 } \n x }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        let StmtKind::Let { value, .. } = &f.body.stmts[0].kind else { panic!() };
+        assert!(matches!(value.kind, ExprKind::Block(_)));
+    }
+
+    #[test]
+    fn for_loop_parses() {
+        let m = parse_ok("fn f(): i32 { for i in range(0, 10) { i } \n 0 }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        assert!(matches!(&f.body.stmts[0].kind, StmtKind::For { .. }));
+    }
+
+    #[test]
+    #[test]
+    fn try_operator_parses() {
+        let m = parse_ok("fn f(): Result<i32, i32> { let x = Ok(1)? \n Ok(x) }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        let StmtKind::Let { value, .. } = &f.body.stmts[0].kind else { panic!() };
+        assert!(matches!(value.kind, ExprKind::Try(_)));
     }
 }
