@@ -89,6 +89,7 @@ struct NativeCodegen<'a> {
     debug_init: FuncId,
     debug_push: FuncId,
     debug_pop: FuncId,
+    string_eq: FuncId,
     debug_data_counter: usize,
 
     /// Per-actor dispatch function IDs (actor_name → FuncId).
@@ -296,6 +297,12 @@ impl<'a> NativeCodegen<'a> {
         let dpop_sig = obj.make_signature();
         let debug_pop = obj.declare_function("lumen_debug_pop", Linkage::Import, &dpop_sig).unwrap();
 
+        let mut streq_sig = obj.make_signature();
+        streq_sig.params.push(AbiParam::new(PTR));
+        streq_sig.params.push(AbiParam::new(PTR));
+        streq_sig.returns.push(AbiParam::new(cl_types::I32));
+        let string_eq = obj.declare_function("lumen_string_eq", Linkage::Import, &streq_sig).unwrap();
+
         // --- Module functions are now declared from parsed std/*.lm files ---
         // (see compile_module → "Declare imported module extern fns")
         // print_frames: () -> void. Walks the frame_chain and prints each.
@@ -329,6 +336,7 @@ impl<'a> NativeCodegen<'a> {
             debug_init,
             debug_push,
             debug_pop,
+            string_eq,
             debug_data_counter: 0,
             dispatch_fns: HashMap::new(),
             heap_data,
@@ -441,6 +449,15 @@ impl<'a> NativeCodegen<'a> {
                             // Also register in module_fn_ids so compile_method_call can find it.
                             self.module_fn_ids.insert(format!("{mod_name}:{}", f.name), id);
                         }
+                    }
+                }
+            }
+            // Register unmangled names for intra-module calls.
+            for item in &mod_ast.items {
+                if let Item::Fn(f) = item {
+                    let mangled = format!("{mod_name}${}", f.name);
+                    if let Some(&id) = self.fn_ids.get(&mangled) {
+                        self.fn_ids.insert(f.name.clone(), id);
                     }
                 }
             }
@@ -1540,6 +1557,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         _span: Span,
     ) -> Result<Value, NativeError> {
         let lt = self.infer_ty(lhs)?;
+
+        // String == and != : content comparison via lumen_string_eq.
+        if matches!(op, BinOp::Eq | BinOp::NotEq) && matches!(lt, Ty::String) {
+            let a = self.compile_expr(lhs)?;
+            let b = self.compile_expr(rhs)?;
+            let func_ref = self.cg.obj.declare_func_in_func(self.cg.string_eq, self.builder.func);
+            let call = self.builder.ins().call(func_ref, &[a, b]);
+            let eq = self.builder.inst_results(call)[0];
+            if matches!(op, BinOp::NotEq) {
+                let one = self.builder.ins().iconst(cl_types::I32, 1);
+                return Ok(self.builder.ins().isub(one, eq)); // flip 0↔1
+            }
+            return Ok(eq);
+        }
 
         // String + string.
         if matches!(op, BinOp::Add) && matches!(lt, Ty::String) {

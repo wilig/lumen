@@ -762,6 +762,18 @@ void lumen_debug_print_stack(void) {
 
 // --- debug.print primitives (output to stderr) ---------------------------
 
+// String content comparison: returns 1 if equal, 0 if not.
+int32_t lumen_string_eq(int64_t a_ptr, int64_t b_ptr) {
+    if (a_ptr == b_ptr) return 1;  // same pointer → equal
+    if (a_ptr == 0 || b_ptr == 0) return a_ptr == b_ptr;
+    char *a = (char *)(uintptr_t)a_ptr;
+    char *b = (char *)(uintptr_t)b_ptr;
+    int32_t a_len = *(int32_t *)a;
+    int32_t b_len = *(int32_t *)b;
+    if (a_len != b_len) return 0;
+    return memcmp(a + 4, b + 4, a_len) == 0 ? 1 : 0;
+}
+
 void lumen_debug_i32(int32_t v) { fprintf(stderr, "%d", v); }
 void lumen_debug_i64(int64_t v) { fprintf(stderr, "%lld", (long long)v); }
 void lumen_debug_f64(double v) { fprintf(stderr, "%g", v); }
