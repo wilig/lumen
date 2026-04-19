@@ -171,7 +171,7 @@ pub enum VariantPayloadInfo {
     Positional(Vec<Ty>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FnSig {
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
@@ -507,6 +507,12 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
             let resolved: Result<Vec<Ty>, TypeError> =
                 elems.iter().map(|e| resolve_type(e, types)).collect();
             Ok(Ty::Tuple(resolved?))
+        }
+        TypeKind::FnPtr { params, ret } => {
+            let param_tys: Result<Vec<Ty>, TypeError> =
+                params.iter().map(|p| resolve_type(p, types)).collect();
+            let ret_ty = resolve_type(ret, types)?;
+            Ok(Ty::FnPtr { params: param_tys?, ret: Box::new(ret_ty) })
         }
     }
 }
@@ -1046,6 +1052,26 @@ impl<'a> FnChecker<'a> {
             }
 
             ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expr.span),
+
+            ExprKind::Lambda { params, return_type, body } => {
+                let ret = match resolve_type(return_type, &self.module.types) {
+                    Ok(t) => t,
+                    Err(e) => { self.errors.push(e); Ty::Error }
+                };
+                self.push_scope();
+                let mut param_tys = Vec::new();
+                for p in params {
+                    let pty = match resolve_type(&p.ty, &self.module.types) {
+                        Ok(t) => t,
+                        Err(e) => { self.errors.push(e); Ty::Error }
+                    };
+                    param_tys.push(pty.clone());
+                    self.declare(&p.name, pty, false, p.span);
+                }
+                self.check_block(body, Some(&ret));
+                self.pop_scope();
+                Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+            }
         }
     }
 
@@ -2812,5 +2838,29 @@ mod tests {
     fn cast_requires_numeric() {
         let errs = tc_err("fn f(b: bool): i32 { return b as i32 }");
         assert!(errs.iter().any(|e| e.message.contains("numeric source")));
+    }
+
+    #[test]
+    fn lambda_infers_fn_ptr_type() {
+        tc_ok("fn f(): i32 { let g = fn(x: i32): i32 { return x + 1 } \n return g(5) }");
+    }
+
+    #[test]
+    fn lambda_passed_as_fn_ptr_arg() {
+        tc_ok(
+            "fn apply(f: fn(i32): i32, x: i32): i32 { return f(x) }
+             fn main(): i32 { return apply(fn(n: i32): i32 { return n * 2 }, 10) }",
+        );
+    }
+
+    #[test]
+    fn lambda_body_type_mismatch() {
+        let errs = tc_err(
+            r#"fn f(): i32 {
+                let g = fn(x: i32): i32 { return "hello" }
+                return g(1)
+            }"#,
+        );
+        assert!(!errs.is_empty());
     }
 }

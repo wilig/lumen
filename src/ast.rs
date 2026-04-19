@@ -155,6 +155,11 @@ pub enum TypeKind {
     },
     /// `(T1, T2, ...)` — tuple type.
     Tuple(Vec<Type>),
+    /// `fn(T1, T2): R` — function pointer type.
+    FnPtr {
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +314,13 @@ pub enum ExprKind {
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
+    },
+
+    /// Non-capturing lambda: `fn(x: i32, y: i32): i32 { return x + y }`
+    Lambda {
+        params: Vec<Param>,
+        return_type: Type,
+        body: Block,
     },
 }
 

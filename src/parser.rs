@@ -450,6 +450,29 @@ impl Parser {
             });
         }
 
+        // Function pointer type: fn(T1, T2): R
+        if matches!(self.peek_kind(), TokenKind::Fn) {
+            let start = self.bump().span;
+            self.expect(&TokenKind::LParen, "`(` after `fn` in function pointer type")?;
+            let mut params = Vec::new();
+            if !matches!(self.peek_kind(), TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_type()?);
+                    if self.eat(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)` to close function pointer type params")?;
+            self.expect(&TokenKind::Colon, "`:` before function pointer return type")?;
+            let ret = self.parse_type()?;
+            let end = ret.span;
+            return Ok(Type {
+                kind: TypeKind::FnPtr { params, ret: Box::new(ret) },
+                span: merge(start, end),
+            });
+        }
+
         let (name, name_span) = match self.peek_kind() {
             TokenKind::Unit => {
                 let tok = self.bump();
@@ -1135,6 +1158,29 @@ impl Parser {
                     span,
                 })
             }
+            // Non-capturing lambda: fn(x: i32): i32 { return x + 1 }
+            TokenKind::Fn => {
+                self.bump();
+                self.expect(&TokenKind::LParen, "`(` after `fn` in lambda")?;
+                let mut params = Vec::new();
+                if !matches!(self.peek_kind(), TokenKind::RParen) {
+                    loop {
+                        params.push(self.parse_param()?);
+                        if self.eat(&TokenKind::Comma).is_none() {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`)` to close lambda parameters")?;
+                self.expect(&TokenKind::Colon, "`:` before lambda return type")?;
+                let return_type = self.parse_type()?;
+                let body = self.parse_block()?;
+                let end = body.span;
+                Ok(Expr {
+                    kind: ExprKind::Lambda { params, return_type, body },
+                    span: merge(tok.span, end),
+                })
+            }
             TokenKind::Ident(_) => {
                 let (name, name_span) = self.expect_ident("identifier")?;
 
@@ -1753,5 +1799,20 @@ mod tests {
     fn shape_match_parses_error_on_missing_arrow() {
         let err = parse_err("fn f(s: i32): i32 { match s { 1 => 1, 2 2, _ => 0 } }");
         assert!(err.message.contains("=>"));
+    }
+
+    #[test]
+    fn lambda_expression_parses() {
+        let m = parse_ok("fn f(): i32 { let g = fn(x: i32): i32 { return x + 1 } \n g(5) }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        let StmtKind::Let { value, .. } = &f.body.stmts[0].kind else { panic!() };
+        assert!(matches!(value.kind, ExprKind::Lambda { .. }));
+    }
+
+    #[test]
+    fn fn_ptr_type_parses() {
+        let m = parse_ok("fn apply(f: fn(i32): i32, x: i32): i32 { f(x) }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        assert!(matches!(f.params[0].ty.kind, TypeKind::FnPtr { .. }));
     }
 }

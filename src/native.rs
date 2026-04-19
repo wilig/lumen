@@ -156,6 +156,11 @@ struct NativeCodegen<'a> {
     /// Interned string literals: content → DataId.
     string_data: HashMap<String, DataId>,
 
+    /// Lambda FuncIds keyed by source span (line, col).
+    lambda_ids: HashMap<(u32, u32), FuncId>,
+    /// Lambda FnSigs (lambdas aren't in ModuleInfo, so we store sigs here).
+    lambda_sigs: HashMap<String, crate::types::FnSig>,
+
     /// Uses WASI / io module.
     uses_io: bool,
 }
@@ -765,6 +770,8 @@ impl<'a> NativeCodegen<'a> {
             bump_ptr_data,
             frame_chain_data,
             string_data: HashMap::new(),
+            lambda_ids: HashMap::new(),
+            lambda_sigs: HashMap::new(),
             uses_io: false,
         })
     }
@@ -828,6 +835,50 @@ impl<'a> NativeCodegen<'a> {
             self.emit_actor_dispatch(actor_name, module)?;
         }
 
+        // Collect, declare, and define non-capturing lambdas.
+        let mut lambdas = Vec::new();
+        for item in &module.items {
+            match item {
+                Item::Fn(f) => collect_lambdas_block(&f.body, &mut lambdas),
+                Item::MsgHandler(mh) => collect_lambdas_block(&mh.body, &mut lambdas),
+                _ => {}
+            }
+        }
+        for (i, lam) in lambdas.iter().enumerate() {
+            let lam_name = format!("__lambda_{i}");
+            let mut sig = self.obj.make_signature();
+            for p in &lam.params {
+                let pty = resolve_type_to_ty(&p.ty);
+                sig.params.push(AbiParam::new(lumen_to_cl(&pty)));
+            }
+            let ret_ty = resolve_type_to_ty(&lam.return_type);
+            if ret_ty != Ty::Unit {
+                sig.returns.push(AbiParam::new(lumen_to_cl(&ret_ty)));
+            } else {
+                sig.returns.push(AbiParam::new(cl_types::I32));
+            }
+            let func_id = self.obj.declare_function(&lam_name, Linkage::Local, &sig).unwrap();
+            self.lambda_ids.insert((lam.span.line, lam.span.col), func_id);
+            let fn_sig = crate::types::FnSig {
+                params: lam.params.iter().map(|p| {
+                    (p.name.clone(), resolve_type_to_ty(&p.ty))
+                }).collect(),
+                ret: ret_ty,
+                effect: ast::Effect::Pure,
+            };
+            let synthetic = FnDecl {
+                name: lam_name.clone(),
+                name_span: lam.span,
+                params: lam.params.clone(),
+                return_type: lam.return_type.clone(),
+                effect: ast::Effect::Pure,
+                body: lam.body.clone(),
+                span: lam.span,
+            };
+            self.lambda_sigs.insert(lam_name, fn_sig);
+            self.define_function(&synthetic, func_id)?;
+        }
+
         // Define user function bodies.
         let fn_ids = self.fn_ids.clone();
         for item in &module.items {
@@ -879,7 +930,13 @@ impl<'a> NativeCodegen<'a> {
     }
 
     fn build_sig(&self, fn_name: &str) -> cranelift_codegen::ir::Signature {
-        let sig = &self.info.fns[fn_name];
+        let sig = self.info.fns.get(fn_name)
+            .or_else(|| self.lambda_sigs.get(fn_name))
+            .unwrap_or_else(|| panic!("no sig for {fn_name}"));
+        self.build_sig_from(sig)
+    }
+
+    fn build_sig_from(&self, sig: &crate::types::FnSig) -> cranelift_codegen::ir::Signature {
         let mut cl_sig = self.obj.make_signature();
         for (_, ty) in &sig.params {
             cl_sig.params.push(AbiParam::new(lumen_to_cl(ty)));
@@ -1278,8 +1335,15 @@ impl<'a> NativeCodegen<'a> {
     }
 
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
-        let sig = &self.info.fns[&f.name];
-        let cl_sig = self.build_sig(&f.name);
+        // Look up FnSig from module info, falling back to lambda_sigs.
+        let sig_owned;
+        let sig: &crate::types::FnSig = if let Some(s) = self.info.fns.get(&f.name) {
+            s
+        } else {
+            sig_owned = self.lambda_sigs[&f.name].clone();
+            &sig_owned
+        };
+        let cl_sig = self.build_sig_from(sig);
 
         let mut ctx = self.obj.make_context();
         ctx.func.signature = cl_sig;
@@ -1999,6 +2063,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         message: "tuple field access on non-tuple".into(),
                     }),
                 }
+            }
+            ExprKind::Lambda { .. } => {
+                // Look up the pre-compiled lambda by its source span.
+                let key = (expr.span.line, expr.span.col);
+                let func_id = *self.cg.lambda_ids.get(&key).ok_or_else(|| NativeError {
+                    span: expr.span,
+                    message: "lambda not found (internal error)".into(),
+                })?;
+                let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+                Ok(self.builder.ins().func_addr(PTR, func_ref))
             }
             _ => Err(NativeError {
                 span: expr.span,
@@ -4069,6 +4143,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     _ => Ty::I32,
                 }
             }
+            ExprKind::Lambda { params, return_type, .. } => {
+                let param_tys: Vec<Ty> = params.iter()
+                    .map(|p| resolve_type_to_ty(&p.ty))
+                    .collect();
+                let ret = resolve_type_to_ty(return_type);
+                Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+            }
             _ => Ty::I32,
         })
     }
@@ -4138,6 +4219,29 @@ fn native_sizeof(ty: &Ty) -> i32 {
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
         Ty::FnPtr { .. } => 8,
         Ty::Error => 4,
+    }
+}
+
+/// Convert an AST type to a Ty (simplified, for lambda signatures).
+fn resolve_type_to_ty(ty: &ast::Type) -> Ty {
+    match &ty.kind {
+        ast::TypeKind::Named { name, args } if args.is_empty() => match name.as_str() {
+            "i32" => Ty::I32,
+            "i64" => Ty::I64,
+            "u32" => Ty::U32,
+            "u64" => Ty::U64,
+            "f64" => Ty::F64,
+            "bool" => Ty::Bool,
+            "unit" => Ty::Unit,
+            "String" => Ty::String,
+            "Bytes" => Ty::Bytes,
+            other => Ty::User(other.to_string()),
+        },
+        ast::TypeKind::FnPtr { params, ret } => {
+            let param_tys = params.iter().map(resolve_type_to_ty).collect();
+            Ty::FnPtr { params: param_tys, ret: Box::new(resolve_type_to_ty(ret)) }
+        }
+        _ => Ty::I32, // fallback
     }
 }
 
@@ -4225,6 +4329,90 @@ fn struct_size(fields: &[(String, Ty)]) -> i32 {
     }
     (offset + 7) & !7
 }
+
+// --- Lambda collection ---------------------------------------------------
+
+struct LambdaInfo {
+    params: Vec<ast::Param>,
+    return_type: ast::Type,
+    body: ast::Block,
+    span: Span,
+}
+
+fn collect_lambdas_block(block: &ast::Block, acc: &mut Vec<LambdaInfo>) {
+    for stmt in &block.stmts {
+        collect_lambdas_stmt(stmt, acc);
+    }
+    if let Some(tail) = &block.tail {
+        collect_lambdas_expr(tail, acc);
+    }
+}
+
+fn collect_lambdas_stmt(stmt: &ast::Stmt, acc: &mut Vec<LambdaInfo>) {
+    match &stmt.kind {
+        StmtKind::Let { value, .. }
+        | StmtKind::Var { value, .. }
+        | StmtKind::Assign { value, .. } => collect_lambdas_expr(value, acc),
+        StmtKind::LetTuple { value, .. } => collect_lambdas_expr(value, acc),
+        StmtKind::Expr(e) => collect_lambdas_expr(e, acc),
+        StmtKind::For { iter, body, .. } => {
+            collect_lambdas_expr(iter, acc);
+            collect_lambdas_block(body, acc);
+        }
+        StmtKind::Return(Some(e)) => collect_lambdas_expr(e, acc),
+        StmtKind::Return(None) => {}
+    }
+}
+
+fn collect_lambdas_expr(expr: &Expr, acc: &mut Vec<LambdaInfo>) {
+    match &expr.kind {
+        ExprKind::Lambda { params, return_type, body } => {
+            // Collect strings inside the lambda body too.
+            collect_lambdas_block(body, acc);
+            acc.push(LambdaInfo {
+                params: params.clone(),
+                return_type: return_type.clone(),
+                body: body.clone(),
+                span: expr.span,
+            });
+        }
+        ExprKind::Paren(e) | ExprKind::Unary { rhs: e, .. } | ExprKind::Cast { expr: e, .. } => {
+            collect_lambdas_expr(e, acc);
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_lambdas_expr(lhs, acc);
+            collect_lambdas_expr(rhs, acc);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_lambdas_expr(callee, acc);
+            for a in args { collect_lambdas_expr(&a.value, acc); }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_lambdas_expr(receiver, acc);
+            for a in args { collect_lambdas_expr(&a.value, acc); }
+        }
+        ExprKind::If { cond, then_block, else_block } => {
+            collect_lambdas_expr(cond, acc);
+            collect_lambdas_block(then_block, acc);
+            collect_lambdas_block(else_block, acc);
+        }
+        ExprKind::Block(b) => collect_lambdas_block(b, acc),
+        ExprKind::StructLit { fields, spread, .. } => {
+            for fi in fields { collect_lambdas_expr(&fi.value, acc); }
+            if let Some(s) = spread { collect_lambdas_expr(s, acc); }
+        }
+        ExprKind::TupleLit(elems) => {
+            for e in elems { collect_lambdas_expr(e, acc); }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_lambdas_expr(scrutinee, acc);
+            for arm in arms { collect_lambdas_expr(&arm.body, acc); }
+        }
+        _ => {}
+    }
+}
+
+// --- String collection ---------------------------------------------------
 
 fn collect_strings_block(block: &ast::Block, acc: &mut Vec<String>) {
     for stmt in &block.stmts {
@@ -4316,6 +4504,7 @@ fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
                 collect_strings_expr(&a.value, acc);
             }
         }
+        ExprKind::Lambda { body, .. } => collect_strings_block(body, acc),
         _ => {}
     }
 }
