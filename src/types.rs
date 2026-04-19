@@ -50,6 +50,9 @@ pub enum Ty {
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
     List(Box<Ty>),
+    /// Insertion-ordered hash map. Key type is string for now (MVP);
+    /// generalizes to `Map<K, V>` once generic keys land.
+    Map(Box<Ty>, Box<Ty>),
     /// Raw byte buffer. Same memory layout as String but without the
     /// UTF-8 assumption. Conversions are zero-cost.
     Bytes,
@@ -86,6 +89,7 @@ impl Ty {
             Ty::Option(t) => format!("Option<{}>", t.display()),
             Ty::Result(o, e) => format!("Result<{}, {}>", o.display(), e.display()),
             Ty::List(t) => format!("List<{}>", t.display()),
+            Ty::Map(k, v) => format!("Map<{}, {}>", k.display(), v.display()),
             Ty::User(name) => name.clone(),
             Ty::FnPtr { params, ret } => {
                 let ps: Vec<String> = params.iter().map(|t| t.display()).collect();
@@ -543,6 +547,10 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
             "List" if args.len() == 1 => {
                 Ok(Ty::List(Box::new(resolve_type(&args[0], types)?)))
             }
+            "Map" if args.len() == 2 => Ok(Ty::Map(
+                Box::new(resolve_type(&args[0], types)?),
+                Box::new(resolve_type(&args[1], types)?),
+            )),
             "Handle" if args.len() == 1 => {
                 Ok(Ty::Handle(Box::new(resolve_type(&args[0], types)?)))
             }
@@ -747,7 +755,17 @@ impl<'a> FnChecker<'a> {
                         // Refine List<Error> → List<T> when the RHS is more specific.
                         if let (Ty::List(inner), Ty::List(_)) = (&b.ty, &rhs_ty) {
                             if matches!(**inner, Ty::Error) {
-                                // Update the binding in the scope.
+                                for scope in self.scopes.iter_mut().rev() {
+                                    if let Some(binding) = scope.bindings.get_mut(name) {
+                                        binding.ty = rhs_ty;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Same refinement for Map<K, Error> → Map<K, V>.
+                        else if let (Ty::Map(_, v), Ty::Map(_, _)) = (&b.ty, &rhs_ty) {
+                            if matches!(**v, Ty::Error) {
                                 for scope in self.scopes.iter_mut().rev() {
                                     if let Some(binding) = scope.bindings.get_mut(name) {
                                         binding.ty = rhs_ty;
@@ -1559,6 +1577,52 @@ impl<'a> FnChecker<'a> {
                 }
                 return Some(Ty::Error);
             }
+            // --- map ---
+            ("map", "new") => {
+                return Some(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+            }
+            ("map", "set") => {
+                if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.set` expects 3 args".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                let val_ty = args.get(2).map(|a| self.infer_expr(&a.value));
+                return match (&map_ty, val_ty) {
+                    (Ty::Map(k, v), Some(vt)) if matches!(**v, Ty::Error) => {
+                        Some(Ty::Map(k.clone(), Box::new(vt)))
+                    }
+                    _ => Some(map_ty),
+                };
+            }
+            ("map", "get") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.get` expects 2 args".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                let value_ty = match map_ty {
+                    Ty::Map(_, v) => *v,
+                    _ => Ty::Error,
+                };
+                return Some(Ty::Option(Box::new(value_ty)));
+            }
+            ("map", "contains") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.contains` expects 2 args".into() }); }
+                if let Some(a) = args.first() { self.infer_expr(&a.value); }
+                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                return Some(Ty::Bool);
+            }
+            ("map", "remove") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.remove` expects 2 args".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                return Some(map_ty);
+            }
+            ("map", "len") => {
+                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.len` expects 1 arg".into() }); }
+                if let Some(a) = args.first() { self.infer_expr(&a.value); }
+                return Some(Ty::I32);
+            }
             (_unknown_mod, _) if !self.module.modules.contains_key(_unknown_mod) => {
                 return None;
             }
@@ -2147,6 +2211,10 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::List(_), Ty::I64) | (Ty::I64, Ty::List(_)) => true,
         // List<Error> (from list.new) unifies with any List<T>.
         (Ty::List(a), Ty::List(b)) => compatible(a, b),
+        // Maps are i64 pointers at runtime.
+        (Ty::Map(_, _), Ty::I64) | (Ty::I64, Ty::Map(_, _)) => true,
+        // Map<K, Error> (from map.new) unifies with any Map<K, V>.
+        (Ty::Map(ka, va), Ty::Map(kb, vb)) => compatible(ka, kb) && compatible(va, vb),
         // Any pointer-based type is compatible with i64.
         (Ty::User(_), Ty::I64) | (Ty::I64, Ty::User(_)) => true,
         // Option<Error> from `None` unifies with any Option<T>.

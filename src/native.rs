@@ -1384,8 +1384,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
     fn compile_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), NativeError> {
         match &stmt.kind {
-            StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
-                let lumen_ty = self.infer_ty(value)?;
+            StmtKind::Let { name, value, ty } | StmtKind::Var { name, value, ty } => {
+                let inferred_ty = self.infer_ty(value)?;
+                // Prefer the user's annotation when it's more specific than
+                // what we inferred (e.g. `var m: Map<string, i32> = map.new()`
+                // — map.new returns Map<_, Error>, but the annotation pins V).
+                let lumen_ty = match ty {
+                    Some(annot) => {
+                        let annot_ty = resolve_type_to_ty(annot);
+                        if ty_more_specific(&annot_ty, &inferred_ty) { annot_ty } else { inferred_ty }
+                    }
+                    None => inferred_ty,
+                };
                 let val = self.compile_expr(value)?;
                 // If the RHS is a borrowing expression (variable read, field
                 // access), rc_incr because we're creating an additional
@@ -2053,6 +2063,67 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, i, val64]);
                 return Ok(self.builder.inst_results(call)[0]);
+            }
+            // map.set: rc_incr pointer values, sextend i32→i64 (mirror list.push).
+            if mod_name == "map" && method == "set" {
+                let m = self.compile_expr(&args[0].value)?;
+                let k = self.compile_expr(&args[1].value)?;
+                let val_raw = self.compile_expr(&args[2].value)?;
+                let val_ty = self.infer_ty(&args[2].value)?;
+                if !is_scalar(&val_ty) { self.emit_rc_incr(val_raw); }
+                let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
+                    self.builder.ins().sextend(cl_types::I64, val_raw)
+                } else { val_raw };
+                let fid = self.module_func("lumen_map_set");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[m, k, val64]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            // map.get: returns Option<V>. Emit:
+            //   raw  = lumen_map_get(m, k)
+            //   ok?  = lumen_map_get_found()
+            //   if ok: Some(raw [ireduced if i32])
+            //   else:  None
+            if mod_name == "map" && method == "get" {
+                let m = self.compile_expr(&args[0].value)?;
+                let k = self.compile_expr(&args[1].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::I64 };
+
+                let get_fid = self.module_func("lumen_map_get");
+                let get_ref = self.cg.obj.declare_func_in_func(get_fid, self.builder.func);
+                let get_call = self.builder.ins().call(get_ref, &[m, k]);
+                let raw = self.builder.inst_results(get_call)[0];
+
+                let found_fid = self.module_func("lumen_map_get_found");
+                let found_ref = self.cg.obj.declare_func_in_func(found_fid, self.builder.func);
+                let found_call = self.builder.ins().call(found_ref, &[]);
+                let found = self.builder.inst_results(found_call)[0];
+
+                let some_bb = self.builder.create_block();
+                let none_bb = self.builder.create_block();
+                let merge_bb = self.builder.create_block();
+                self.builder.append_block_param(merge_bb, PTR);
+                self.builder.ins().brif(found, some_bb, &[], none_bb, &[]);
+
+                // Some(v) — narrow i32 if needed, then build the sum block
+                self.builder.switch_to_block(some_bb);
+                let v = if lumen_to_cl(&elem_ty) == cl_types::I32 {
+                    self.builder.ins().ireduce(cl_types::I32, raw)
+                } else { raw };
+                let size = native_sizeof(&elem_ty);
+                let field_ptr = self.rc_alloc(size as i64)?;
+                self.builder.ins().store(MemFlags::new(), v, field_ptr, 0);
+                let some_block = self.build_sum_block(1, Some(field_ptr))?;
+                self.builder.ins().jump(merge_bb, &[BlockArg::Value(some_block)]);
+
+                // None
+                self.builder.switch_to_block(none_bb);
+                let none_block = self.build_sum_block(0, None)?;
+                self.builder.ins().jump(merge_bb, &[BlockArg::Value(none_block)]);
+
+                self.builder.switch_to_block(merge_bb);
+                return Ok(self.builder.block_params(merge_bb)[0]);
             }
         }
         // Fall through to imported module lookup.
@@ -3268,6 +3339,39 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         }
                         return Ok(Ty::List(Box::new(Ty::I32)));
                     }
+                    // --- map ---
+                    if m == "map" && method == "new" {
+                        return Ok(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                    }
+                    if m == "map" && method == "set" {
+                        let map_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?
+                            .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                        let val_ty = args.get(2).map(|a| self.infer_ty(&a.value)).transpose()?;
+                        if let (Ty::Map(k, v), Some(vt)) = (&map_ty, val_ty) {
+                            if matches!(**v, Ty::Error) {
+                                return Ok(Ty::Map(k.clone(), Box::new(vt)));
+                            }
+                        }
+                        return Ok(map_ty);
+                    }
+                    if m == "map" && method == "get" {
+                        let map_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?
+                            .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                        let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                        return Ok(Ty::Option(Box::new(elem_ty)));
+                    }
+                    if m == "map" && method == "contains" {
+                        return Ok(Ty::Bool);
+                    }
+                    if m == "map" && method == "remove" {
+                        if let Some(first_arg) = args.first() {
+                            return self.infer_ty(&first_arg.value);
+                        }
+                        return Ok(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                    }
+                    if m == "map" && method == "len" {
+                        return Ok(Ty::I32);
+                    }
                     // --- Raylib ---
                     if m == "rl" {
                         return Ok(match method.as_ref() {
@@ -3423,7 +3527,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
-        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
         Ty::FnPtr { .. } => PTR,
         Ty::Error => cl_types::I32,
     }
@@ -3433,20 +3537,38 @@ fn is_scalar(ty: &Ty) -> bool {
     matches!(
         ty,
         Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Bool | Ty::Unit
-        // Lists are treated as scalar for RC purposes: they manage their
-        // own memory via realloc inside push/remove. RC decrementing a
-        // list after realloc moved it would double-free.
+        // Lists and maps are treated as scalar for RC purposes: they
+        // manage their own memory via realloc inside set/push/remove. RC
+        // decrementing one after realloc moved it would double-free.
         | Ty::List(_)
+        | Ty::Map(_, _)
         // Function pointers are just integer addresses — no RC needed.
         | Ty::FnPtr { .. }
     )
+}
+
+/// True when `annot` carries strictly more information than `inferred` —
+/// i.e. the inferred type has Ty::Error in a generic slot that the
+/// annotation pins to a real type. Used so `var m: Map<string, i32> = map.new()`
+/// honors the annotation (map.new returns Map<_, Error>).
+fn ty_more_specific(annot: &Ty, inferred: &Ty) -> bool {
+    match (annot, inferred) {
+        (Ty::List(a), Ty::List(b)) => !matches!(**a, Ty::Error) && matches!(**b, Ty::Error),
+        (Ty::Map(_, a), Ty::Map(_, b)) => !matches!(**a, Ty::Error) && matches!(**b, Ty::Error),
+        (Ty::Option(a), Ty::Option(b)) => !matches!(**a, Ty::Error) && matches!(**b, Ty::Error),
+        (Ty::Result(ao, ae), Ty::Result(bo, be)) => {
+            (!matches!(**ao, Ty::Error) && matches!(**bo, Ty::Error))
+                || (!matches!(**ae, Ty::Error) && matches!(**be, Ty::Error))
+        }
+        _ => false,
+    }
 }
 
 fn native_sizeof(ty: &Ty) -> i32 {
     match ty {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
-        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
+        Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
         Ty::FnPtr { .. } => 8,
         Ty::Error => 4,
     }
@@ -3455,23 +3577,37 @@ fn native_sizeof(ty: &Ty) -> i32 {
 /// Convert an AST type to a Ty (simplified, for lambda signatures).
 fn resolve_type_to_ty(ty: &ast::Type) -> Ty {
     match &ty.kind {
-        ast::TypeKind::Named { name, args } if args.is_empty() => match name.as_str() {
-            "i32" => Ty::I32,
-            "i64" => Ty::I64,
-            "u32" => Ty::U32,
-            "u64" => Ty::U64,
-            "f64" => Ty::F64,
-            "bool" => Ty::Bool,
-            "unit" => Ty::Unit,
-            "String" => Ty::String,
-            "Bytes" => Ty::Bytes,
-            other => Ty::User(other.to_string()),
+        ast::TypeKind::Named { name, args } => match (name.as_str(), args.len()) {
+            ("i32", 0) => Ty::I32,
+            ("i64", 0) => Ty::I64,
+            ("u32", 0) => Ty::U32,
+            ("u64", 0) => Ty::U64,
+            ("f64", 0) => Ty::F64,
+            ("bool", 0) => Ty::Bool,
+            ("unit", 0) => Ty::Unit,
+            ("string", 0) | ("String", 0) => Ty::String,
+            ("bytes", 0) | ("Bytes", 0) => Ty::Bytes,
+            ("List", 1) => Ty::List(Box::new(resolve_type_to_ty(&args[0]))),
+            ("Map", 2) => Ty::Map(
+                Box::new(resolve_type_to_ty(&args[0])),
+                Box::new(resolve_type_to_ty(&args[1])),
+            ),
+            ("Option", 1) => Ty::Option(Box::new(resolve_type_to_ty(&args[0]))),
+            ("Result", 2) => Ty::Result(
+                Box::new(resolve_type_to_ty(&args[0])),
+                Box::new(resolve_type_to_ty(&args[1])),
+            ),
+            ("Handle", 1) => Ty::Handle(Box::new(resolve_type_to_ty(&args[0]))),
+            (other, 0) => Ty::User(other.to_string()),
+            _ => Ty::Error,
         },
         ast::TypeKind::FnPtr { params, ret } => {
             let param_tys = params.iter().map(resolve_type_to_ty).collect();
             Ty::FnPtr { params: param_tys, ret: Box::new(resolve_type_to_ty(ret)) }
         }
-        _ => Ty::I32, // fallback
+        ast::TypeKind::Tuple(elems) => {
+            Ty::Tuple(elems.iter().map(resolve_type_to_ty).collect())
+        }
     }
 }
 

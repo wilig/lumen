@@ -1,0 +1,27 @@
+// Insertion-ordered hash map.
+//
+// Keys are strings (MVP). Values are any single-word type — i32, i64,
+// f64, bool, or pointer-shaped (string, bytes, struct, list, etc.).
+//
+// Usage:
+//   var m: Map<string, i32> = map.new()
+//   m = map.set(m, "alice", 30)
+//   m = map.set(m, "bob", 25)
+//   match map.get(m, "alice") {
+//       Some(age) => io.println("age = \{age}"),
+//       None => io.println("not found"),
+//   }
+//
+// All mutation operations return the (possibly relocated) map pointer —
+// rebind with `m = map.set(m, ...)`, same convention as List.
+
+extern fn new(): i64 link "lumen_map_new"
+extern fn set(m: i64, k: string, v: i64): i64 link "lumen_map_set"
+extern fn contains(m: i64, k: string): i32 link "lumen_map_contains"
+extern fn remove(m: i64, k: string): i64 link "lumen_map_remove"
+extern fn len(m: i64): i32 link "lumen_map_len"
+
+// `get` is special-cased in the codegen so it returns Option<V> with V
+// inferred from the map's element type; the raw extern is internal.
+extern fn _get(m: i64, k: string): i64 link "lumen_map_get"
+extern fn _get_found(): i32 link "lumen_map_get_found"
