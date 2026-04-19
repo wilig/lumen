@@ -2168,13 +2168,17 @@ mod tests {
     fn tc(src: &str) -> Result<ModuleInfo, Vec<TypeError>> {
         let toks = lex(src).unwrap();
         let m = parse(toks).unwrap();
-        // Resolve imports from std/ directory so tests can use module calls.
-        let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
+        // Resolve imports from std/ and vendor/ directories.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut imported = Vec::new();
         for imp in &m.imports {
             let file_name = imp.path.last().cloned().unwrap_or_default();
             let reg_name = imp.alias.clone().unwrap_or_else(|| file_name.clone());
-            let mod_path = std_dir.join(format!("{file_name}.lm"));
+            let mut mod_path = base.to_path_buf();
+            for seg in &imp.path[..imp.path.len() - 1] {
+                mod_path = mod_path.join(seg);
+            }
+            mod_path = mod_path.join(format!("{file_name}.lm"));
             if mod_path.exists() {
                 let mod_src = std::fs::read_to_string(&mod_path).unwrap();
                 let mod_tokens = lex(&mod_src).unwrap();

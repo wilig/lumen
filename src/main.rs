@@ -57,35 +57,41 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
         format_error(&src, path, "parse error", e.span.line, e.span.col, 0, &e.message)
     })?;
 
-    // Resolve imports to stdlib .lm files, recursively following
-    // transitive imports (e.g. std/http imports std/bytes).
-    let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
+    // Resolve imports from std/ and vendor/ directories, recursively
+    // following transitive imports.
+    let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut imported = Vec::new();
     let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Queue: (file_name, registered_name). Alias only applies to direct user imports.
-    let mut queue: Vec<(String, String)> = module.imports.iter()
+    // Queue: (import_path_segments, registered_name).
+    let mut queue: Vec<(Vec<String>, String)> = module.imports.iter()
         .map(|imp| {
             let file_name = imp.path.last().cloned().unwrap_or_default();
             let reg_name = imp.alias.clone().unwrap_or_else(|| file_name.clone());
-            (file_name, reg_name)
+            (imp.path.clone(), reg_name)
         })
         .collect();
-    while let Some((file_name, reg_name)) = queue.pop() {
+    while let Some((path_segs, reg_name)) = queue.pop() {
         if loaded.contains(&reg_name) { continue; }
         loaded.insert(reg_name.clone());
-        let mod_path = std_dir.join(format!("{file_name}.lm"));
+        // Build file path: import std/http → std/http.lm, import vendor/raylib → vendor/raylib.lm
+        let file_name = path_segs.last().cloned().unwrap_or_default();
+        let mut mod_path = base_dir.to_path_buf();
+        for seg in &path_segs[..path_segs.len() - 1] {
+            mod_path = mod_path.join(seg);
+        }
+        mod_path = mod_path.join(format!("{file_name}.lm"));
         if mod_path.exists() {
             let mod_src = std::fs::read_to_string(&mod_path)
                 .map_err(|e| format!("read {}: {e}", mod_path.display()))?;
             let mod_tokens = lumen::lexer::lex(&mod_src)
-                .map_err(|e| format!("lex error in std/{file_name}.lm: {e}"))?;
+                .map_err(|e| format!("lex error in {}: {e}", mod_path.display()))?;
             let mod_ast = lumen::parser::parse(mod_tokens)
-                .map_err(|e| format!("parse error in std/{file_name}.lm: {e}"))?;
-            // Queue transitive imports (no alias — use file name directly).
+                .map_err(|e| format!("parse error in {}: {e}", mod_path.display()))?;
+            // Queue transitive imports.
             for imp in &mod_ast.imports {
                 let dep = imp.path.last().cloned().unwrap_or_default();
                 let dep_name = imp.alias.clone().unwrap_or_else(|| dep.clone());
-                if !loaded.contains(&dep_name) { queue.push((dep, dep_name)); }
+                if !loaded.contains(&dep_name) { queue.push((imp.path.clone(), dep_name)); }
             }
             imported.push(lumen::types::ParsedImport { name: reg_name, module: mod_ast });
         }
@@ -133,7 +139,7 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
     // Compile and link the raylib bridge only when the source imports std/raylib.
     let rl_bridge_src = rt_dir.join("raylib_bridge.c");
     let rl_bridge_obj = format!("{stem}_rl.o");
-    let uses_raylib = imports.iter().any(|i| i == "std/rl" || i == "std/raylib");
+    let uses_raylib = imports.iter().any(|i| i == "vendor/raylib" || i == "std/rl" || i == "std/raylib");
     if uses_raylib && rl_bridge_src.exists() {
         let cc_status = std::process::Command::new("cc")
             .args(["-c", "-O2", rl_bridge_src.to_str().unwrap(), "-o", &rl_bridge_obj])
