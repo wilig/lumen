@@ -1356,6 +1356,7 @@ impl<'a> FnChecker<'a> {
                 }
                 "range" => return self.check_range_call(args, whole_span),
                 "string_len" => return self.check_string_len_call(args, whole_span),
+                "assert" => return self.check_assert_call(args, whole_span),
                 _ => {}
             }
 
@@ -1617,6 +1618,23 @@ impl<'a> FnChecker<'a> {
                 message: "a `pure` function cannot call an `io` function".into(),
             });
         }
+    }
+
+    fn check_assert_call(&mut self, args: &[Arg], call_span: Span) -> Ty {
+        // Built-in `assert(cond: bool)` or `assert(cond: bool, msg: string)`.
+        // Aborts at runtime when cond is false. Returns unit.
+        if args.is_empty() || args.len() > 2 {
+            self.errors.push(TypeError {
+                span: call_span,
+                message: format!("`assert` expects 1 or 2 arguments, found {}", args.len()),
+            });
+            return Ty::Unit;
+        }
+        self.check_expr(&args[0].value, &Ty::Bool);
+        if args.len() == 2 {
+            self.check_expr(&args[1].value, &Ty::String);
+        }
+        Ty::Unit
     }
 
     fn check_string_len_call(&mut self, args: &[Arg], call_span: Span) -> Ty {

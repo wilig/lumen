@@ -32,9 +32,11 @@ pub fn compile_native(
     info: &ModuleInfo,
     imported_modules: &[(&str, &ast::Module)],
     debug: bool,
+    source_path: &str,
 ) -> Result<Vec<u8>, NativeError> {
     let mut cg = NativeCodegen::new(info)?;
     cg.debug_mode = debug;
+    cg.source_path = source_path.to_string();
     cg.compile_module(module, imported_modules)?;
     Ok(cg.finish())
 }
@@ -71,6 +73,7 @@ struct NativeCodegen<'a> {
     libc_free: FuncId,
     helper_concat: FuncId,
     helper_println: FuncId,
+    helper_assert: FuncId,
     helper_print_frames: FuncId,
     helper_rc_alloc: FuncId,
     helper_rc_incr: FuncId,
@@ -117,6 +120,8 @@ struct NativeCodegen<'a> {
     uses_io: bool,
     /// Debug mode: emit frame chain push/pop for stack traces.
     debug_mode: bool,
+    /// Path of the source file being compiled (for assert messages).
+    source_path: String,
 }
 
 impl<'a> NativeCodegen<'a> {
@@ -206,6 +211,18 @@ impl<'a> NativeCodegen<'a> {
         println_sig.params.push(AbiParam::new(PTR));
         let helper_println = obj
             .declare_function("lumen_println", Linkage::Import, &println_sig)
+            .unwrap();
+
+        // lumen_assert(cond: i32, msg: ptr, file: ptr, line: i32, col: i32, debug: i32)
+        let mut assert_sig = obj.make_signature();
+        assert_sig.params.push(AbiParam::new(cl_types::I32)); // cond
+        assert_sig.params.push(AbiParam::new(PTR));           // msg (or 0)
+        assert_sig.params.push(AbiParam::new(PTR));           // file
+        assert_sig.params.push(AbiParam::new(cl_types::I32)); // line
+        assert_sig.params.push(AbiParam::new(cl_types::I32)); // col
+        assert_sig.params.push(AbiParam::new(cl_types::I32)); // debug_mode
+        let helper_assert = obj
+            .declare_function("lumen_assert", Linkage::Import, &assert_sig)
             .unwrap();
 
         // rc_alloc(size: i64) -> ptr: malloc(size+8), set rc=1, return ptr+8
@@ -319,6 +336,7 @@ impl<'a> NativeCodegen<'a> {
             libc_free,
             helper_concat,
             helper_println,
+            helper_assert,
             helper_print_frames,
             helper_rc_alloc,
             helper_rc_incr,
@@ -348,6 +366,7 @@ impl<'a> NativeCodegen<'a> {
             module_fn_ids: HashMap::new(),
             uses_io: false,
             debug_mode: false,
+            source_path: String::new(),
         })
     }
 
@@ -624,6 +643,9 @@ impl<'a> NativeCodegen<'a> {
         strings.push("=".to_string());
         strings.push("true".to_string());
         strings.push("false".to_string());
+        if !self.source_path.is_empty() {
+            strings.push(self.source_path.clone());
+        }
         // Intern param names for frame arg capture.
         for (fn_name, sig) in &self.info.fns {
             for (pname, _) in &sig.params {
@@ -1643,6 +1665,29 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             let s = self.compile_expr(&args[0].value)?;
             let len = self.builder.ins().load(cl_types::I32, MemFlags::new(), s, 0);
             return Ok(len);
+        }
+
+        // Built-in assert(cond) / assert(cond, msg).
+        if name == "assert" {
+            let cond = self.compile_expr(&args[0].value)?;
+            let msg = if args.len() >= 2 {
+                self.compile_expr(&args[1].value)?
+            } else {
+                self.builder.ins().iconst(PTR, 0)
+            };
+            let file_ptr = if !self.cg.source_path.is_empty() {
+                let data_id = *self.cg.string_data.get(&self.cg.source_path).unwrap();
+                let gv = self.cg.obj.declare_data_in_func(data_id, self.builder.func);
+                self.builder.ins().global_value(PTR, gv)
+            } else {
+                self.builder.ins().iconst(PTR, 0)
+            };
+            let line = self.builder.ins().iconst(cl_types::I32, span.line as i64);
+            let col = self.builder.ins().iconst(cl_types::I32, span.col as i64);
+            let dbg = self.builder.ins().iconst(cl_types::I32, if self.cg.debug_mode { 1 } else { 0 });
+            let func_ref = self.cg.obj.declare_func_in_func(self.cg.helper_assert, self.builder.func);
+            self.builder.ins().call(func_ref, &[cond, msg, file_ptr, line, col, dbg]);
+            return Ok(self.builder.ins().iconst(cl_types::I32, 0));
         }
 
         // Built-in Option/Result constructors.
@@ -2871,6 +2916,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 if let ExprKind::Ident(name) = &callee.kind {
                     if name == "string_len" {
                         return Ok(Ty::I32);
+                    }
+                    if name == "assert" {
+                        return Ok(Ty::Unit);
                     }
                     match name.as_str() {
                         "Ok" => {

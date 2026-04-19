@@ -149,7 +149,7 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
     let imported_refs: Vec<(&str, &lumen::ast::Module)> = imported.iter()
         .map(|i| (i.name.as_str(), &i.module))
         .collect();
-    let obj = lumen::native::compile_native(&module, &info, &imported_refs, debug)
+    let obj = lumen::native::compile_native(&module, &info, &imported_refs, debug, path)
         .map_err(|e| format_error(&src, path, "codegen error", e.span.line, e.span.col, e.span.end, &e.message))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
     Ok((obj, stem.to_string(), imports))

@@ -1,0 +1,14 @@
+import std/io
+
+fn main(): i32 io {
+    let x: i32 = 21
+    assert(x + x == 42)
+    assert(x > 0, "x must be positive")
+    io.println("all asserts passed")
+
+    // Triggering the failing assert below would abort with:
+    //   assertion failed at examples/assert_demo.lm:LINE:COL: x is not 100
+    // assert(x == 100, "x is not 100")
+
+    return 0
+}

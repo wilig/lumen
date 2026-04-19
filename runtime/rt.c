@@ -788,3 +788,35 @@ void lumen_debug_str(int64_t ptr) {
 }
 void lumen_debug_raw(const char *s, int32_t len) { fwrite(s, 1, len, stderr); }
 void lumen_debug_newline(void) { fprintf(stderr, "\n"); }
+
+// --- assert builtin ------------------------------------------------------
+// cond: 0 = fail, nonzero = pass.
+// msg_ptr: optional Lumen string (0 if absent).
+// file_ptr: Lumen string of the source path (interned at codegen time).
+// line, col: 1-based source location.
+// debug_mode: 1 if compiled with --debug (also dumps the frame stack).
+void lumen_assert(int32_t cond, int64_t msg_ptr, int64_t file_ptr,
+                  int32_t line, int32_t col, int32_t debug_mode) {
+    if (cond) return;
+    fprintf(stderr, "assertion failed at ");
+    if (file_ptr != 0) {
+        char *file = (char *)(uintptr_t)file_ptr;
+        int32_t file_len = *(int32_t *)file;
+        fwrite(file + 4, 1, file_len, stderr);
+    } else {
+        fprintf(stderr, "<unknown>");
+    }
+    fprintf(stderr, ":%d:%d", line, col);
+    if (msg_ptr != 0) {
+        char *msg = (char *)(uintptr_t)msg_ptr;
+        int32_t msg_len = *(int32_t *)msg;
+        fprintf(stderr, ": ");
+        fwrite(msg + 4, 1, msg_len, stderr);
+    }
+    fprintf(stderr, "\n");
+    if (debug_mode) {
+        fprintf(stderr, "Stack trace:\n");
+        lumen_debug_print_stack();
+    }
+    abort();
+}
