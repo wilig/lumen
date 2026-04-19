@@ -1,6 +1,7 @@
 // Actor model: typed message passing with compile-time checked protocols.
 
 import std/io
+import std/int
 
 actor Counter {
     count: i32

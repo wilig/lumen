@@ -3,6 +3,7 @@
 // in order by the scheduler.
 
 import std/io
+import std/int
 
 actor Counter {
     count: i32

@@ -3,6 +3,7 @@
 
 import std/io
 import std/net
+import std/http
 
 fn handle_request(raw: bytes): bytes {
     let path = http.parse_path(raw)

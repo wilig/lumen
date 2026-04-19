@@ -2,6 +2,7 @@
 // wall-clock seconds, then print it.
 
 import std/io
+import std/int
 
 extern fn time(tloc: i64): i64
 

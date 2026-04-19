@@ -5,6 +5,7 @@
 
 import std/io
 import std/net
+import std/http
 
 fn handle(client: i32): unit io {
     let request = net.gt_read(client, 4096)

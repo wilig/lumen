@@ -1,4 +1,4 @@
-extern fn new(): i64 link "lumen_list_new"
+extern fn new(elem_size: i32): i64 link "lumen_list_new"
 extern fn len(list: i64): i32 link "lumen_list_len"
 extern fn push(list: i64, value: i64): i64 link "lumen_list_push"
 extern fn get(list: i64, index: i32): i64 link "lumen_list_get"

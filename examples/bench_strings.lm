@@ -3,6 +3,7 @@
 // Measures the cost of deep-copy + watermark reset per iteration.
 
 import std/io
+import std/int
 
 fn format_num(i: i32): string {
     return "value=" + int.to_string_i32(i)

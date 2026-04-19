@@ -87,7 +87,7 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
     // Compile and link the raylib bridge only when the source imports std/raylib.
     let rl_bridge_src = rt_dir.join("raylib_bridge.c");
     let rl_bridge_obj = format!("{stem}_rl.o");
-    let uses_raylib = imports.iter().any(|i| i == "std/raylib");
+    let uses_raylib = imports.iter().any(|i| i == "std/rl" || i == "std/raylib");
     if uses_raylib && rl_bridge_src.exists() {
         let cc_status = std::process::Command::new("cc")
             .args(["-c", "-O2", rl_bridge_src.to_str().unwrap(), "-o", &rl_bridge_obj])

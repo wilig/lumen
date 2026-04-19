@@ -1,7 +1,7 @@
 extern fn tcp_listen(port: i32): i32 link "lumen_tcp_listen"
 extern fn tcp_accept(fd: i32): i32 link "lumen_tcp_accept"
 extern fn tcp_read(fd: i32, max: i32): bytes link "lumen_tcp_read"
-extern fn tcp_write(fd: i32, data: bytes): i32 link "lumen_tcp_write"
+extern fn tcp_write(fd: i32, data: bytes): i64 link "lumen_tcp_write"
 extern fn tcp_close(fd: i32): unit link "lumen_tcp_close"
 extern fn serve(port: i32, handler: i64): unit link "lumen_net_serve"
 extern fn gt_read(fd: i32, max: i32): bytes link "lumen_gt_read"

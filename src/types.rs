@@ -1764,10 +1764,10 @@ impl<'a> FnChecker<'a> {
                 Some(Ty::Bytes)
             }
             // --- Raylib: Window ---
-            ("rl", _) if !self.module.imports.iter().any(|i| i == "std/raylib") => {
+            ("rl", _) if !self.module.imports.iter().any(|i| i == "std/rl" || i == "std/raylib") => {
                 self.errors.push(TypeError {
                     span,
-                    message: format!("`rl.{method}` requires `import std/raylib`"),
+                    message: format!("`rl.{method}` requires `import std/rl`"),
                 });
                 None
             }

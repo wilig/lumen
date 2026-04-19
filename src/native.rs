@@ -827,54 +827,12 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
-        // Declare imported module extern fns. Skip symbols already declared
-        // by the hardcoded helper/runtime declarations — they'll be handled
-        // by the existing match table until Phase 5 removes them.
-        let already_declared: std::collections::HashSet<&str> = self.fn_ids.values()
-            .chain(std::iter::once(&self.helper_concat))
-            .chain(std::iter::once(&self.helper_println))
-            .chain(std::iter::once(&self.helper_itoa))
-            .map(|_| "") // placeholder — we need symbol names, not FuncIds
-            .collect();
-        // Build a set of C symbols already declared in this ObjectModule.
-        let known_symbols: Vec<&str> = vec![
-            "lumen_concat", "lumen_println", "lumen_itoa",
-            "lumen_rc_alloc", "lumen_rc_incr", "lumen_rc_decr",
-            "lumen_rt_send", "lumen_rt_ask", "lumen_rt_drain", "lumen_rt_yield",
-            "lumen_tcp_listen", "lumen_tcp_accept", "lumen_tcp_read",
-            "lumen_tcp_write", "lumen_tcp_close", "lumen_net_serve",
-            "lumen_gt_read", "lumen_gt_write",
-            "lumen_http_parse_method", "lumen_http_parse_path",
-            "lumen_http_parse_body", "lumen_http_format_response",
-            "lumen_list_new", "lumen_list_len", "lumen_list_push",
-            "lumen_list_get", "lumen_list_set", "lumen_list_remove",
-            "rl_init_window", "rl_close_window", "rl_window_should_close",
-            "rl_set_target_fps", "rl_get_frame_time",
-            "rl_begin_drawing", "rl_end_drawing", "rl_clear_background",
-            "rl_draw_text", "rl_measure_text",
-            "rl_draw_rectangle_rec", "rl_draw_rectangle", "rl_draw_rectangle_pro",
-            "rl_draw_circle", "rl_draw_line",
-            "rl_is_key_pressed", "rl_is_key_down", "rl_is_gesture_detected",
-            "rl_set_camera", "rl_begin_mode_2d", "rl_end_mode_2d",
-            "rl_init_audio",
-            "rl_color_black", "rl_color_white", "rl_color_red", "rl_color_green",
-            "rl_color_blue", "rl_color_yellow", "rl_color_purple",
-            "rl_color_darkblue", "rl_color_darkgray", "rl_color_gray",
-            "rl_color_alpha",
-            "lumen_sqrt", "lumen_abs", "lumen_cos", "lumen_sin",
-            "lumen_clamp", "lumen_rand_f64",
-            "write", "malloc", "free", "lumen_print_frames",
-        ];
-        let known_set: std::collections::HashSet<&str> = known_symbols.into_iter().collect();
-        drop(already_declared);
-        for (mod_name, links) in &self.info.module_link_names {
-            let mod_sigs = self.info.modules.get(mod_name);
+        // Declare imported module extern fns from parsed std/*.lm files.
+        for (_mod_name, links) in &self.info.module_link_names {
+            let mod_sigs = self.info.modules.get(_mod_name);
             for (fn_name, link_name) in links {
                 if self.module_fn_ids.contains_key(link_name.as_str()) {
                     continue;
-                }
-                if known_set.contains(link_name.as_str()) {
-                    continue; // handled by existing hardcoded declarations
                 }
                 if let Some(sig) = mod_sigs.and_then(|m| m.get(fn_name)) {
                     let cl_sig = self.build_sig_from(sig);
@@ -1003,7 +961,9 @@ impl<'a> NativeCodegen<'a> {
         for (_, ty) in &sig.params {
             cl_sig.params.push(AbiParam::new(lumen_to_cl(ty)));
         }
-        cl_sig.returns.push(AbiParam::new(lumen_to_cl(&sig.ret)));
+        if sig.ret != Ty::Unit {
+            cl_sig.returns.push(AbiParam::new(lumen_to_cl(&sig.ret)));
+        }
         cl_sig
     }
 
@@ -1451,9 +1411,13 @@ impl<'a> NativeCodegen<'a> {
             if fb.hit_return {
                 // The body ended with a return. We're on a dead block.
                 // Emit a correctly-typed return for the function signature.
-                let ret_ty = lumen_to_cl(&sig.ret);
-                let dummy = fb.builder.ins().iconst(ret_ty, 0);
-                fb.builder.ins().return_(&[dummy]);
+                if sig.ret == Ty::Unit {
+                    fb.builder.ins().return_(&[]);
+                } else {
+                    let ret_ty = lumen_to_cl(&sig.ret);
+                    let dummy = fb.builder.ins().iconst(ret_ty, 0);
+                    fb.builder.ins().return_(&[dummy]);
+                }
             } else {
                 // If this is main, drain the message queue before returning.
                 if f.name == "main" {
@@ -1463,7 +1427,11 @@ impl<'a> NativeCodegen<'a> {
                     fb.builder.ins().call(drain_ref, &[]);
                 }
                 // Return.
-                fb.builder.ins().return_(&[result]);
+                if sig.ret == Ty::Unit {
+                    fb.builder.ins().return_(&[]);
+                } else {
+                    fb.builder.ins().return_(&[result]);
+                }
             }
         } // fb dropped here, releasing the mutable borrow on builder
 
@@ -1720,8 +1688,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
             }
             StmtKind::Return(None) => {
-                let zero = self.builder.ins().iconst(cl_types::I32, 0);
-                self.builder.ins().return_(&[zero]);
+                self.builder.ins().return_(&[]);
             }
         }
         Ok(())
@@ -2081,7 +2048,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
         }
         let call = self.builder.ins().call(func_ref, &arg_vals);
-        Ok(self.builder.inst_results(call)[0])
+        let results = self.builder.inst_results(call);
+        if results.is_empty() {
+            // Void function — return a unit placeholder.
+            Ok(self.builder.ins().iconst(cl_types::I32, 0))
+        } else {
+            Ok(results[0])
+        }
     }
 
     // --- Method call helpers ------------------------------------------------
@@ -2104,6 +2077,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(self.builder.ins().iconst(cl_types::I32, 0))
     }
 
+    /// Look up a module function's FuncId by its C link name.
+    fn module_func(&mut self, link_name: &str) -> FuncId {
+        *self.cg.module_fn_ids.get(link_name)
+            .expect(&format!("module function not declared: {link_name}"))
+    }
+
     fn compile_method_call(
         &mut self,
         receiver: &Expr,
@@ -2112,81 +2091,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         span: Span,
     ) -> Result<Value, NativeError> {
         if let ExprKind::Ident(mod_name) = &receiver.kind {
-            // --- Standard dispatch: most calls are just "compile args, call, return" ---
-            let result = match (mod_name.as_str(), method) {
-                // io / int
-                ("io", "println")           => return self.call_builtin_void(self.cg.helper_println, &args[..1]),
-                ("int", "to_string_i32")    => return self.call_builtin(self.cg.helper_itoa, &args[..1]),
-                // bytes / string
-                ("bytes", "concat")         => return self.call_builtin(self.cg.helper_concat, &args[..2]),
-                ("bytes", "from_string")    => return self.compile_expr(&args[0].value),
-                ("string", "from_bytes")    => return self.compile_expr(&args[0].value),
-                // net
-                ("net", "tcp_listen")       => return self.call_builtin(self.cg.net_tcp_listen, &args[..1]),
-                ("net", "tcp_accept")       => return self.call_builtin(self.cg.net_tcp_accept, &args[..1]),
-                ("net", "tcp_read")         => return self.call_builtin(self.cg.net_tcp_read, &args[..2]),
-                ("net", "tcp_close")        => return self.call_builtin_void(self.cg.net_tcp_close, &args[..1]),
-                ("net", "gt_read")          => return self.call_builtin(self.cg.gt_read, &args[..2]),
-                ("net", "gt_write")         => return self.call_builtin(self.cg.gt_write, &args[..2]),
-                // http
-                ("http", "parse_method")    => return self.call_builtin(self.cg.http_parse_method, &args[..1]),
-                ("http", "parse_path")      => return self.call_builtin(self.cg.http_parse_path, &args[..1]),
-                ("http", "parse_body")      => return self.call_builtin(self.cg.http_parse_body, &args[..1]),
-                ("http", "format_response") => return self.call_builtin(self.cg.http_format_response, &args[..2]),
-                // list (simple cases)
-                ("list", "len")             => return self.call_builtin(self.cg.list_len, &args[..1]),
-                ("list", "remove")          => return self.call_builtin(self.cg.list_remove, &args[..2]),
-                // rl: window
-                ("rl", "init_window")       => return self.call_builtin_void(self.cg.rl_init_window, &args[..3]),
-                ("rl", "close_window")      => return self.call_builtin_void(self.cg.rl_close_window, &[]),
-                ("rl", "window_should_close") => return self.call_builtin(self.cg.rl_window_should_close, &[]),
-                ("rl", "set_target_fps")    => return self.call_builtin_void(self.cg.rl_set_target_fps, &args[..1]),
-                ("rl", "get_frame_time")    => return self.call_builtin(self.cg.rl_get_frame_time, &[]),
-                // rl: drawing
-                ("rl", "begin_drawing")     => return self.call_builtin_void(self.cg.rl_begin_drawing, &[]),
-                ("rl", "end_drawing")       => return self.call_builtin_void(self.cg.rl_end_drawing, &[]),
-                ("rl", "clear_background")  => return self.call_builtin_void(self.cg.rl_clear_background, &args[..1]),
-                ("rl", "draw_text")         => return self.call_builtin_void(self.cg.rl_draw_text, &args[..5]),
-                ("rl", "measure_text")      => return self.call_builtin(self.cg.rl_measure_text, &args[..2]),
-                ("rl", "draw_rect")         => return self.call_builtin_void(self.cg.rl_draw_rectangle_rec, &args[..5]),
-                ("rl", "draw_rect_i")       => return self.call_builtin_void(self.cg.rl_draw_rectangle, &args[..5]),
-                ("rl", "draw_rect_pro")     => return self.call_builtin_void(self.cg.rl_draw_rectangle_pro, &args[..8]),
-                ("rl", "draw_circle")       => return self.call_builtin_void(self.cg.rl_draw_circle, &args[..4]),
-                ("rl", "draw_line")         => return self.call_builtin_void(self.cg.rl_draw_line, &args[..5]),
-                // rl: input
-                ("rl", "is_key_pressed")    => return self.call_builtin(self.cg.rl_is_key_pressed, &args[..1]),
-                ("rl", "is_key_down")       => return self.call_builtin(self.cg.rl_is_key_down, &args[..1]),
-                ("rl", "is_gesture_detected") => return self.call_builtin(self.cg.rl_is_gesture_detected, &args[..1]),
-                // rl: camera
-                ("rl", "set_camera")        => return self.call_builtin_void(self.cg.rl_set_camera, &args[..6]),
-                ("rl", "begin_mode_2d")     => return self.call_builtin_void(self.cg.rl_begin_mode_2d, &[]),
-                ("rl", "end_mode_2d")       => return self.call_builtin_void(self.cg.rl_end_mode_2d, &[]),
-                // rl: audio
-                ("rl", "init_audio")        => return self.call_builtin_void(self.cg.rl_init_audio, &[]),
-                // rl: colors
-                ("rl", "black")    => return self.call_builtin(self.cg.rl_color_black, &[]),
-                ("rl", "white")    => return self.call_builtin(self.cg.rl_color_white, &[]),
-                ("rl", "red")      => return self.call_builtin(self.cg.rl_color_red, &[]),
-                ("rl", "green")    => return self.call_builtin(self.cg.rl_color_green, &[]),
-                ("rl", "blue")     => return self.call_builtin(self.cg.rl_color_blue, &[]),
-                ("rl", "yellow")   => return self.call_builtin(self.cg.rl_color_yellow, &[]),
-                ("rl", "purple")   => return self.call_builtin(self.cg.rl_color_purple, &[]),
-                ("rl", "darkblue") => return self.call_builtin(self.cg.rl_color_darkblue, &[]),
-                ("rl", "darkgray") => return self.call_builtin(self.cg.rl_color_darkgray, &[]),
-                ("rl", "gray")     => return self.call_builtin(self.cg.rl_color_gray, &[]),
-                ("rl", "color_alpha") => return self.call_builtin(self.cg.rl_color_alpha, &args[..2]),
-                // math
-                ("math", "sqrt")   => return self.call_builtin(self.cg.math_sqrt, &args[..1]),
-                ("math", "abs")    => return self.call_builtin(self.cg.math_abs, &args[..1]),
-                ("math", "cos")    => return self.call_builtin(self.cg.math_cos, &args[..1]),
-                ("math", "sin")    => return self.call_builtin(self.cg.math_sin, &args[..1]),
-                ("math", "clamp")  => return self.call_builtin(self.cg.math_clamp, &args[..3]),
-                ("math", "rand")   => return self.call_builtin(self.cg.math_rand, &[]),
-                _ => None,
-            };
-            if let Some(v) = result { return Ok(v); }
+            // --- Special cases that need custom codegen ---
 
-            // --- Special cases that need custom logic ---
+            // Zero-cost identity conversions.
+            if (mod_name == "bytes" && method == "from_string")
+                || (mod_name == "string" && method == "from_bytes") {
+                return self.compile_expr(&args[0].value);
+            }
 
             // bytes.len: inline load
             if mod_name == "bytes" && method == "len" {
@@ -2222,7 +2133,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             if mod_name == "net" && method == "tcp_write" {
                 let fd = self.compile_expr(&args[0].value)?;
                 let data = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.net_tcp_write, self.builder.func);
+                let fid = self.module_func("lumen_tcp_write");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[fd, data]);
                 let result = self.builder.inst_results(call)[0];
                 return Ok(self.builder.ins().ireduce(cl_types::I32, result));
@@ -2239,14 +2151,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 })?;
                 let handler_ref = self.cg.obj.declare_func_in_func(handler_id, self.builder.func);
                 let handler_addr = self.builder.ins().func_addr(PTR, handler_ref);
-                let serve_ref = self.cg.obj.declare_func_in_func(self.cg.net_serve, self.builder.func);
+                let serve_fid = self.module_func("lumen_net_serve");
+                let serve_ref = self.cg.obj.declare_func_in_func(serve_fid, self.builder.func);
                 self.builder.ins().call(serve_ref, &[port, handler_addr]);
                 return Ok(self.builder.ins().iconst(cl_types::I32, 0));
             }
             // list.new: pass elem_size=8
             if mod_name == "list" && method == "new" {
                 let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_new, self.builder.func);
+                let fid = self.module_func("lumen_list_new");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[elem_size]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
@@ -2259,7 +2173,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
                 } else { val_raw };
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_push, self.builder.func);
+                let fid = self.module_func("lumen_list_push");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, val64]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
@@ -2267,7 +2182,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             if mod_name == "list" && method == "get" {
                 let l = self.compile_expr(&args[0].value)?;
                 let i = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_get, self.builder.func);
+                let fid = self.module_func("lumen_list_get");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, i]);
                 let result = self.builder.inst_results(call)[0];
                 let list_ty = self.infer_ty(&args[0].value)?;
@@ -2285,7 +2201,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
                 } else { val_raw };
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_set, self.builder.func);
+                let fid = self.module_func("lumen_list_set");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, i, val64]);
                 return Ok(self.builder.inst_results(call)[0]);
             }

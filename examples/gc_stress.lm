@@ -3,6 +3,7 @@
 // that gets reclaimed when the helper function returns.
 
 import std/io
+import std/int
 
 fn format_line(i: i32): string {
     return "iteration " + int.to_string_i32(i) + " of 100000"
