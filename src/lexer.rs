@@ -471,6 +471,46 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self, start: u32, line: u32, col: u32) -> Result<Token, LexError> {
         self.bump(); // opening "
+
+        // Check for triple-quoted multiline string: """..."""
+        if self.peek() == Some(b'"') && self.peek_at(1) == Some(b'"') {
+            self.bump(); // second "
+            self.bump(); // third "
+            let mut out = String::new();
+            loop {
+                match self.peek() {
+                    None => {
+                        return Err(LexError {
+                            span: self.span_from(start, line, col),
+                            message: "unterminated triple-quoted string".into(),
+                        });
+                    }
+                    Some(b'"') if self.peek_at(1) == Some(b'"') && self.peek_at(2) == Some(b'"') => {
+                        self.bump(); self.bump(); self.bump();
+                        return Ok(Token {
+                            kind: TokenKind::StringLit(out),
+                            span: self.span_from(start, line, col),
+                        });
+                    }
+                    Some(b'\n') => {
+                        self.bump();
+                        out.push('\n');
+                    }
+                    Some(b) => {
+                        let char_len = utf8_char_len(b);
+                        let end = self.pos + char_len;
+                        if end <= self.src.len() {
+                            if let Ok(s) = std::str::from_utf8(&self.src[self.pos..end]) {
+                                out.push_str(s);
+                            }
+                        }
+                        self.pos = end;
+                        self.col += 1;
+                    }
+                }
+            }
+        }
+
         let mut out = String::new();
         loop {
             let b = match self.peek() {
