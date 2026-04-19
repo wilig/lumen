@@ -1,0 +1,44 @@
+// Window
+extern fn init_window(w: i32, h: i32, title: string): unit link "rl_init_window"
+extern fn close_window(): unit link "rl_close_window"
+extern fn window_should_close(): i32 link "rl_window_should_close"
+extern fn set_target_fps(fps: i32): unit link "rl_set_target_fps"
+extern fn get_frame_time(): f64 link "rl_get_frame_time"
+
+// Drawing
+extern fn begin_drawing(): unit link "rl_begin_drawing"
+extern fn end_drawing(): unit link "rl_end_drawing"
+extern fn clear_background(color: i32): unit link "rl_clear_background"
+extern fn draw_text(text: string, x: i32, y: i32, size: i32, color: i32): unit link "rl_draw_text"
+extern fn measure_text(text: string, size: i32): i32 link "rl_measure_text"
+extern fn draw_rect(x: f64, y: f64, w: f64, h: f64, color: i32): unit link "rl_draw_rectangle_rec"
+extern fn draw_rect_i(x: i32, y: i32, w: i32, h: i32, color: i32): unit link "rl_draw_rectangle"
+extern fn draw_rect_pro(rx: f64, ry: f64, rw: f64, rh: f64, ox: f64, oy: f64, rot: f64, color: i32): unit link "rl_draw_rectangle_pro"
+extern fn draw_circle(cx: f64, cy: f64, radius: f64, color: i32): unit link "rl_draw_circle"
+extern fn draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32): unit link "rl_draw_line"
+
+// Input
+extern fn is_key_pressed(key: i32): i32 link "rl_is_key_pressed"
+extern fn is_key_down(key: i32): i32 link "rl_is_key_down"
+extern fn is_gesture_detected(gesture: i32): i32 link "rl_is_gesture_detected"
+
+// Camera
+extern fn set_camera(tx: f64, ty: f64, ox: f64, oy: f64, rot: f64, zoom: f64): unit link "rl_set_camera"
+extern fn begin_mode_2d(): unit link "rl_begin_mode_2d"
+extern fn end_mode_2d(): unit link "rl_end_mode_2d"
+
+// Audio
+extern fn init_audio(): unit link "rl_init_audio"
+
+// Colors
+extern fn black(): i32 link "rl_color_black"
+extern fn white(): i32 link "rl_color_white"
+extern fn red(): i32 link "rl_color_red"
+extern fn green(): i32 link "rl_color_green"
+extern fn blue(): i32 link "rl_color_blue"
+extern fn yellow(): i32 link "rl_color_yellow"
+extern fn purple(): i32 link "rl_color_purple"
+extern fn darkblue(): i32 link "rl_color_darkblue"
+extern fn darkgray(): i32 link "rl_color_darkgray"
+extern fn gray(): i32 link "rl_color_gray"
+extern fn color_alpha(color: i32, alpha: f64): i32 link "rl_color_alpha"

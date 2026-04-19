@@ -1,0 +1,1 @@
+extern fn concat(a: bytes, b: bytes): bytes link "lumen_concat"

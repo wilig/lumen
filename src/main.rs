@@ -30,7 +30,25 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let tokens = lumen::lexer::lex(&src).map_err(|e| format!("lex error: {e}"))?;
     let module = lumen::parser::parse(tokens).map_err(|e| format!("parse error: {e}"))?;
-    let info = lumen::types::typecheck(&module).map_err(|errs| {
+
+    // Resolve imports to stdlib .lm files and parse them.
+    let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
+    let mut imported = Vec::new();
+    for imp in &module.imports {
+        let mod_name = imp.path.last().cloned().unwrap_or_default();
+        let mod_path = std_dir.join(format!("{mod_name}.lm"));
+        if mod_path.exists() {
+            let mod_src = std::fs::read_to_string(&mod_path)
+                .map_err(|e| format!("read {}: {e}", mod_path.display()))?;
+            let mod_tokens = lumen::lexer::lex(&mod_src)
+                .map_err(|e| format!("lex error in std/{mod_name}.lm: {e}"))?;
+            let mod_ast = lumen::parser::parse(mod_tokens)
+                .map_err(|e| format!("parse error in std/{mod_name}.lm: {e}"))?;
+            imported.push(lumen::types::ParsedImport { name: mod_name, module: mod_ast });
+        }
+    }
+
+    let info = lumen::types::typecheck(&module, &imported).map_err(|errs| {
         errs.iter()
             .map(|e| format!("type error: {e}"))
             .collect::<Vec<_>>()

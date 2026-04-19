@@ -1,0 +1,2 @@
+// string.from_bytes is a zero-cost identity (same representation).
+// Handled inline by the codegen — no extern fn needed.

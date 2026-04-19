@@ -1,0 +1,6 @@
+extern fn sqrt(x: f64): f64 link "lumen_sqrt"
+extern fn abs(x: f64): f64 link "lumen_abs"
+extern fn cos(x: f64): f64 link "lumen_cos"
+extern fn sin(x: f64): f64 link "lumen_sin"
+extern fn clamp(x: f64, lo: f64, hi: f64): f64 link "lumen_clamp"
+extern fn rand(): f64 link "lumen_rand_f64"

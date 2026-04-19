@@ -135,6 +135,10 @@ pub struct ModuleInfo {
     pub actors: HashMap<String, Vec<MsgSig>>,
     /// Imported module paths: e.g. ["std/io", "std/raylib"].
     pub imports: Vec<String>,
+    /// Imported module APIs: module_name → (fn_name → FnSig).
+    pub modules: HashMap<String, HashMap<String, FnSig>>,
+    /// Imported module extern fn link names: module_name → (fn_name → link_name).
+    pub module_link_names: HashMap<String, HashMap<String, String>>,
 }
 
 /// Signature of an actor message handler.
@@ -183,14 +187,53 @@ pub struct FnSig {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn typecheck(module: &Module) -> Result<ModuleInfo, Vec<TypeError>> {
+/// Parsed import: module name + its AST items (extern fns, fns, types).
+pub struct ParsedImport {
+    pub name: String,
+    pub module: Module,
+}
+
+pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInfo, Vec<TypeError>> {
     let mut errors = Vec::new();
     let mut info = ModuleInfo {
         types: HashMap::new(),
         fns: HashMap::new(),
         actors: HashMap::new(),
         imports: module.imports.iter().map(|i| i.path.join("/")).collect(),
+        modules: HashMap::new(),
+        module_link_names: HashMap::new(),
     };
+
+    // Register imported module APIs.
+    for imp in imported {
+        let mut mod_fns = HashMap::new();
+        let mut mod_links = HashMap::new();
+        for item in &imp.module.items {
+            if let Item::ExternFn(ef) = item {
+                let params: Vec<(String, Ty)> = ef.params.iter().filter_map(|p| {
+                    resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
+                }).collect();
+                let ret = resolve_type(&ef.return_type, &info.types).unwrap_or(Ty::Error);
+                let sig = FnSig { params, ret, effect: Effect::Pure };
+                if let Some(link) = &ef.link_name {
+                    mod_links.insert(ef.name.clone(), link.clone());
+                } else {
+                    mod_links.insert(ef.name.clone(), ef.name.clone());
+                }
+                mod_fns.insert(ef.name.clone(), sig);
+            }
+            if let Item::Fn(f) = item {
+                let params: Vec<(String, Ty)> = f.params.iter().filter_map(|p| {
+                    resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
+                }).collect();
+                let ret = resolve_type(&f.return_type, &info.types).unwrap_or(Ty::Error);
+                let sig = FnSig { params, ret, effect: f.effect };
+                mod_fns.insert(f.name.clone(), sig);
+            }
+        }
+        info.modules.insert(imp.name.clone(), mod_fns);
+        info.module_link_names.insert(imp.name.clone(), mod_links);
+    }
 
     // Pass 1: register all type decl names so the next pass can resolve
     // references between user types in any order.
@@ -1949,7 +1992,31 @@ impl<'a> FnChecker<'a> {
                 if !args.is_empty() { self.errors.push(TypeError { span, message: "`math.rand` expects 0 arguments".into() }); }
                 Some(Ty::F64)
             }
-            _ => None,
+            _ => {
+                // Fall through to imported module lookup.
+                if let Some(mod_fns) = self.module.modules.get(module) {
+                    if let Some(sig) = mod_fns.get(method) {
+                        if sig.effect == Effect::Io {
+                            self.check_effect(Effect::Io, span);
+                        }
+                        if args.len() != sig.params.len() {
+                            self.errors.push(TypeError {
+                                span,
+                                message: format!(
+                                    "`{module}.{method}` expects {} args, found {}",
+                                    sig.params.len(), args.len()
+                                ),
+                            });
+                        } else {
+                            for (i, (_, pty)) in sig.params.iter().enumerate() {
+                                self.check_expr(&args[i].value, pty);
+                            }
+                        }
+                        return Some(sig.ret.clone());
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -2554,7 +2621,7 @@ mod tests {
     fn tc(src: &str) -> Result<ModuleInfo, Vec<TypeError>> {
         let toks = lex(src).unwrap();
         let m = parse(toks).unwrap();
-        typecheck(&m)
+        typecheck(&m, &[])
     }
 
     fn tc_ok(src: &str) {

@@ -162,6 +162,9 @@ struct NativeCodegen<'a> {
     /// Lambda FnSigs (lambdas aren't in ModuleInfo, so we store sigs here).
     lambda_sigs: HashMap<String, crate::types::FnSig>,
 
+    /// Imported module function FuncIds: C link name → FuncId.
+    module_fn_ids: HashMap<String, FuncId>,
+
     /// Uses WASI / io module.
     uses_io: bool,
 }
@@ -773,6 +776,7 @@ impl<'a> NativeCodegen<'a> {
             string_data: HashMap::new(),
             lambda_ids: HashMap::new(),
             lambda_sigs: HashMap::new(),
+            module_fn_ids: HashMap::new(),
             uses_io: false,
         })
     }
@@ -820,6 +824,63 @@ impl<'a> NativeCodegen<'a> {
                     .declare_function(symbol, Linkage::Import, &sig)
                     .unwrap();
                 self.fn_ids.insert(ef.name.clone(), id);
+            }
+        }
+
+        // Declare imported module extern fns. Skip symbols already declared
+        // by the hardcoded helper/runtime declarations — they'll be handled
+        // by the existing match table until Phase 5 removes them.
+        let already_declared: std::collections::HashSet<&str> = self.fn_ids.values()
+            .chain(std::iter::once(&self.helper_concat))
+            .chain(std::iter::once(&self.helper_println))
+            .chain(std::iter::once(&self.helper_itoa))
+            .map(|_| "") // placeholder — we need symbol names, not FuncIds
+            .collect();
+        // Build a set of C symbols already declared in this ObjectModule.
+        let known_symbols: Vec<&str> = vec![
+            "lumen_concat", "lumen_println", "lumen_itoa",
+            "lumen_rc_alloc", "lumen_rc_incr", "lumen_rc_decr",
+            "lumen_rt_send", "lumen_rt_ask", "lumen_rt_drain", "lumen_rt_yield",
+            "lumen_tcp_listen", "lumen_tcp_accept", "lumen_tcp_read",
+            "lumen_tcp_write", "lumen_tcp_close", "lumen_net_serve",
+            "lumen_gt_read", "lumen_gt_write",
+            "lumen_http_parse_method", "lumen_http_parse_path",
+            "lumen_http_parse_body", "lumen_http_format_response",
+            "lumen_list_new", "lumen_list_len", "lumen_list_push",
+            "lumen_list_get", "lumen_list_set", "lumen_list_remove",
+            "rl_init_window", "rl_close_window", "rl_window_should_close",
+            "rl_set_target_fps", "rl_get_frame_time",
+            "rl_begin_drawing", "rl_end_drawing", "rl_clear_background",
+            "rl_draw_text", "rl_measure_text",
+            "rl_draw_rectangle_rec", "rl_draw_rectangle", "rl_draw_rectangle_pro",
+            "rl_draw_circle", "rl_draw_line",
+            "rl_is_key_pressed", "rl_is_key_down", "rl_is_gesture_detected",
+            "rl_set_camera", "rl_begin_mode_2d", "rl_end_mode_2d",
+            "rl_init_audio",
+            "rl_color_black", "rl_color_white", "rl_color_red", "rl_color_green",
+            "rl_color_blue", "rl_color_yellow", "rl_color_purple",
+            "rl_color_darkblue", "rl_color_darkgray", "rl_color_gray",
+            "rl_color_alpha",
+            "lumen_sqrt", "lumen_abs", "lumen_cos", "lumen_sin",
+            "lumen_clamp", "lumen_rand_f64",
+            "write", "malloc", "free", "lumen_print_frames",
+        ];
+        let known_set: std::collections::HashSet<&str> = known_symbols.into_iter().collect();
+        drop(already_declared);
+        for (mod_name, links) in &self.info.module_link_names {
+            let mod_sigs = self.info.modules.get(mod_name);
+            for (fn_name, link_name) in links {
+                if self.module_fn_ids.contains_key(link_name.as_str()) {
+                    continue;
+                }
+                if known_set.contains(link_name.as_str()) {
+                    continue; // handled by existing hardcoded declarations
+                }
+                if let Some(sig) = mod_sigs.and_then(|m| m.get(fn_name)) {
+                    let cl_sig = self.build_sig_from(sig);
+                    let id = self.obj.declare_function(link_name, Linkage::Import, &cl_sig).unwrap();
+                    self.module_fn_ids.insert(link_name.clone(), id);
+                }
             }
         }
 
@@ -2229,6 +2290,28 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 return Ok(self.builder.inst_results(call)[0]);
             }
         }
+        // Fall through to imported module lookup.
+        if let ExprKind::Ident(mod_name) = &receiver.kind {
+            if let Some(link_name) = self.cg.info.module_link_names
+                .get(mod_name.as_str())
+                .and_then(|m| m.get(method))
+            {
+                // Look up the FuncId for this link name (declared in compile_module).
+                if let Some(&func_id) = self.cg.module_fn_ids.get(link_name.as_str()) {
+                    // Check if it's a void function by looking at the module sig.
+                    let is_void = self.cg.info.modules
+                        .get(mod_name.as_str())
+                        .and_then(|m| m.get(method))
+                        .map(|sig| sig.ret == Ty::Unit)
+                        .unwrap_or(false);
+                    if is_void {
+                        return self.call_builtin_void(func_id, args);
+                    } else {
+                        return self.call_builtin(func_id, args);
+                    }
+                }
+            }
+        }
         Err(NativeError {
             span,
             message: format!("method `.{method}()` not supported in native backend"),
@@ -3226,6 +3309,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     // --- Math ---
                     if m == "math" {
                         return Ok(Ty::F64);
+                    }
+                    // Fall through to imported module lookup.
+                    if let Some(mod_fns) = self.cg.info.modules.get(m.as_str()) {
+                        if let Some(sig) = mod_fns.get(method.as_str()) {
+                            return Ok(sig.ret.clone());
+                        }
                     }
                 }
                 Ty::I32

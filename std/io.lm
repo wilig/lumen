@@ -1,0 +1,1 @@
+extern fn println(s: string): unit link "lumen_println"

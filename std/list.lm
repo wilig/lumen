@@ -1,0 +1,6 @@
+extern fn new(): i64 link "lumen_list_new"
+extern fn len(list: i64): i32 link "lumen_list_len"
+extern fn push(list: i64, value: i64): i64 link "lumen_list_push"
+extern fn get(list: i64, index: i32): i64 link "lumen_list_get"
+extern fn set(list: i64, index: i32, value: i64): i64 link "lumen_list_set"
+extern fn remove(list: i64, index: i32): i64 link "lumen_list_remove"

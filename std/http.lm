@@ -1,0 +1,4 @@
+extern fn parse_method(raw: bytes): string link "lumen_http_parse_method"
+extern fn parse_path(raw: bytes): string link "lumen_http_parse_path"
+extern fn parse_body(raw: bytes): string link "lumen_http_parse_body"
+extern fn format_response(status: i32, body: string): bytes link "lumen_http_format_response"

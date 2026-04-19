@@ -1,0 +1,1 @@
+extern fn to_string_i32(n: i32): string link "lumen_itoa"
