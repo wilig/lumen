@@ -323,6 +323,20 @@ impl Parser {
         self.expect(&TokenKind::Fn, "`fn`")?;
         let (name, name_span) = self.expect_ident("function name")?;
 
+        // Optional generic type parameters: fn name<T, U>(...)
+        let mut type_params = Vec::new();
+        if matches!(self.peek_kind(), TokenKind::Lt) {
+            self.bump();
+            loop {
+                let (tp, _) = self.expect_ident("type parameter name")?;
+                type_params.push(tp);
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Gt, "`>` to close type parameters")?;
+        }
+
         self.expect(&TokenKind::LParen, "`(` after function name")?;
         let mut params = Vec::new();
         if !matches!(self.peek_kind(), TokenKind::RParen) {
@@ -361,6 +375,7 @@ impl Parser {
         Ok(FnDecl {
             name,
             name_span,
+            type_params,
             params,
             return_type,
             effect,

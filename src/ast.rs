@@ -80,6 +80,10 @@ pub struct ExternFnDecl {
 pub struct FnDecl {
     pub name: String,
     pub name_span: Span,
+    /// Generic type parameters: `fn first<T>(...)` → ["T"]. Empty for
+    /// non-generic functions. Each instantiation is monomorphized at
+    /// codegen time into a fresh function with `T` substituted.
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub return_type: Type,
     pub effect: Effect,

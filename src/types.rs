@@ -64,6 +64,10 @@ pub enum Ty {
     FnPtr { params: Vec<Ty>, ret: Box<Ty> },
     /// An actor handle.
     Handle(Box<Ty>),
+    /// A generic type parameter, e.g. the `T` inside `fn first<T>(...)`.
+    /// Only valid inside the body of a generic function; codegen
+    /// substitutes a concrete type at each call-site monomorphization.
+    Generic(String),
     /// Internal placeholder emitted after a type error. Any comparison
     /// against `Error` silently succeeds so one failure doesn't cascade
     /// into a storm of follow-on errors.
@@ -96,6 +100,7 @@ impl Ty {
                 format!("fn({}): {}", ps.join(", "), ret.display())
             }
             Ty::Handle(inner) => format!("Handle<{}>", inner.display()),
+            Ty::Generic(name) => name.clone(),
             Ty::Error => "<error>".into(),
         }
     }
@@ -185,6 +190,10 @@ pub struct FnSig {
     pub ret: Ty,
     #[allow(dead_code)]
     pub effect: Effect,
+    /// Generic type parameters this fn introduces (empty for non-generic).
+    /// Names appearing in `params`/`ret` as `Ty::Generic(name)` reference
+    /// these. At each call site the codegen substitutes concrete types.
+    pub type_params: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +233,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                 } else {
                     Effect::Pure
                 };
-                let sig = FnSig { params, ret, effect };
+                let sig = FnSig { params, ret, effect, type_params: Vec::new() };
                 if let Some(link) = &ef.link_name {
                     mod_links.insert(ef.name.clone(), link.clone());
                 } else {
@@ -234,10 +243,10 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             }
             if let Item::Fn(f) = item {
                 let params: Vec<(String, Ty)> = f.params.iter().filter_map(|p| {
-                    resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
+                    resolve_type_with_params(&p.ty, &info.types, &f.type_params).ok().map(|t| (p.name.clone(), t))
                 }).collect();
-                let ret = resolve_type(&f.return_type, &info.types).unwrap_or(Ty::Error);
-                let sig = FnSig { params, ret, effect: f.effect };
+                let ret = resolve_type_with_params(&f.return_type, &info.types, &f.type_params).unwrap_or(Ty::Error);
+                let sig = FnSig { params, ret, effect: f.effect, type_params: f.type_params.clone() };
                 mod_fns.insert(f.name.clone(), sig);
             }
         }
@@ -385,6 +394,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params: fn_params,
                     ret: ret.clone(),
                     effect: Effect::Pure,
+                    type_params: Vec::new(),
                 },
             );
             if let Some(msgs) = info.actors.get_mut(&mh.actor_name) {
@@ -409,12 +419,12 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             }
             let mut params = Vec::new();
             for p in &f.params {
-                match resolve_type(&p.ty, &info.types) {
+                match resolve_type_with_params(&p.ty, &info.types, &f.type_params) {
                     Ok(t) => params.push((p.name.clone(), t)),
                     Err(e) => errors.push(e),
                 }
             }
-            let ret = match resolve_type(&f.return_type, &info.types) {
+            let ret = match resolve_type_with_params(&f.return_type, &info.types, &f.type_params) {
                 Ok(t) => t,
                 Err(e) => {
                     errors.push(e);
@@ -427,6 +437,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params,
                     ret,
                     effect: f.effect,
+                    type_params: f.type_params.clone(),
                 },
             );
         }
@@ -462,6 +473,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params,
                     ret,
                     effect: Effect::Io,
+                    type_params: Vec::new(),
                 },
             );
         }
@@ -479,6 +491,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             let synthetic = FnDecl {
                 name: fn_name.clone(),
                 name_span: mh.name_span,
+                type_params: Vec::new(),
                 params: {
                     let mut ps = vec![Param {
                         name: "self".to_string(),
@@ -526,6 +539,23 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
 // ---------------------------------------------------------------------------
 
 fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeError> {
+    resolve_type_with_params(t, types, &[])
+}
+
+fn resolve_type_with_params(
+    t: &Type,
+    types: &HashMap<String, TypeInfo>,
+    type_params: &[String],
+) -> Result<Ty, TypeError> {
+    // Treat any zero-arg name that matches a generic type parameter as
+    // Ty::Generic. This is the only place type-parameter names get
+    // recognized — nested resolutions (Result<T, ...>, List<T>, etc.) all
+    // re-enter through here.
+    if let TypeKind::Named { name, args } = &t.kind {
+        if args.is_empty() && type_params.iter().any(|p| p == name) {
+            return Ok(Ty::Generic(name.clone()));
+        }
+    }
     match &t.kind {
         TypeKind::Named { name, args } => match name.as_str() {
             "i32" if args.is_empty() => Ok(Ty::I32),
@@ -538,21 +568,21 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
             "bytes" if args.is_empty() => Ok(Ty::Bytes),
             "unit" if args.is_empty() => Ok(Ty::Unit),
             "Option" if args.len() == 1 => {
-                Ok(Ty::Option(Box::new(resolve_type(&args[0], types)?)))
+                Ok(Ty::Option(Box::new(resolve_type_with_params(&args[0], types, type_params)?)))
             }
             "Result" if args.len() == 2 => Ok(Ty::Result(
-                Box::new(resolve_type(&args[0], types)?),
-                Box::new(resolve_type(&args[1], types)?),
+                Box::new(resolve_type_with_params(&args[0], types, type_params)?),
+                Box::new(resolve_type_with_params(&args[1], types, type_params)?),
             )),
             "List" if args.len() == 1 => {
-                Ok(Ty::List(Box::new(resolve_type(&args[0], types)?)))
+                Ok(Ty::List(Box::new(resolve_type_with_params(&args[0], types, type_params)?)))
             }
             "Map" if args.len() == 2 => Ok(Ty::Map(
-                Box::new(resolve_type(&args[0], types)?),
-                Box::new(resolve_type(&args[1], types)?),
+                Box::new(resolve_type_with_params(&args[0], types, type_params)?),
+                Box::new(resolve_type_with_params(&args[1], types, type_params)?),
             )),
             "Handle" if args.len() == 1 => {
-                Ok(Ty::Handle(Box::new(resolve_type(&args[0], types)?)))
+                Ok(Ty::Handle(Box::new(resolve_type_with_params(&args[0], types, type_params)?)))
             }
             _ if args.is_empty() && types.contains_key(name) => Ok(Ty::User(name.clone())),
             _ => Err(TypeError {
@@ -562,13 +592,13 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
         },
         TypeKind::Tuple(elems) => {
             let resolved: Result<Vec<Ty>, TypeError> =
-                elems.iter().map(|e| resolve_type(e, types)).collect();
+                elems.iter().map(|e| resolve_type_with_params(e, types, type_params)).collect();
             Ok(Ty::Tuple(resolved?))
         }
         TypeKind::FnPtr { params, ret } => {
             let param_tys: Result<Vec<Ty>, TypeError> =
-                params.iter().map(|p| resolve_type(p, types)).collect();
-            let ret_ty = resolve_type(ret, types)?;
+                params.iter().map(|p| resolve_type_with_params(p, types, type_params)).collect();
+            let ret_ty = resolve_type_with_params(ret, types, type_params)?;
             Ok(Ty::FnPtr { params: param_tys?, ret: Box::new(ret_ty) })
         }
     }
@@ -1394,6 +1424,7 @@ impl<'a> FnChecker<'a> {
                 params: s.params.clone(),
                 ret: s.ret.clone(),
                 effect: s.effect,
+                type_params: s.type_params.clone(),
             }) {
                 self.check_effect(sig.effect, whole_span);
                 self.check_args_against_params(&sig.params, args, whole_span);
@@ -2203,6 +2234,11 @@ impl<'a> FnChecker<'a> {
 fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Error, _) | (_, Ty::Error) => true,
+        // A generic type parameter unifies with anything during type
+        // checking; the codegen substitutes it with the concrete type at
+        // each call-site monomorphization. (Without bounds, there's no
+        // additional constraint to enforce here.)
+        (Ty::Generic(_), _) | (_, Ty::Generic(_)) => true,
         // A function pointer is represented as an i64 address, so it's
         // compatible with i64 parameters (used when passing fn names as args
         // before FnPtr syntax lands in the parser).

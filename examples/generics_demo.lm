@@ -1,0 +1,66 @@
+import std/io
+import std/list
+
+// Generic identity — same fn body, monomorphized per call-site type.
+fn id<T>(x: T): T {
+    return x
+}
+
+// Two type parameters.
+fn pick_first<A, B>(a: A, b: B): A {
+    return a
+}
+
+// Generic over a container — returns Option<T> with T inferred from xs.
+fn head<T>(xs: List<T>): Option<T> {
+    if list.len(xs) == 0 {
+        return None
+    }
+    return Some(list.get(xs, 0))
+}
+
+// Generic calling generic: forces the monomorphization worklist to keep
+// draining as new instantiations surface during body compilation.
+fn id_twice<T>(x: T): T {
+    return id(id(x))
+}
+
+fn main(): i32 io {
+    // id<i32>, id<string>, id<f64> — three monomorphizations of `id`.
+    io.println("id ints:    \{id(42)}")
+    io.println("id string:  \{id("hello")}")
+    io.println("id float:   \{id(3.14)}")
+
+    // pick_first<i32, string> and pick_first<string, i32>.
+    io.println("pick first: \{pick_first(7, "ignored")}")
+    io.println("pick first: \{pick_first("kept", 99)}")
+
+    // head over List<i32> and List<string>.
+    var ints: List<i32> = list.new()
+    ints = list.push(ints, 10)
+    ints = list.push(ints, 20)
+    match head(ints) {
+        Some(n) => io.println("head ints:  \{n}"),
+        None => io.println("(empty)"),
+    }
+
+    var strs: List<string> = list.new()
+    strs = list.push(strs, "alpha")
+    strs = list.push(strs, "beta")
+    match head(strs) {
+        Some(s) => io.println("head strs:  \{s}"),
+        None => io.println("(empty)"),
+    }
+
+    var empty: List<i32> = list.new()
+    match head(empty) {
+        Some(_) => io.println("unreachable"),
+        None => io.println("head empty: None"),
+    }
+
+    // Generic-of-generic.
+    io.println("id_twice:   \{id_twice(123)}")
+    io.println("id_twice:   \{id_twice("nested")}")
+
+    return 0
+}

@@ -11,7 +11,7 @@
 //! Structs and sum types use the same layouts. IO goes through libc
 //! `write(2)` instead of WASI `fd_write`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
@@ -162,6 +162,25 @@ struct NativeCodegen<'a> {
     debug_mode: bool,
     /// Path of the source file being compiled (for assert messages).
     source_path: String,
+    /// Generic fn ASTs, keyed by fn name. Generic fns aren't compiled
+    /// directly; each call site requests a monomorphization with concrete
+    /// type arguments, recorded in `monomorph_queue` and compiled later.
+    generic_templates: HashMap<String, ast::FnDecl>,
+    /// Pending monomorphizations to compile after the main pass:
+    /// (mangled_name, func_id, substituted FnSig, substitution, original AST).
+    monomorph_queue: Vec<MonomorphRequest>,
+    /// Mangled names of monomorphizations already declared (so a second
+    /// call site reusing the same instantiation just calls the existing
+    /// FuncId rather than re-declaring).
+    monomorph_done: HashSet<String>,
+}
+
+struct MonomorphRequest {
+    mangled_name: String,
+    func_id: FuncId,
+    sig: crate::types::FnSig,
+    subs: HashMap<String, Ty>,
+    decl: ast::FnDecl,
 }
 
 impl<'a> NativeCodegen<'a> {
@@ -495,6 +514,9 @@ impl<'a> NativeCodegen<'a> {
             uses_io: false,
             debug_mode: false,
             source_path: String::new(),
+            generic_templates: HashMap::new(),
+            monomorph_queue: Vec::new(),
+            monomorph_done: HashSet::new(),
         })
     }
 
@@ -504,9 +526,14 @@ impl<'a> NativeCodegen<'a> {
         // Intern string literals + frame messages.
         self.intern_all_strings(module);
 
-        // Declare all user functions.
+        // Declare all user functions. Generic ones are stashed as templates
+        // — they get monomorphized on demand from each call site.
         for item in &module.items {
             if let Item::Fn(f) = item {
+                if !f.type_params.is_empty() {
+                    self.generic_templates.insert(f.name.clone(), f.clone());
+                    continue;
+                }
                 let sig = self.build_sig(&f.name);
                 let id = self
                     .obj
@@ -617,6 +644,7 @@ impl<'a> NativeCodegen<'a> {
                         let synthetic = FnDecl {
                             name: mangled,
                             name_span: f.name_span,
+                            type_params: f.type_params.clone(),
                             params: f.params.clone(),
                             return_type: f.return_type.clone(),
                             effect: f.effect,
@@ -672,10 +700,12 @@ impl<'a> NativeCodegen<'a> {
                 }).collect(),
                 ret: ret_ty,
                 effect: ast::Effect::Pure,
+                type_params: Vec::new(),
             };
             let synthetic = FnDecl {
                 name: lam_name.clone(),
                 name_span: lam.span,
+                type_params: Vec::new(),
                 params: lam.params.clone(),
                 return_type: lam.return_type.clone(),
                 effect: ast::Effect::Pure,
@@ -686,10 +716,12 @@ impl<'a> NativeCodegen<'a> {
             self.define_function(&synthetic, func_id)?;
         }
 
-        // Define user function bodies.
+        // Define user function bodies (skip generic templates — they're
+        // compiled per monomorphization in the drain loop below).
         let fn_ids = self.fn_ids.clone();
         for item in &module.items {
             if let Item::Fn(f) = item {
+                if !f.type_params.is_empty() { continue; }
                 let func_id = fn_ids[&f.name];
                 self.define_function(f, func_id)?;
             }
@@ -704,6 +736,7 @@ impl<'a> NativeCodegen<'a> {
                 let synthetic = FnDecl {
                     name: fn_name.clone(),
                     name_span: mh.name_span,
+                    type_params: Vec::new(),
                     params: {
                         let mut ps = vec![ast::Param {
                             name: "self".to_string(),
@@ -726,6 +759,13 @@ impl<'a> NativeCodegen<'a> {
                 };
                 self.define_function(&synthetic, func_id)?;
             }
+        }
+
+        // Drain monomorphization queue. Each compiled body may queue more
+        // monomorphizations (a generic fn calling another generic fn), so
+        // loop until empty.
+        while let Some(req) = self.monomorph_queue.pop() {
+            self.define_monomorphization(req)?;
         }
 
         Ok(())
@@ -1147,14 +1187,28 @@ impl<'a> NativeCodegen<'a> {
     }
 
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
-        // Look up FnSig from module info, falling back to lambda_sigs.
-        let sig_owned;
-        let sig: &crate::types::FnSig = if let Some(s) = self.info.fns.get(&f.name) {
-            s
-        } else {
-            sig_owned = self.lambda_sigs[&f.name].clone();
-            &sig_owned
+        let sig = self.info.fns.get(&f.name).cloned()
+            .unwrap_or_else(|| self.lambda_sigs[&f.name].clone());
+        self.define_function_with_sig(f, func_id, &sig, HashMap::new())
+    }
+
+    fn define_monomorphization(&mut self, req: MonomorphRequest) -> Result<(), NativeError> {
+        // Use the mangled name for diagnostic spans / debug-frame messages,
+        // but everything else mirrors define_function.
+        let renamed = FnDecl {
+            name: req.mangled_name.clone(),
+            ..req.decl
         };
+        self.define_function_with_sig(&renamed, req.func_id, &req.sig, req.subs)
+    }
+
+    fn define_function_with_sig(
+        &mut self,
+        f: &FnDecl,
+        func_id: FuncId,
+        sig: &crate::types::FnSig,
+        active_subs: HashMap<String, Ty>,
+    ) -> Result<(), NativeError> {
         let cl_sig = self.build_sig_from(sig);
 
         let mut ctx = self.obj.make_context();
@@ -1169,6 +1223,7 @@ impl<'a> NativeCodegen<'a> {
 
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
+            fb.active_subs = active_subs;
 
             // Declare params as variables. Pointer-typed params are
             // registered on the cleanup stack — the caller incr'd them
@@ -1299,6 +1354,9 @@ struct FnEmitter<'a, 'b, 'c> {
     /// Set to true when a `return` statement is compiled. Checked by
     /// compile_if to avoid emitting jumps after a terminated block.
     hit_return: bool,
+    /// Active type-parameter substitutions when compiling a monomorphized
+    /// generic fn body (T → I32, etc). Empty for non-generic fns.
+    active_subs: HashMap<String, Ty>,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -1317,6 +1375,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             name_types: HashMap::new(),
             cleanup_stack: Vec::new(),
             hit_return: false,
+            active_subs: HashMap::new(),
         }
     }
 
@@ -1783,6 +1842,70 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         })
     }
 
+    /// If `name` is a generic fn, ensure a monomorphization exists for the
+    /// given argument types and return (mangled_name, substituted_sig).
+    /// Returns None for non-generic callees so the caller can use `name`
+    /// as-is.
+    fn monomorphize_if_generic(
+        &mut self,
+        name: &str,
+        arg_tys: &[Ty],
+    ) -> Option<(String, crate::types::FnSig)> {
+        let sig = self.cg.info.fns.get(name)?.clone();
+        if sig.type_params.is_empty() {
+            return None;
+        }
+
+        // Unify each generic param against the corresponding concrete arg.
+        let mut subs: HashMap<String, Ty> = HashMap::new();
+        for (i, (_, pty)) in sig.params.iter().enumerate() {
+            if let Some(at) = arg_tys.get(i) {
+                unify_into(pty, at, &mut subs);
+            }
+        }
+        // Order type args by the fn's declared type_params so the same
+        // instantiation always mangles to the same name.
+        let type_args: Vec<Ty> = sig.type_params.iter()
+            .map(|p| subs.get(p).cloned().unwrap_or(Ty::Error))
+            .collect();
+        let mangled = mangle_monomorph_name(name, &type_args);
+
+        // Build the substituted FnSig (always — we need it for rc_incr decisions
+        // and the cl signature).
+        let subbed_params: Vec<(String, Ty)> = sig.params.iter()
+            .map(|(n, t)| (n.clone(), substitute_ty(t.clone(), &subs)))
+            .collect();
+        let subbed_ret = substitute_ty(sig.ret.clone(), &subs);
+        let subbed_sig = crate::types::FnSig {
+            params: subbed_params,
+            ret: subbed_ret,
+            effect: sig.effect,
+            type_params: Vec::new(),
+        };
+
+        if !self.cg.monomorph_done.contains(&mangled) {
+            // First time we've seen this instantiation. Declare the function
+            // and queue body compilation.
+            let cl_sig = self.cg.build_sig_from(&subbed_sig);
+            let func_id = self.cg.obj
+                .declare_function(&mangled, Linkage::Local, &cl_sig)
+                .unwrap();
+            self.cg.fn_ids.insert(mangled.clone(), func_id);
+            self.cg.monomorph_done.insert(mangled.clone());
+            if let Some(decl) = self.cg.generic_templates.get(name).cloned() {
+                self.cg.monomorph_queue.push(MonomorphRequest {
+                    mangled_name: mangled.clone(),
+                    func_id,
+                    sig: subbed_sig.clone(),
+                    subs,
+                    decl,
+                });
+            }
+        }
+
+        Some((mangled, subbed_sig))
+    }
+
     fn compile_call(
         &mut self,
         callee: &Expr,
@@ -1893,8 +2016,24 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
         }
 
-        // User function call.
-        let func_id = self.cg.fn_ids.get(&name).ok_or_else(|| NativeError {
+        // User function call. Compile args first — we need their types to
+        // monomorphize generic callees.
+        let mut arg_vals = Vec::new();
+        let mut arg_tys = Vec::new();
+        for a in args {
+            arg_vals.push(self.compile_expr(&a.value)?);
+            arg_tys.push(self.infer_ty(&a.value)?);
+        }
+
+        // If the callee is generic, dispatch to a monomorphization (creating
+        // it on first sight). Otherwise call the original name.
+        let (effective_name, effective_sig) =
+            match self.monomorphize_if_generic(&name, &arg_tys) {
+                Some(pair) => (pair.0, Some(pair.1)),
+                None => (name.clone(), self.cg.info.fns.get(&name).cloned()),
+            };
+
+        let func_id = self.cg.fn_ids.get(&effective_name).ok_or_else(|| NativeError {
             span,
             message: format!("unknown function `{name}`"),
         })?;
@@ -1902,16 +2041,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .cg
             .obj
             .declare_func_in_func(*func_id, self.builder.func);
-        let mut arg_vals = Vec::new();
-        for a in args {
-            let val = self.compile_expr(&a.value)?;
-            arg_vals.push(val);
-        }
+
         // rc_incr each pointer argument so the callee's scope-exit
         // decr doesn't free values the caller still holds.
-        if let Some(sig) = self.cg.info.fns.get(&name) {
-            let param_types: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
-            for (i, pty) in param_types.iter().enumerate() {
+        if let Some(sig) = &effective_sig {
+            for (i, (_, pty)) in sig.params.iter().enumerate() {
                 if !is_scalar(pty) {
                     if let Some(&val) = arg_vals.get(i) {
                         self.emit_rc_incr(val);
@@ -3242,6 +3376,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         _ => {}
                     }
                     if let Some(sig) = self.cg.info.fns.get(name) {
+                        // Generic callee: infer the substitution from
+                        // call-site arg types and apply to the return.
+                        if !sig.type_params.is_empty() {
+                            let mut subs: HashMap<String, Ty> = HashMap::new();
+                            for (i, (_, pty)) in sig.params.iter().enumerate() {
+                                if let Some(arg) = args.get(i) {
+                                    let at = self.infer_ty(&arg.value)?;
+                                    unify_into(pty, &at, &mut subs);
+                                }
+                            }
+                            return Ok(substitute_ty(sig.ret.clone(), &subs));
+                        }
                         return Ok(sig.ret.clone());
                     }
                     // Unqualified call inside an imported module wrapper:
@@ -3550,6 +3696,9 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
+        // Ty::Generic should only appear in pre-monomorphized signatures.
+        // If it leaks into codegen, treat as pointer-sized — safest default.
+        Ty::Generic(_) => PTR,
         Ty::FnPtr { .. } => PTR,
         Ty::Error => cl_types::I32,
     }
@@ -3567,6 +3716,90 @@ fn is_scalar(ty: &Ty) -> bool {
         // Function pointers are just integer addresses — no RC needed.
         | Ty::FnPtr { .. }
     )
+}
+
+/// Recursively replace Ty::Generic(name) with the substitution if name
+/// is bound. Also replaces Ty::User(name) when bound (because the codegen
+/// AST resolver returns User for unknown idents, including type params
+/// that live only in the generic body's annotations).
+fn substitute_ty(ty: Ty, subs: &HashMap<String, Ty>) -> Ty {
+    if subs.is_empty() { return ty; }
+    match ty {
+        Ty::Generic(name) => subs.get(&name).cloned().unwrap_or(Ty::Generic(name)),
+        Ty::User(name) if subs.contains_key(&name) => subs[&name].clone(),
+        Ty::List(inner) => Ty::List(Box::new(substitute_ty(*inner, subs))),
+        Ty::Map(k, v) => Ty::Map(Box::new(substitute_ty(*k, subs)), Box::new(substitute_ty(*v, subs))),
+        Ty::Option(inner) => Ty::Option(Box::new(substitute_ty(*inner, subs))),
+        Ty::Result(o, e) => Ty::Result(Box::new(substitute_ty(*o, subs)), Box::new(substitute_ty(*e, subs))),
+        Ty::Handle(inner) => Ty::Handle(Box::new(substitute_ty(*inner, subs))),
+        Ty::Tuple(elems) => Ty::Tuple(elems.into_iter().map(|t| substitute_ty(t, subs)).collect()),
+        Ty::FnPtr { params, ret } => Ty::FnPtr {
+            params: params.into_iter().map(|t| substitute_ty(t, subs)).collect(),
+            ret: Box::new(substitute_ty(*ret, subs)),
+        },
+        other => other,
+    }
+}
+
+/// Unify a generic param type against a concrete arg type, recording any
+/// new Ty::Generic bindings into `subs`. First binding wins (no
+/// constraint solving — practical for unbounded MVP generics).
+fn unify_into(generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty>) {
+    match (generic, concrete) {
+        (Ty::Generic(name), c) => {
+            subs.entry(name.clone()).or_insert_with(|| c.clone());
+        }
+        (Ty::List(g), Ty::List(c)) => unify_into(g, c, subs),
+        (Ty::Map(gk, gv), Ty::Map(ck, cv)) => { unify_into(gk, ck, subs); unify_into(gv, cv, subs); }
+        (Ty::Option(g), Ty::Option(c)) => unify_into(g, c, subs),
+        (Ty::Result(go, ge), Ty::Result(co, ce)) => { unify_into(go, co, subs); unify_into(ge, ce, subs); }
+        (Ty::Handle(g), Ty::Handle(c)) => unify_into(g, c, subs),
+        (Ty::Tuple(gs), Ty::Tuple(cs)) if gs.len() == cs.len() => {
+            for (g, c) in gs.iter().zip(cs.iter()) { unify_into(g, c, subs); }
+        }
+        (Ty::FnPtr { params: gp, ret: gr }, Ty::FnPtr { params: cp, ret: cr }) => {
+            for (g, c) in gp.iter().zip(cp.iter()) { unify_into(g, c, subs); }
+            unify_into(gr, cr, subs);
+        }
+        _ => {}
+    }
+}
+
+/// Build a deterministic mangled name for a monomorphization. Order of
+/// type args follows the fn's declared `type_params` so two call sites
+/// with the same instantiation produce the same name.
+fn mangle_monomorph_name(base: &str, type_args: &[Ty]) -> String {
+    let mut s = base.to_string();
+    s.push('$');
+    for (i, t) in type_args.iter().enumerate() {
+        if i > 0 { s.push('_'); }
+        s.push_str(&mangle_ty(t));
+    }
+    s
+}
+
+fn mangle_ty(t: &Ty) -> String {
+    match t {
+        Ty::I32 => "I32".into(),
+        Ty::I64 => "I64".into(),
+        Ty::U32 => "U32".into(),
+        Ty::U64 => "U64".into(),
+        Ty::F64 => "F64".into(),
+        Ty::Bool => "Bool".into(),
+        Ty::String => "Str".into(),
+        Ty::Bytes => "Bytes".into(),
+        Ty::Unit => "Unit".into(),
+        Ty::List(inner) => format!("L{}", mangle_ty(inner)),
+        Ty::Map(k, v) => format!("M{}V{}", mangle_ty(k), mangle_ty(v)),
+        Ty::Option(inner) => format!("O{}", mangle_ty(inner)),
+        Ty::Result(o, e) => format!("R{}E{}", mangle_ty(o), mangle_ty(e)),
+        Ty::Handle(inner) => format!("H{}", mangle_ty(inner)),
+        Ty::Tuple(elems) => format!("T{}", elems.iter().map(mangle_ty).collect::<Vec<_>>().join("_")),
+        Ty::User(n) => format!("U{}", n),
+        Ty::FnPtr { .. } => "Fn".into(),
+        Ty::Generic(n) => format!("G{}", n),
+        Ty::Error => "Err".into(),
+    }
 }
 
 /// True when `annot` carries strictly more information than `inferred` —
@@ -3591,6 +3824,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
         Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
+        Ty::Generic(_) => 8, // see comment in lumen_to_cl
         Ty::FnPtr { .. } => 8,
         Ty::Error => 4,
     }
