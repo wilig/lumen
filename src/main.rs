@@ -26,10 +26,35 @@ fn main() -> ExitCode {
     }
 }
 
+/// Format an error with source context: the offending line + a caret.
+fn format_error(src: &str, file: &str, kind: &str, line: u32, col: u32, end: u32, message: &str) -> String {
+    let mut out = format!("{kind}: {file}:{line}:{col}: {message}");
+    if line > 0 {
+        if let Some(src_line) = src.lines().nth((line - 1) as usize) {
+            out.push_str(&format!("\n  {line} | {src_line}"));
+            // Caret(s) under the error location.
+            let pad = format!("{line}").len() + 3 + (col as usize).saturating_sub(1);
+            let width = if end > 0 {
+                let span_len = (end - (col - 1) as u32) as usize;
+                span_len.max(1).min(src_line.len().saturating_sub((col - 1) as usize)).max(1)
+            } else { 1 };
+            out.push_str(&format!("\n  {}{}",
+                " ".repeat(pad),
+                "^".repeat(width),
+            ));
+        }
+    }
+    out
+}
+
 fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    let tokens = lumen::lexer::lex(&src).map_err(|e| format!("lex error: {e}"))?;
-    let module = lumen::parser::parse(tokens).map_err(|e| format!("parse error: {e}"))?;
+    let tokens = lumen::lexer::lex(&src).map_err(|e| {
+        format_error(&src, path, "lex error", e.span.line, e.span.col, 0, &e.message)
+    })?;
+    let module = lumen::parser::parse(tokens).map_err(|e| {
+        format_error(&src, path, "parse error", e.span.line, e.span.col, 0, &e.message)
+    })?;
 
     // Resolve imports to stdlib .lm files, recursively following
     // transitive imports (e.g. std/http imports std/bytes).
@@ -67,16 +92,16 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
 
     let info = lumen::types::typecheck(&module, &imported).map_err(|errs| {
         errs.iter()
-            .map(|e| format!("type error: {e}"))
+            .map(|e| format_error(&src, path, "type error", e.span.line, e.span.col, e.span.end, &e.message))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
     })?;
     let imports = info.imports.clone();
     let imported_refs: Vec<(&str, &lumen::ast::Module)> = imported.iter()
         .map(|i| (i.name.as_str(), &i.module))
         .collect();
     let obj = lumen::native::compile_native(&module, &info, &imported_refs)
-        .map_err(|e| format!("native codegen error: {e}"))?;
+        .map_err(|e| format_error(&src, path, "codegen error", e.span.line, e.span.col, e.span.end, &e.message))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
     Ok((obj, stem.to_string(), imports))
 }
