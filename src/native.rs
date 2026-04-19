@@ -2290,6 +2290,26 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(self.builder.inst_results(call)[0])
     }
 
+    // --- Method call helpers ------------------------------------------------
+
+    /// Compile args, call a builtin FuncId, return the result.
+    fn call_builtin(&mut self, func_id: FuncId, args: &[ast::Arg]) -> Result<Value, NativeError> {
+        let mut vals = Vec::new();
+        for a in args { vals.push(self.compile_expr(&a.value)?); }
+        let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &vals);
+        Ok(self.builder.inst_results(call)[0])
+    }
+
+    /// Compile args, call a void builtin FuncId, return unit (i32 0).
+    fn call_builtin_void(&mut self, func_id: FuncId, args: &[ast::Arg]) -> Result<Value, NativeError> {
+        let mut vals = Vec::new();
+        for a in args { vals.push(self.compile_expr(&a.value)?); }
+        let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+        self.builder.ins().call(func_ref, &vals);
+        Ok(self.builder.ins().iconst(cl_types::I32, 0))
+    }
+
     fn compile_method_call(
         &mut self,
         receiver: &Expr,
@@ -2298,568 +2318,181 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         span: Span,
     ) -> Result<Value, NativeError> {
         if let ExprKind::Ident(mod_name) = &receiver.kind {
-            if mod_name == "io" && method == "println" {
-                let s = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.helper_println, self.builder.func);
-                self.builder.ins().call(func_ref, &[s]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "int" && method == "to_string_i32" {
-                let n = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.helper_itoa, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[n]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
+            // --- Standard dispatch: most calls are just "compile args, call, return" ---
+            let result = match (mod_name.as_str(), method) {
+                // io / int
+                ("io", "println")           => return self.call_builtin_void(self.cg.helper_println, &args[..1]),
+                ("int", "to_string_i32")    => return self.call_builtin(self.cg.helper_itoa, &args[..1]),
+                // bytes / string
+                ("bytes", "concat")         => return self.call_builtin(self.cg.helper_concat, &args[..2]),
+                ("bytes", "from_string")    => return self.compile_expr(&args[0].value),
+                ("string", "from_bytes")    => return self.compile_expr(&args[0].value),
+                // net
+                ("net", "tcp_listen")       => return self.call_builtin(self.cg.net_tcp_listen, &args[..1]),
+                ("net", "tcp_accept")       => return self.call_builtin(self.cg.net_tcp_accept, &args[..1]),
+                ("net", "tcp_read")         => return self.call_builtin(self.cg.net_tcp_read, &args[..2]),
+                ("net", "tcp_close")        => return self.call_builtin_void(self.cg.net_tcp_close, &args[..1]),
+                ("net", "gt_read")          => return self.call_builtin(self.cg.gt_read, &args[..2]),
+                ("net", "gt_write")         => return self.call_builtin(self.cg.gt_write, &args[..2]),
+                // http
+                ("http", "parse_method")    => return self.call_builtin(self.cg.http_parse_method, &args[..1]),
+                ("http", "parse_path")      => return self.call_builtin(self.cg.http_parse_path, &args[..1]),
+                ("http", "parse_body")      => return self.call_builtin(self.cg.http_parse_body, &args[..1]),
+                ("http", "format_response") => return self.call_builtin(self.cg.http_format_response, &args[..2]),
+                // list (simple cases)
+                ("list", "len")             => return self.call_builtin(self.cg.list_len, &args[..1]),
+                ("list", "remove")          => return self.call_builtin(self.cg.list_remove, &args[..2]),
+                // rl: window
+                ("rl", "init_window")       => return self.call_builtin_void(self.cg.rl_init_window, &args[..3]),
+                ("rl", "close_window")      => return self.call_builtin_void(self.cg.rl_close_window, &[]),
+                ("rl", "window_should_close") => return self.call_builtin(self.cg.rl_window_should_close, &[]),
+                ("rl", "set_target_fps")    => return self.call_builtin_void(self.cg.rl_set_target_fps, &args[..1]),
+                ("rl", "get_frame_time")    => return self.call_builtin(self.cg.rl_get_frame_time, &[]),
+                // rl: drawing
+                ("rl", "begin_drawing")     => return self.call_builtin_void(self.cg.rl_begin_drawing, &[]),
+                ("rl", "end_drawing")       => return self.call_builtin_void(self.cg.rl_end_drawing, &[]),
+                ("rl", "clear_background")  => return self.call_builtin_void(self.cg.rl_clear_background, &args[..1]),
+                ("rl", "draw_text")         => return self.call_builtin_void(self.cg.rl_draw_text, &args[..5]),
+                ("rl", "measure_text")      => return self.call_builtin(self.cg.rl_measure_text, &args[..2]),
+                ("rl", "draw_rect")         => return self.call_builtin_void(self.cg.rl_draw_rectangle_rec, &args[..5]),
+                ("rl", "draw_rect_i")       => return self.call_builtin_void(self.cg.rl_draw_rectangle, &args[..5]),
+                ("rl", "draw_rect_pro")     => return self.call_builtin_void(self.cg.rl_draw_rectangle_pro, &args[..8]),
+                ("rl", "draw_circle")       => return self.call_builtin_void(self.cg.rl_draw_circle, &args[..4]),
+                ("rl", "draw_line")         => return self.call_builtin_void(self.cg.rl_draw_line, &args[..5]),
+                // rl: input
+                ("rl", "is_key_pressed")    => return self.call_builtin(self.cg.rl_is_key_pressed, &args[..1]),
+                ("rl", "is_key_down")       => return self.call_builtin(self.cg.rl_is_key_down, &args[..1]),
+                ("rl", "is_gesture_detected") => return self.call_builtin(self.cg.rl_is_gesture_detected, &args[..1]),
+                // rl: camera
+                ("rl", "set_camera")        => return self.call_builtin_void(self.cg.rl_set_camera, &args[..6]),
+                ("rl", "begin_mode_2d")     => return self.call_builtin_void(self.cg.rl_begin_mode_2d, &[]),
+                ("rl", "end_mode_2d")       => return self.call_builtin_void(self.cg.rl_end_mode_2d, &[]),
+                // rl: audio
+                ("rl", "init_audio")        => return self.call_builtin_void(self.cg.rl_init_audio, &[]),
+                // rl: colors
+                ("rl", "black")    => return self.call_builtin(self.cg.rl_color_black, &[]),
+                ("rl", "white")    => return self.call_builtin(self.cg.rl_color_white, &[]),
+                ("rl", "red")      => return self.call_builtin(self.cg.rl_color_red, &[]),
+                ("rl", "green")    => return self.call_builtin(self.cg.rl_color_green, &[]),
+                ("rl", "blue")     => return self.call_builtin(self.cg.rl_color_blue, &[]),
+                ("rl", "yellow")   => return self.call_builtin(self.cg.rl_color_yellow, &[]),
+                ("rl", "purple")   => return self.call_builtin(self.cg.rl_color_purple, &[]),
+                ("rl", "darkblue") => return self.call_builtin(self.cg.rl_color_darkblue, &[]),
+                ("rl", "darkgray") => return self.call_builtin(self.cg.rl_color_darkgray, &[]),
+                ("rl", "gray")     => return self.call_builtin(self.cg.rl_color_gray, &[]),
+                ("rl", "color_alpha") => return self.call_builtin(self.cg.rl_color_alpha, &args[..2]),
+                // math
+                ("math", "sqrt")   => return self.call_builtin(self.cg.math_sqrt, &args[..1]),
+                ("math", "abs")    => return self.call_builtin(self.cg.math_abs, &args[..1]),
+                ("math", "cos")    => return self.call_builtin(self.cg.math_cos, &args[..1]),
+                ("math", "sin")    => return self.call_builtin(self.cg.math_sin, &args[..1]),
+                ("math", "clamp")  => return self.call_builtin(self.cg.math_clamp, &args[..3]),
+                ("math", "rand")   => return self.call_builtin(self.cg.math_rand, &[]),
+                _ => None,
+            };
+            if let Some(v) = result { return Ok(v); }
+
+            // --- Special cases that need custom logic ---
+
+            // bytes.len: inline load
             if mod_name == "bytes" && method == "len" {
                 let b = self.compile_expr(&args[0].value)?;
-                let len = self.builder.ins().load(cl_types::I32, MemFlags::new(), b, 0);
-                return Ok(len);
+                return Ok(self.builder.ins().load(cl_types::I32, MemFlags::new(), b, 0));
             }
+            // bytes.new: rc_alloc + memset
             if mod_name == "bytes" && method == "new" {
-                // rc_alloc(4 + size), store size as i32 at offset 0, memset to 0
                 let size_val = self.compile_expr(&args[0].value)?;
                 let size_ptr = self.builder.ins().uextend(PTR, size_val);
                 let four = self.builder.ins().iconst(PTR, 4);
                 let total = self.builder.ins().iadd(size_ptr, four);
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[total]);
                 let ptr = self.builder.inst_results(call)[0];
-                // Store length at offset 0
                 self.builder.ins().store(MemFlags::new(), size_val, ptr, 0);
-                // memset bytes to 0: use call_memset
                 let data_ptr = self.builder.ins().iadd_imm(ptr, 4);
                 let zero = self.builder.ins().iconst(cl_types::I8, 0);
-                self.builder.call_memset(
-                    self.cg.obj.target_config(),
-                    data_ptr,
-                    zero,
-                    size_ptr,
-                );
+                self.builder.call_memset(self.cg.obj.target_config(), data_ptr, zero, size_ptr);
                 return Ok(ptr);
             }
+            // bytes.get: inline load u8
             if mod_name == "bytes" && method == "get" {
-                // load u8 at b + 4 + i, zero-extend to i32
                 let b = self.compile_expr(&args[0].value)?;
                 let i = self.compile_expr(&args[1].value)?;
                 let i_ptr = self.builder.ins().sextend(PTR, i);
                 let base = self.builder.ins().iadd_imm(b, 4);
                 let addr = self.builder.ins().iadd(base, i_ptr);
                 let byte = self.builder.ins().load(cl_types::I8, MemFlags::new(), addr, 0);
-                let result = self.builder.ins().uextend(cl_types::I32, byte);
-                return Ok(result);
+                return Ok(self.builder.ins().uextend(cl_types::I32, byte));
             }
-            if mod_name == "bytes" && method == "concat" {
-                let a = self.compile_expr(&args[0].value)?;
-                let b = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.helper_concat, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[a, b]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "bytes" && method == "from_string" {
-                // Zero-cost: same layout
-                let s = self.compile_expr(&args[0].value)?;
-                return Ok(s);
-            }
-            if mod_name == "string" && method == "from_bytes" {
-                // Zero-cost: same layout
-                let b = self.compile_expr(&args[0].value)?;
-                return Ok(b);
-            }
-            // --- TCP socket operations ---
-            if mod_name == "net" && method == "tcp_listen" {
-                let port = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.net_tcp_listen, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[port]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "net" && method == "tcp_accept" {
-                let server_fd = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.net_tcp_accept, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[server_fd]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "net" && method == "tcp_read" {
-                let fd = self.compile_expr(&args[0].value)?;
-                let max = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.net_tcp_read, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[fd, max]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
+            // net.tcp_write: call + ireduce i64→i32
             if mod_name == "net" && method == "tcp_write" {
                 let fd = self.compile_expr(&args[0].value)?;
                 let data = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.net_tcp_write, self.builder.func);
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.net_tcp_write, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[fd, data]);
-                // Return value is i64 (ssize_t), truncate to i32
                 let result = self.builder.inst_results(call)[0];
-                let truncated = self.builder.ins().ireduce(cl_types::I32, result);
-                return Ok(truncated);
+                return Ok(self.builder.ins().ireduce(cl_types::I32, result));
             }
+            // net.serve: second arg is func_addr
             if mod_name == "net" && method == "serve" {
                 let port = self.compile_expr(&args[0].value)?;
-                // Second arg: function name → func_addr
                 let handler_name = match &args[1].value.kind {
                     ExprKind::Ident(n) => n.clone(),
-                    _ => {
-                        return Err(NativeError {
-                            span,
-                            message: "net.serve: second arg must be a function name".into(),
-                        })
-                    }
+                    _ => return Err(NativeError { span, message: "net.serve: second arg must be a function name".into() }),
                 };
-                let handler_id = self.cg.fn_ids.get(&handler_name).ok_or_else(|| {
+                let handler_id = *self.cg.fn_ids.get(&handler_name).ok_or_else(|| {
                     NativeError { span, message: format!("unknown function `{handler_name}`") }
                 })?;
-                let handler_ref = self.cg.obj.declare_func_in_func(*handler_id, self.builder.func);
+                let handler_ref = self.cg.obj.declare_func_in_func(handler_id, self.builder.func);
                 let handler_addr = self.builder.ins().func_addr(PTR, handler_ref);
                 let serve_ref = self.cg.obj.declare_func_in_func(self.cg.net_serve, self.builder.func);
                 self.builder.ins().call(serve_ref, &[port, handler_addr]);
                 return Ok(self.builder.ins().iconst(cl_types::I32, 0));
             }
-            // Green-thread-aware I/O: use gt_read/gt_write when inside net.serve.
-            if mod_name == "net" && method == "gt_read" {
-                let fd = self.compile_expr(&args[0].value)?;
-                let max = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.gt_read, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[fd, max]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "net" && method == "gt_write" {
-                let fd = self.compile_expr(&args[0].value)?;
-                let data = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.gt_write, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[fd, data]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "net" && method == "tcp_close" {
-                let fd = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.net_tcp_close, self.builder.func);
-                self.builder.ins().call(func_ref, &[fd]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "http" && method == "parse_method" {
-                let raw = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.http_parse_method, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[raw]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "http" && method == "parse_path" {
-                let raw = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.http_parse_path, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[raw]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "http" && method == "parse_body" {
-                let raw = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.http_parse_body, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[raw]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "http" && method == "format_response" {
-                let status = self.compile_expr(&args[0].value)?;
-                let body = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.http_format_response, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[status, body]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            // --- List<T> operations ---
+            // list.new: pass elem_size=8
             if mod_name == "list" && method == "new" {
-                // list.new(): create a new list with elem_size = 8.
                 let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_new, self.builder.func);
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_new, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[elem_size]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
-            if mod_name == "list" && method == "len" {
-                // list.len(l): returns i32.
-                let l = self.compile_expr(&args[0].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_len, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[l]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
+            // list.push: rc_incr pointer-typed values, sextend i32→i64
             if mod_name == "list" && method == "push" {
-                // list.push(l, val): val may need sextend to i64. Returns new list ptr.
                 let l = self.compile_expr(&args[0].value)?;
                 let val_raw = self.compile_expr(&args[1].value)?;
                 let val_ty = self.infer_ty(&args[1].value)?;
-                // The list now holds a reference to the element — rc_incr
-                // pointer-typed values so they survive scope cleanup.
-                if !is_scalar(&val_ty) {
-                    self.emit_rc_incr(val_raw);
-                }
+                if !is_scalar(&val_ty) { self.emit_rc_incr(val_raw); }
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
-                } else {
-                    val_raw
-                };
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_push, self.builder.func);
+                } else { val_raw };
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_push, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, val64]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
+            // list.get: ireduce i64→i32 if elem type is i32
             if mod_name == "list" && method == "get" {
-                // list.get(l, i): returns i64; ireduce to i32 if elem type is i32.
                 let l = self.compile_expr(&args[0].value)?;
                 let i = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_get, self.builder.func);
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_get, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, i]);
                 let result = self.builder.inst_results(call)[0];
-                // Determine element type from the list argument.
                 let list_ty = self.infer_ty(&args[0].value)?;
-                let elem_ty = match list_ty {
-                    Ty::List(inner) => *inner,
-                    _ => Ty::I64,
-                };
-                let r = if lumen_to_cl(&elem_ty) == cl_types::I32 {
+                let elem_ty = match list_ty { Ty::List(inner) => *inner, _ => Ty::I64 };
+                return Ok(if lumen_to_cl(&elem_ty) == cl_types::I32 {
                     self.builder.ins().ireduce(cl_types::I32, result)
-                } else {
-                    result
-                };
-                return Ok(r);
+                } else { result });
             }
+            // list.set: sextend val if i32
             if mod_name == "list" && method == "set" {
-                // list.set(l, i, val): sextend val if i32, returns new ptr.
                 let l = self.compile_expr(&args[0].value)?;
                 let i = self.compile_expr(&args[1].value)?;
                 let val_raw = self.compile_expr(&args[2].value)?;
                 let val_ty = self.infer_ty(&args[2].value)?;
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
-                } else {
-                    val_raw
-                };
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_set, self.builder.func);
+                } else { val_raw };
+                let func_ref = self.cg.obj.declare_func_in_func(self.cg.list_set, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[l, i, val64]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "list" && method == "remove" {
-                // list.remove(l, i): returns new ptr.
-                let l = self.compile_expr(&args[0].value)?;
-                let i = self.compile_expr(&args[1].value)?;
-                let func_ref = self
-                    .cg
-                    .obj
-                    .declare_func_in_func(self.cg.list_remove, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[l, i]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-
-            // --- Raylib: Window ---
-            if mod_name == "rl" && method == "init_window" {
-                let w = self.compile_expr(&args[0].value)?;
-                let h = self.compile_expr(&args[1].value)?;
-                let t = self.compile_expr(&args[2].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_init_window, self.builder.func);
-                self.builder.ins().call(func_ref, &[w, h, t]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "close_window" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_close_window, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "window_should_close" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_window_should_close, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "set_target_fps" {
-                let fps = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_set_target_fps, self.builder.func);
-                self.builder.ins().call(func_ref, &[fps]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "get_frame_time" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_get_frame_time, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-
-            // --- Raylib: Drawing ---
-            if mod_name == "rl" && method == "begin_drawing" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_begin_drawing, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "end_drawing" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_end_drawing, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "clear_background" {
-                let color = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_clear_background, self.builder.func);
-                self.builder.ins().call(func_ref, &[color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "draw_text" {
-                let text = self.compile_expr(&args[0].value)?;
-                let x = self.compile_expr(&args[1].value)?;
-                let y = self.compile_expr(&args[2].value)?;
-                let size = self.compile_expr(&args[3].value)?;
-                let color = self.compile_expr(&args[4].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_text, self.builder.func);
-                self.builder.ins().call(func_ref, &[text, x, y, size, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "measure_text" {
-                let text = self.compile_expr(&args[0].value)?;
-                let size = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_measure_text, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[text, size]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "draw_rect" {
-                let x = self.compile_expr(&args[0].value)?;
-                let y = self.compile_expr(&args[1].value)?;
-                let w = self.compile_expr(&args[2].value)?;
-                let h = self.compile_expr(&args[3].value)?;
-                let color = self.compile_expr(&args[4].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle_rec, self.builder.func);
-                self.builder.ins().call(func_ref, &[x, y, w, h, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "draw_rect_i" {
-                let x = self.compile_expr(&args[0].value)?;
-                let y = self.compile_expr(&args[1].value)?;
-                let w = self.compile_expr(&args[2].value)?;
-                let h = self.compile_expr(&args[3].value)?;
-                let color = self.compile_expr(&args[4].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle, self.builder.func);
-                self.builder.ins().call(func_ref, &[x, y, w, h, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "draw_rect_pro" {
-                let rx = self.compile_expr(&args[0].value)?;
-                let ry = self.compile_expr(&args[1].value)?;
-                let rw = self.compile_expr(&args[2].value)?;
-                let rh = self.compile_expr(&args[3].value)?;
-                let ox = self.compile_expr(&args[4].value)?;
-                let oy = self.compile_expr(&args[5].value)?;
-                let rot = self.compile_expr(&args[6].value)?;
-                let color = self.compile_expr(&args[7].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_rectangle_pro, self.builder.func);
-                self.builder.ins().call(func_ref, &[rx, ry, rw, rh, ox, oy, rot, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "draw_circle" {
-                let cx = self.compile_expr(&args[0].value)?;
-                let cy = self.compile_expr(&args[1].value)?;
-                let radius = self.compile_expr(&args[2].value)?;
-                let color = self.compile_expr(&args[3].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_circle, self.builder.func);
-                self.builder.ins().call(func_ref, &[cx, cy, radius, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "draw_line" {
-                let x1 = self.compile_expr(&args[0].value)?;
-                let y1 = self.compile_expr(&args[1].value)?;
-                let x2 = self.compile_expr(&args[2].value)?;
-                let y2 = self.compile_expr(&args[3].value)?;
-                let color = self.compile_expr(&args[4].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_draw_line, self.builder.func);
-                self.builder.ins().call(func_ref, &[x1, y1, x2, y2, color]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-
-            // --- Raylib: Input ---
-            if mod_name == "rl" && method == "is_key_pressed" {
-                let key = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_key_pressed, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[key]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "is_key_down" {
-                let key = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_key_down, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[key]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "is_gesture_detected" {
-                let gesture = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_is_gesture_detected, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[gesture]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-
-            // --- Raylib: Camera ---
-            if mod_name == "rl" && method == "set_camera" {
-                let tx = self.compile_expr(&args[0].value)?;
-                let ty_val = self.compile_expr(&args[1].value)?;
-                let ox = self.compile_expr(&args[2].value)?;
-                let oy = self.compile_expr(&args[3].value)?;
-                let rot = self.compile_expr(&args[4].value)?;
-                let zoom = self.compile_expr(&args[5].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_set_camera, self.builder.func);
-                self.builder.ins().call(func_ref, &[tx, ty_val, ox, oy, rot, zoom]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "begin_mode_2d" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_begin_mode_2d, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-            if mod_name == "rl" && method == "end_mode_2d" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_end_mode_2d, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-
-            // --- Raylib: Audio ---
-            if mod_name == "rl" && method == "init_audio" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_init_audio, self.builder.func);
-                self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
-            }
-
-            // --- Raylib: Colors ---
-            if mod_name == "rl" && method == "black" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_black, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "white" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_white, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "red" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_red, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "green" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_green, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "blue" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_blue, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "yellow" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_yellow, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "purple" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_purple, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "darkblue" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_darkblue, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "darkgray" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_darkgray, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "gray" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_gray, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "rl" && method == "color_alpha" {
-                let color = self.compile_expr(&args[0].value)?;
-                let alpha = self.compile_expr(&args[1].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.rl_color_alpha, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[color, alpha]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-
-            // --- Math ---
-            if mod_name == "math" && method == "sqrt" {
-                let x = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_sqrt, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[x]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "math" && method == "abs" {
-                let x = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_abs, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[x]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "math" && method == "cos" {
-                let x = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_cos, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[x]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "math" && method == "sin" {
-                let x = self.compile_expr(&args[0].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_sin, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[x]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "math" && method == "clamp" {
-                let x = self.compile_expr(&args[0].value)?;
-                let lo = self.compile_expr(&args[1].value)?;
-                let hi = self.compile_expr(&args[2].value)?;
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_clamp, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[x, lo, hi]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            if mod_name == "math" && method == "rand" {
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.math_rand, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
         }
