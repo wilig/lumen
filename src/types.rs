@@ -526,6 +526,9 @@ struct FnChecker<'a> {
     sig: &'a FnSig,
     scopes: Vec<Scope>,
     errors: &'a mut Vec<TypeError>,
+    /// When inside a lambda, the scope depth at which the lambda starts.
+    /// `lookup` will not search scopes below this depth, preventing capture.
+    lambda_scope_floor: Option<usize>,
 }
 
 #[derive(Default)]
@@ -547,6 +550,7 @@ impl<'a> FnChecker<'a> {
             sig,
             scopes: Vec::new(),
             errors,
+            lambda_scope_floor: None,
         }
     }
 
@@ -582,7 +586,8 @@ impl<'a> FnChecker<'a> {
     }
 
     fn lookup(&self, name: &str) -> Option<&Binding> {
-        for scope in self.scopes.iter().rev() {
+        let floor = self.lambda_scope_floor.unwrap_or(0);
+        for scope in self.scopes[floor..].iter().rev() {
             if let Some(b) = scope.bindings.get(name) {
                 return Some(b);
             }
@@ -692,7 +697,19 @@ impl<'a> FnChecker<'a> {
                         self.infer_expr(value);
                     }
                     Some(b) => {
-                        self.check_expr(value, &b.ty);
+                        let rhs_ty = self.infer_expr(value);
+                        // Refine List<Error> → List<T> when the RHS is more specific.
+                        if let (Ty::List(inner), Ty::List(_)) = (&b.ty, &rhs_ty) {
+                            if matches!(**inner, Ty::Error) {
+                                // Update the binding in the scope.
+                                for scope in self.scopes.iter_mut().rev() {
+                                    if let Some(binding) = scope.bindings.get_mut(name) {
+                                        binding.ty = rhs_ty;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1058,7 +1075,11 @@ impl<'a> FnChecker<'a> {
                     Ok(t) => t,
                     Err(e) => { self.errors.push(e); Ty::Error }
                 };
+                // Set scope floor to prevent lambda from capturing outer
+                // variables — lookup will only see this scope and above.
+                let old_floor = self.lambda_scope_floor;
                 self.push_scope();
+                self.lambda_scope_floor = Some(self.scopes.len() - 1);
                 let mut param_tys = Vec::new();
                 for p in params {
                     let pty = match resolve_type(&p.ty, &self.module.types) {
@@ -1070,6 +1091,7 @@ impl<'a> FnChecker<'a> {
                 }
                 self.check_block(body, Some(&ret));
                 self.pop_scope();
+                self.lambda_scope_floor = old_floor;
                 Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
             }
         }
@@ -1617,8 +1639,15 @@ impl<'a> FnChecker<'a> {
             }
             ("list", "push") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.push` expects 2 args".into() }); }
-                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
-                Some(Ty::List(Box::new(Ty::Error)))
+                // Infer element type from the second arg to refine List<Error>.
+                let list_ty = args.first().map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::List(Box::new(Ty::Error)));
+                let elem_ty = args.get(1).map(|a| self.infer_expr(&a.value));
+                match (&list_ty, elem_ty) {
+                    (Ty::List(inner), Some(et)) if matches!(**inner, Ty::Error) => {
+                        Some(Ty::List(Box::new(et)))
+                    }
+                    _ => Some(list_ty),
+                }
             }
             ("list", "get") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.get` expects 2 args".into() }); }
@@ -2873,6 +2902,28 @@ mod tests {
                    let y: Option<i32> = None
                    return 0
                }"#,
+        );
+    }
+
+    #[test]
+    fn lambda_cannot_capture_outer_variables() {
+        let errs = tc_err(
+            r#"fn f(): i32 {
+                let outer = 42
+                let g = fn(x: i32): i32 { return x + outer }
+                return g(1)
+            }"#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("outer")));
+    }
+
+    #[test]
+    fn lambda_can_use_own_params() {
+        tc_ok(
+            r#"fn f(): i32 {
+                let g = fn(x: i32, y: i32): i32 { return x + y }
+                return g(1, 2)
+            }"#,
         );
     }
 }

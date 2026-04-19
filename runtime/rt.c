@@ -50,12 +50,17 @@ static int queue_len(void) {
 void lumen_rt_send(void *cell,
                    void (*dispatch)(void *, int32_t, int64_t, int64_t *),
                    int32_t kind, int64_t arg0) {
+    int next = (queue_tail + 1) % QUEUE_CAP;
+    if (next == queue_head) {
+        fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
+        return;
+    }
     queue[queue_tail].target_cell = cell;
     queue[queue_tail].dispatch = dispatch;
     queue[queue_tail].msg_kind = kind;
     queue[queue_tail].arg0 = arg0;
     queue[queue_tail].reply_slot = NULL;
-    queue_tail = (queue_tail + 1) % QUEUE_CAP;
+    queue_tail = next;
 }
 
 // Push a message and get a reply (blocks by draining until the reply
@@ -66,12 +71,17 @@ int64_t lumen_rt_ask(void *cell,
                      int32_t kind, int64_t arg0) {
     int64_t reply = 0;
     // Enqueue with a reply slot.
+    int next = (queue_tail + 1) % QUEUE_CAP;
+    if (next == queue_head) {
+        fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
+        return 0;
+    }
     queue[queue_tail].target_cell = cell;
     queue[queue_tail].dispatch = dispatch;
     queue[queue_tail].msg_kind = kind;
     queue[queue_tail].arg0 = arg0;
     queue[queue_tail].reply_slot = &reply;
-    queue_tail = (queue_tail + 1) % QUEUE_CAP;
+    queue_tail = next;
     // Drain until our reply is filled.
     lumen_rt_drain();
     return reply;
@@ -306,11 +316,20 @@ int32_t lumen_list_len(int64_t list_ptr) {
 static int64_t list_ensure_cap(int64_t list_ptr) {
     ListHeader *hdr = (ListHeader *)(uintptr_t)list_ptr;
     if (hdr->len < hdr->cap) return list_ptr;
+    // Guard against int32 overflow on capacity doubling.
+    if (hdr->cap > INT32_MAX / 2) {
+        fprintf(stderr, "FATAL: list capacity overflow (cap=%d)\n", hdr->cap);
+        abort();
+    }
     int32_t new_cap = hdr->cap * 2;
-    int32_t total = sizeof(ListHeader) + hdr->elem_size * new_cap;
+    int32_t total = (int32_t)sizeof(ListHeader) + hdr->elem_size * new_cap;
     // realloc the entire block (including rc header).
     char *raw = (char *)hdr - 8;
     raw = realloc(raw, 8 + total);
+    if (!raw) {
+        fprintf(stderr, "FATAL: list realloc failed (size=%d)\n", 8 + total);
+        abort();
+    }
     hdr = (ListHeader *)(raw + 8);
     hdr->cap = new_cap;
     return (int64_t)(uintptr_t)hdr;

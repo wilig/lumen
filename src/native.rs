@@ -1848,6 +1848,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     message: format!("unknown `{name}`"),
                 })?;
                 self.builder.def_var(var, val);
+                // Refine name_types: if the RHS has a more specific list type
+                // (e.g. List(User("Block")) vs List(I64)), update the tracked type
+                // so list.get can extract the element type.
+                if let Ok(rhs_ty) = self.infer_ty(value) {
+                    if let Ty::List(ref inner) = rhs_ty {
+                        if !matches!(**inner, Ty::I64 | Ty::I32 | Ty::Error) {
+                            self.name_types.insert(name.clone(), rhs_ty);
+                        }
+                    }
+                }
             }
             StmtKind::Expr(e) => {
                 self.compile_expr(e)?;
@@ -4038,17 +4048,24 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         return Ok(Ty::I32);
                     }
                     if m == "list" && method == "push" {
-                        // Returns the (possibly reallocated) list — same type as first arg.
-                        if let Some(first_arg) = args.first() {
-                            return self.infer_ty(&first_arg.value);
+                        // Refine List<I64> → List<T> from the second arg.
+                        let list_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?.unwrap_or(Ty::List(Box::new(Ty::I64)));
+                        let elem_ty = args.get(1).map(|a| self.infer_ty(&a.value)).transpose()?;
+                        if let (Ty::List(inner), Some(et)) = (&list_ty, elem_ty) {
+                            if matches!(**inner, Ty::I64 | Ty::I32 | Ty::Error) && !matches!(et, Ty::I32 | Ty::I64 | Ty::F64) {
+                                return Ok(Ty::List(Box::new(et)));
+                            }
                         }
-                        return Ok(Ty::List(Box::new(Ty::I32)));
+                        return Ok(list_ty);
                     }
                     if m == "list" && method == "get" {
-                        // Without proper generics, we can't know the
-                        // element type. Return I64 (the raw storage type).
-                        // Field access on the result works because the
-                        // codegen treats Error/I64 as PTR.
+                        // Extract element type from the list argument.
+                        if let Some(first_arg) = args.first() {
+                            let list_ty = self.infer_ty(&first_arg.value)?;
+                            if let Ty::List(inner) = list_ty {
+                                return Ok(*inner);
+                            }
+                        }
                         return Ok(Ty::I64);
                     }
                     if m == "list" && method == "set" {
