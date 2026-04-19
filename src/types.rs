@@ -2863,4 +2863,16 @@ mod tests {
         );
         assert!(!errs.is_empty());
     }
+
+    #[test]
+    fn option_none_compatible_both_directions() {
+        // None (Option<Error>) assigned to Option<i32> — both directions.
+        tc_ok(
+            r#"fn f(): Option<i32> { return None }
+               fn g(x: Option<i32>): i32 {
+                   let y: Option<i32> = None
+                   return 0
+               }"#,
+        );
+    }
 }

@@ -1801,6 +1801,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             StmtKind::Let { name, value, .. } | StmtKind::Var { name, value, .. } => {
                 let lumen_ty = self.infer_ty(value)?;
                 let val = self.compile_expr(value)?;
+                // If the RHS is a borrowing expression (variable read, field
+                // access), rc_incr because we're creating an additional
+                // reference. Fresh values (calls, struct lits) already have
+                // rc=1 from allocation.
+                if !is_scalar(&lumen_ty) && is_borrowing_expr(&value.kind) {
+                    self.emit_rc_incr(val);
+                }
                 let cl_ty = lumen_to_cl(&lumen_ty);
                 let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
@@ -1850,6 +1857,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
             StmtKind::Return(Some(e)) => {
                 let val = self.compile_expr(e)?;
+                // Protect the return value from cleanup, then decr all
+                // locals so we don't leak them.
+                let ret_is_ptr = self.infer_ty(e).map(|t| !is_scalar(&t)).unwrap_or(false);
+                if ret_is_ptr {
+                    self.emit_rc_incr(val);
+                }
+                // Collect cleanup targets first to avoid borrow conflict.
+                let to_clean: Vec<(Variable, Ty)> = self.cleanup_stack.iter().rev()
+                    .flat_map(|frame| frame.iter().map(|(_, var, ty)| (*var, ty.clone())))
+                    .collect();
+                for (var, ty) in &to_clean {
+                    let v = self.builder.use_var(*var);
+                    self.emit_rc_decr_typed(v, ty);
+                }
                 self.builder.ins().return_(&[val]);
                 self.hit_return = true;
             }

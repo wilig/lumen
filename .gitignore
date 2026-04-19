@@ -4,6 +4,10 @@ Cargo.lock
 *.cwasm
 .DS_Store
 
+# Compiled example binaries (keep only .lm source)
+examples/*
+!examples/*.lm
+
 # Keep beads DB under version control? Yes — tracks issue state across sessions.
 # !.beads/
 
