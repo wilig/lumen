@@ -63,13 +63,11 @@ struct NativeCodegen<'a> {
 
     /// Lumen fn name → Cranelift FuncId.
     fn_ids: HashMap<String, FuncId>,
-    /// Built-in helper func IDs.
-    libc_write: FuncId,
+    /// Core infrastructure FuncIds (not module-managed).
     libc_malloc: FuncId,
     libc_free: FuncId,
     helper_concat: FuncId,
     helper_println: FuncId,
-    helper_itoa: FuncId,
     helper_print_frames: FuncId,
     helper_rc_alloc: FuncId,
     helper_rc_incr: FuncId,
@@ -77,72 +75,6 @@ struct NativeCodegen<'a> {
     rt_send: FuncId,
     rt_ask: FuncId,
     rt_drain: FuncId,
-    #[allow(dead_code)]
-    rt_yield: FuncId,
-    /// TCP socket helpers (from runtime/rt.c).
-    net_tcp_listen: FuncId,
-    net_tcp_accept: FuncId,
-    net_tcp_read: FuncId,
-    net_tcp_write: FuncId,
-    net_tcp_close: FuncId,
-    net_serve: FuncId,
-    gt_read: FuncId,
-    gt_write: FuncId,
-    /// HTTP parsing/formatting helpers (from runtime/rt.c).
-    http_parse_method: FuncId,
-    http_parse_path: FuncId,
-    http_parse_body: FuncId,
-    http_format_response: FuncId,
-    /// List<T> operations (from runtime/rt.c).
-    list_new: FuncId,
-    list_len: FuncId,
-    list_push: FuncId,
-    list_get: FuncId,
-    list_set: FuncId,
-    list_remove: FuncId,
-
-    // --- Raylib bridge functions ---
-    rl_init_window: FuncId,
-    rl_close_window: FuncId,
-    rl_window_should_close: FuncId,
-    rl_set_target_fps: FuncId,
-    rl_get_frame_time: FuncId,
-    rl_begin_drawing: FuncId,
-    rl_end_drawing: FuncId,
-    rl_clear_background: FuncId,
-    rl_draw_text: FuncId,
-    rl_measure_text: FuncId,
-    rl_draw_rectangle_rec: FuncId,
-    rl_draw_rectangle: FuncId,
-    rl_draw_rectangle_pro: FuncId,
-    rl_draw_circle: FuncId,
-    rl_draw_line: FuncId,
-    rl_is_key_pressed: FuncId,
-    rl_is_key_down: FuncId,
-    rl_is_gesture_detected: FuncId,
-    rl_set_camera: FuncId,
-    rl_begin_mode_2d: FuncId,
-    rl_end_mode_2d: FuncId,
-    rl_init_audio: FuncId,
-    rl_color_black: FuncId,
-    rl_color_white: FuncId,
-    rl_color_red: FuncId,
-    rl_color_green: FuncId,
-    rl_color_blue: FuncId,
-    rl_color_yellow: FuncId,
-    rl_color_purple: FuncId,
-    rl_color_darkblue: FuncId,
-    rl_color_darkgray: FuncId,
-    rl_color_gray: FuncId,
-    rl_color_alpha: FuncId,
-
-    // --- Math helpers ---
-    math_sqrt: FuncId,
-    math_abs: FuncId,
-    math_cos: FuncId,
-    math_sin: FuncId,
-    math_clamp: FuncId,
-    math_rand: FuncId,
 
     /// Per-actor dispatch function IDs (actor_name → FuncId).
     dispatch_fns: HashMap<String, FuncId>,
@@ -205,16 +137,6 @@ impl<'a> NativeCodegen<'a> {
         })?;
         let mut obj = ObjectModule::new(builder);
 
-        // Declare libc write(fd, buf, count) -> ssize_t
-        let mut write_sig = obj.make_signature();
-        write_sig.params.push(AbiParam::new(cl_types::I32)); // fd
-        write_sig.params.push(AbiParam::new(PTR)); // buf
-        write_sig.params.push(AbiParam::new(PTR)); // count
-        write_sig.returns.push(AbiParam::new(PTR)); // ssize_t
-        let libc_write = obj
-            .declare_function("write", Linkage::Import, &write_sig)
-            .unwrap();
-
         // malloc(size) -> ptr
         let mut malloc_sig = obj.make_signature();
         malloc_sig.params.push(AbiParam::new(PTR));
@@ -267,13 +189,6 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_println", Linkage::Import, &println_sig)
             .unwrap();
 
-        let mut itoa_sig = obj.make_signature();
-        itoa_sig.params.push(AbiParam::new(cl_types::I32));
-        itoa_sig.returns.push(AbiParam::new(PTR));
-        let helper_itoa = obj
-            .declare_function("lumen_itoa", Linkage::Import, &itoa_sig)
-            .unwrap();
-
         // rc_alloc(size: i64) -> ptr: malloc(size+8), set rc=1, return ptr+8
         let mut rc_alloc_sig = obj.make_signature();
         rc_alloc_sig.params.push(AbiParam::new(PTR));
@@ -324,370 +239,8 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_rt_drain", Linkage::Import, &rt_drain_sig)
             .unwrap();
 
-        // lumen_rt_yield()
-        let rt_yield_sig = obj.make_signature();
-        let rt_yield = obj
-            .declare_function("lumen_rt_yield", Linkage::Import, &rt_yield_sig)
-            .unwrap();
-
-        // --- TCP socket helpers (from runtime/rt.c) ---
-        // lumen_tcp_listen(port: i32) -> i32
-        let mut tcp_listen_sig = obj.make_signature();
-        tcp_listen_sig.params.push(AbiParam::new(cl_types::I32));
-        tcp_listen_sig.returns.push(AbiParam::new(cl_types::I32));
-        let net_tcp_listen = obj
-            .declare_function("lumen_tcp_listen", Linkage::Import, &tcp_listen_sig)
-            .unwrap();
-
-        // lumen_tcp_accept(server_fd: i32) -> i32
-        let mut tcp_accept_sig = obj.make_signature();
-        tcp_accept_sig.params.push(AbiParam::new(cl_types::I32));
-        tcp_accept_sig.returns.push(AbiParam::new(cl_types::I32));
-        let net_tcp_accept = obj
-            .declare_function("lumen_tcp_accept", Linkage::Import, &tcp_accept_sig)
-            .unwrap();
-
-        // lumen_tcp_read(fd: i32, max: i32) -> i64 (ptr to bytes)
-        let mut tcp_read_sig = obj.make_signature();
-        tcp_read_sig.params.push(AbiParam::new(cl_types::I32));
-        tcp_read_sig.params.push(AbiParam::new(cl_types::I32));
-        tcp_read_sig.returns.push(AbiParam::new(PTR));
-        let net_tcp_read = obj
-            .declare_function("lumen_tcp_read", Linkage::Import, &tcp_read_sig)
-            .unwrap();
-
-        // lumen_tcp_write(fd: i32, bytes_ptr: i64) -> i64
-        let mut tcp_write_sig = obj.make_signature();
-        tcp_write_sig.params.push(AbiParam::new(cl_types::I32));
-        tcp_write_sig.params.push(AbiParam::new(PTR));
-        tcp_write_sig.returns.push(AbiParam::new(PTR));
-        let net_tcp_write = obj
-            .declare_function("lumen_tcp_write", Linkage::Import, &tcp_write_sig)
-            .unwrap();
-
-        // lumen_tcp_close(fd: i32)
-        let mut tcp_close_sig = obj.make_signature();
-        tcp_close_sig.params.push(AbiParam::new(cl_types::I32));
-        let net_tcp_close = obj
-            .declare_function("lumen_tcp_close", Linkage::Import, &tcp_close_sig)
-            .unwrap();
-
-        // lumen_net_serve(port: i32, handler: ptr)
-        let mut serve_sig = obj.make_signature();
-        serve_sig.params.push(AbiParam::new(cl_types::I32));
-        serve_sig.params.push(AbiParam::new(PTR));
-        let net_serve = obj
-            .declare_function("lumen_net_serve", Linkage::Import, &serve_sig)
-            .unwrap();
-
-        // lumen_gt_read(fd: i32, max: i32) -> ptr (bytes)
-        let mut gt_read_sig = obj.make_signature();
-        gt_read_sig.params.push(AbiParam::new(cl_types::I32));
-        gt_read_sig.params.push(AbiParam::new(cl_types::I32));
-        gt_read_sig.returns.push(AbiParam::new(PTR));
-        let gt_read = obj
-            .declare_function("lumen_gt_read", Linkage::Import, &gt_read_sig)
-            .unwrap();
-
-        // lumen_gt_write(fd: i32, bytes: ptr) -> i32
-        let mut gt_write_sig = obj.make_signature();
-        gt_write_sig.params.push(AbiParam::new(cl_types::I32));
-        gt_write_sig.params.push(AbiParam::new(PTR));
-        gt_write_sig.returns.push(AbiParam::new(cl_types::I32));
-        let gt_write = obj
-            .declare_function("lumen_gt_write", Linkage::Import, &gt_write_sig)
-            .unwrap();
-
-        // lumen_http_parse_method(raw: ptr) -> ptr
-        let mut http_pm_sig = obj.make_signature();
-        http_pm_sig.params.push(AbiParam::new(PTR));
-        http_pm_sig.returns.push(AbiParam::new(PTR));
-        let http_parse_method = obj
-            .declare_function("lumen_http_parse_method", Linkage::Import, &http_pm_sig)
-            .unwrap();
-
-        // lumen_http_parse_path(raw: ptr) -> ptr
-        let mut http_pp_sig = obj.make_signature();
-        http_pp_sig.params.push(AbiParam::new(PTR));
-        http_pp_sig.returns.push(AbiParam::new(PTR));
-        let http_parse_path = obj
-            .declare_function("lumen_http_parse_path", Linkage::Import, &http_pp_sig)
-            .unwrap();
-
-        // lumen_http_parse_body(raw: ptr) -> ptr
-        let mut http_pb_sig = obj.make_signature();
-        http_pb_sig.params.push(AbiParam::new(PTR));
-        http_pb_sig.returns.push(AbiParam::new(PTR));
-        let http_parse_body = obj
-            .declare_function("lumen_http_parse_body", Linkage::Import, &http_pb_sig)
-            .unwrap();
-
-        // lumen_http_format_response(status: i32, body: ptr) -> ptr
-        let mut http_fr_sig = obj.make_signature();
-        http_fr_sig.params.push(AbiParam::new(cl_types::I32));
-        http_fr_sig.params.push(AbiParam::new(PTR));
-        http_fr_sig.returns.push(AbiParam::new(PTR));
-        let http_format_response = obj
-            .declare_function("lumen_http_format_response", Linkage::Import, &http_fr_sig)
-            .unwrap();
-
-        // lumen_list_new(elem_size: i32) -> i64 (PTR)
-        let mut list_new_sig = obj.make_signature();
-        list_new_sig.params.push(AbiParam::new(cl_types::I32));
-        list_new_sig.returns.push(AbiParam::new(PTR));
-        let list_new = obj
-            .declare_function("lumen_list_new", Linkage::Import, &list_new_sig)
-            .unwrap();
-
-        // lumen_list_len(list: i64) -> i32
-        let mut list_len_sig = obj.make_signature();
-        list_len_sig.params.push(AbiParam::new(cl_types::I64));
-        list_len_sig.returns.push(AbiParam::new(cl_types::I32));
-        let list_len = obj
-            .declare_function("lumen_list_len", Linkage::Import, &list_len_sig)
-            .unwrap();
-
-        // lumen_list_push(list: i64, value: i64) -> i64
-        let mut list_push_sig = obj.make_signature();
-        list_push_sig.params.push(AbiParam::new(cl_types::I64));
-        list_push_sig.params.push(AbiParam::new(cl_types::I64));
-        list_push_sig.returns.push(AbiParam::new(cl_types::I64));
-        let list_push = obj
-            .declare_function("lumen_list_push", Linkage::Import, &list_push_sig)
-            .unwrap();
-
-        // lumen_list_get(list: i64, index: i32) -> i64
-        let mut list_get_sig = obj.make_signature();
-        list_get_sig.params.push(AbiParam::new(cl_types::I64));
-        list_get_sig.params.push(AbiParam::new(cl_types::I32));
-        list_get_sig.returns.push(AbiParam::new(cl_types::I64));
-        let list_get = obj
-            .declare_function("lumen_list_get", Linkage::Import, &list_get_sig)
-            .unwrap();
-
-        // lumen_list_set(list: i64, index: i32, value: i64) -> i64
-        let mut list_set_sig = obj.make_signature();
-        list_set_sig.params.push(AbiParam::new(cl_types::I64));
-        list_set_sig.params.push(AbiParam::new(cl_types::I32));
-        list_set_sig.params.push(AbiParam::new(cl_types::I64));
-        list_set_sig.returns.push(AbiParam::new(cl_types::I64));
-        let list_set = obj
-            .declare_function("lumen_list_set", Linkage::Import, &list_set_sig)
-            .unwrap();
-
-        // lumen_list_remove(list: i64, index: i32) -> i64
-        let mut list_remove_sig = obj.make_signature();
-        list_remove_sig.params.push(AbiParam::new(cl_types::I64));
-        list_remove_sig.params.push(AbiParam::new(cl_types::I32));
-        list_remove_sig.returns.push(AbiParam::new(cl_types::I64));
-        let list_remove = obj
-            .declare_function("lumen_list_remove", Linkage::Import, &list_remove_sig)
-            .unwrap();
-
-        // --- Raylib bridge function declarations ---
-
-        // rl_init_window(w: i32, h: i32, title: ptr)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(PTR));
-        let rl_init_window = obj.declare_function("rl_init_window", Linkage::Import, &sig).unwrap();
-
-        // rl_close_window()
-        let sig = obj.make_signature();
-        let rl_close_window = obj.declare_function("rl_close_window", Linkage::Import, &sig).unwrap();
-
-        // rl_window_should_close() -> i32
-        let mut sig = obj.make_signature();
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_window_should_close = obj.declare_function("rl_window_should_close", Linkage::Import, &sig).unwrap();
-
-        // rl_set_target_fps(fps: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_set_target_fps = obj.declare_function("rl_set_target_fps", Linkage::Import, &sig).unwrap();
-
-        // rl_get_frame_time() -> f64
-        let mut sig = obj.make_signature();
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let rl_get_frame_time = obj.declare_function("rl_get_frame_time", Linkage::Import, &sig).unwrap();
-
-        // rl_begin_drawing()
-        let sig = obj.make_signature();
-        let rl_begin_drawing = obj.declare_function("rl_begin_drawing", Linkage::Import, &sig).unwrap();
-
-        // rl_end_drawing()
-        let sig = obj.make_signature();
-        let rl_end_drawing = obj.declare_function("rl_end_drawing", Linkage::Import, &sig).unwrap();
-
-        // rl_clear_background(color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_clear_background = obj.declare_function("rl_clear_background", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_text(text: ptr, x: i32, y: i32, size: i32, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(PTR));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_text = obj.declare_function("rl_draw_text", Linkage::Import, &sig).unwrap();
-
-        // rl_measure_text(text: ptr, size: i32) -> i32
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(PTR));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_measure_text = obj.declare_function("rl_measure_text", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_rectangle_rec(x: f64, y: f64, w: f64, h: f64, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_rectangle_rec = obj.declare_function("rl_draw_rectangle_rec", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_rectangle(x: i32, y: i32, w: i32, h: i32, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_rectangle = obj.declare_function("rl_draw_rectangle", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_rectangle_pro(rx: f64, ry: f64, rw: f64, rh: f64, ox: f64, oy: f64, rot: f64, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_rectangle_pro = obj.declare_function("rl_draw_rectangle_pro", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_circle(cx: f64, cy: f64, radius: f64, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_circle = obj.declare_function("rl_draw_circle", Linkage::Import, &sig).unwrap();
-
-        // rl_draw_line(x1: i32, y1: i32, x2: i32, y2: i32, color: i32)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::I32));
-        let rl_draw_line = obj.declare_function("rl_draw_line", Linkage::Import, &sig).unwrap();
-
-        // rl_is_key_pressed(key: i32) -> i32
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_is_key_pressed = obj.declare_function("rl_is_key_pressed", Linkage::Import, &sig).unwrap();
-
-        // rl_is_key_down(key: i32) -> i32
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_is_key_down = obj.declare_function("rl_is_key_down", Linkage::Import, &sig).unwrap();
-
-        // rl_is_gesture_detected(gesture: i32) -> i32
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_is_gesture_detected = obj.declare_function("rl_is_gesture_detected", Linkage::Import, &sig).unwrap();
-
-        // rl_set_camera(tx: f64, ty: f64, ox: f64, oy: f64, rot: f64, zoom: f64)
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        let rl_set_camera = obj.declare_function("rl_set_camera", Linkage::Import, &sig).unwrap();
-
-        // rl_begin_mode_2d()
-        let sig = obj.make_signature();
-        let rl_begin_mode_2d = obj.declare_function("rl_begin_mode_2d", Linkage::Import, &sig).unwrap();
-
-        // rl_end_mode_2d()
-        let sig = obj.make_signature();
-        let rl_end_mode_2d = obj.declare_function("rl_end_mode_2d", Linkage::Import, &sig).unwrap();
-
-        // rl_init_audio()
-        let sig = obj.make_signature();
-        let rl_init_audio = obj.declare_function("rl_init_audio", Linkage::Import, &sig).unwrap();
-
-        // Color constants: all () -> i32
-        let mut color_sig = obj.make_signature();
-        color_sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_color_black = obj.declare_function("rl_color_black", Linkage::Import, &color_sig).unwrap();
-        let rl_color_white = obj.declare_function("rl_color_white", Linkage::Import, &color_sig).unwrap();
-        let rl_color_red = obj.declare_function("rl_color_red", Linkage::Import, &color_sig).unwrap();
-        let rl_color_green = obj.declare_function("rl_color_green", Linkage::Import, &color_sig).unwrap();
-        let rl_color_blue = obj.declare_function("rl_color_blue", Linkage::Import, &color_sig).unwrap();
-        let rl_color_yellow = obj.declare_function("rl_color_yellow", Linkage::Import, &color_sig).unwrap();
-        let rl_color_purple = obj.declare_function("rl_color_purple", Linkage::Import, &color_sig).unwrap();
-        let rl_color_darkblue = obj.declare_function("rl_color_darkblue", Linkage::Import, &color_sig).unwrap();
-        let rl_color_darkgray = obj.declare_function("rl_color_darkgray", Linkage::Import, &color_sig).unwrap();
-        let rl_color_gray = obj.declare_function("rl_color_gray", Linkage::Import, &color_sig).unwrap();
-
-        // rl_color_alpha(color: i32, alpha: f64) -> i32
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::I32));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::I32));
-        let rl_color_alpha = obj.declare_function("rl_color_alpha", Linkage::Import, &sig).unwrap();
-
-        // --- Math helpers ---
-
-        // lumen_sqrt(x: f64) -> f64
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_sqrt = obj.declare_function("lumen_sqrt", Linkage::Import, &sig).unwrap();
-
-        // lumen_abs(x: f64) -> f64
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_abs = obj.declare_function("lumen_abs", Linkage::Import, &sig).unwrap();
-
-        // lumen_cos(x: f64) -> f64
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_cos = obj.declare_function("lumen_cos", Linkage::Import, &sig).unwrap();
-
-        // lumen_sin(x: f64) -> f64
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_sin = obj.declare_function("lumen_sin", Linkage::Import, &sig).unwrap();
-
-        // lumen_clamp(x: f64, lo: f64, hi: f64) -> f64
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.params.push(AbiParam::new(cl_types::F64));
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_clamp = obj.declare_function("lumen_clamp", Linkage::Import, &sig).unwrap();
-
-        // lumen_rand_f64() -> f64
-        let mut sig = obj.make_signature();
-        sig.returns.push(AbiParam::new(cl_types::F64));
-        let math_rand = obj.declare_function("lumen_rand_f64", Linkage::Import, &sig).unwrap();
-
+        // --- Module functions are now declared from parsed std/*.lm files ---
+        // (see compile_module → "Declare imported module extern fns")
         // print_frames: () -> void. Walks the frame_chain and prints each.
         let print_frames_sig = obj.make_signature();
         let helper_print_frames = obj
@@ -698,12 +251,10 @@ impl<'a> NativeCodegen<'a> {
             info,
             obj,
             fn_ids: HashMap::new(),
-            libc_write,
             libc_malloc,
             libc_free,
             helper_concat,
             helper_println,
-            helper_itoa,
             helper_print_frames,
             helper_rc_alloc,
             helper_rc_incr,
@@ -711,64 +262,6 @@ impl<'a> NativeCodegen<'a> {
             rt_send,
             rt_ask,
             rt_drain,
-            rt_yield,
-            net_tcp_listen,
-            net_tcp_accept,
-            net_tcp_read,
-            net_tcp_write,
-            net_tcp_close,
-            net_serve,
-            gt_read,
-            gt_write,
-            http_parse_method,
-            http_parse_path,
-            http_parse_body,
-            http_format_response,
-            list_new,
-            list_len,
-            list_push,
-            list_get,
-            list_set,
-            list_remove,
-            rl_init_window,
-            rl_close_window,
-            rl_window_should_close,
-            rl_set_target_fps,
-            rl_get_frame_time,
-            rl_begin_drawing,
-            rl_end_drawing,
-            rl_clear_background,
-            rl_draw_text,
-            rl_measure_text,
-            rl_draw_rectangle_rec,
-            rl_draw_rectangle,
-            rl_draw_rectangle_pro,
-            rl_draw_circle,
-            rl_draw_line,
-            rl_is_key_pressed,
-            rl_is_key_down,
-            rl_is_gesture_detected,
-            rl_set_camera,
-            rl_begin_mode_2d,
-            rl_end_mode_2d,
-            rl_init_audio,
-            rl_color_black,
-            rl_color_white,
-            rl_color_red,
-            rl_color_green,
-            rl_color_blue,
-            rl_color_yellow,
-            rl_color_purple,
-            rl_color_darkblue,
-            rl_color_darkgray,
-            rl_color_gray,
-            rl_color_alpha,
-            math_sqrt,
-            math_abs,
-            math_cos,
-            math_sin,
-            math_clamp,
-            math_rand,
             dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
