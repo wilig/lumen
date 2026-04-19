@@ -21,6 +21,8 @@ pub struct Module {
 pub struct Import {
     /// Path components: `import std/io` → `["std", "io"]`.
     pub path: Vec<String>,
+    /// Optional alias: `import std/raylib as rl` → Some("rl").
+    pub alias: Option<String>,
     pub span: Span,
 }
 

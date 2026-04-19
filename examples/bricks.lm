@@ -1,7 +1,7 @@
 // Bricks! — A breakout clone ported from Odin to Lumen.
 // Uses raylib via the C bridge layer.
 
-import std/rl
+import std/raylib as rl
 import std/math
 import std/int
 import std/list

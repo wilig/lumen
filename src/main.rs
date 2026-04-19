@@ -36,26 +36,32 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
     let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
     let mut imported = Vec::new();
     let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: Vec<String> = module.imports.iter()
-        .map(|imp| imp.path.last().cloned().unwrap_or_default())
+    // Queue: (file_name, registered_name). Alias only applies to direct user imports.
+    let mut queue: Vec<(String, String)> = module.imports.iter()
+        .map(|imp| {
+            let file_name = imp.path.last().cloned().unwrap_or_default();
+            let reg_name = imp.alias.clone().unwrap_or_else(|| file_name.clone());
+            (file_name, reg_name)
+        })
         .collect();
-    while let Some(mod_name) = queue.pop() {
-        if loaded.contains(&mod_name) { continue; }
-        loaded.insert(mod_name.clone());
-        let mod_path = std_dir.join(format!("{mod_name}.lm"));
+    while let Some((file_name, reg_name)) = queue.pop() {
+        if loaded.contains(&reg_name) { continue; }
+        loaded.insert(reg_name.clone());
+        let mod_path = std_dir.join(format!("{file_name}.lm"));
         if mod_path.exists() {
             let mod_src = std::fs::read_to_string(&mod_path)
                 .map_err(|e| format!("read {}: {e}", mod_path.display()))?;
             let mod_tokens = lumen::lexer::lex(&mod_src)
-                .map_err(|e| format!("lex error in std/{mod_name}.lm: {e}"))?;
+                .map_err(|e| format!("lex error in std/{file_name}.lm: {e}"))?;
             let mod_ast = lumen::parser::parse(mod_tokens)
-                .map_err(|e| format!("parse error in std/{mod_name}.lm: {e}"))?;
-            // Queue transitive imports.
+                .map_err(|e| format!("parse error in std/{file_name}.lm: {e}"))?;
+            // Queue transitive imports (no alias — use file name directly).
             for imp in &mod_ast.imports {
                 let dep = imp.path.last().cloned().unwrap_or_default();
-                if !loaded.contains(&dep) { queue.push(dep); }
+                let dep_name = imp.alias.clone().unwrap_or_else(|| dep.clone());
+                if !loaded.contains(&dep_name) { queue.push((dep, dep_name)); }
             }
-            imported.push(lumen::types::ParsedImport { name: mod_name, module: mod_ast });
+            imported.push(lumen::types::ParsedImport { name: reg_name, module: mod_ast });
         }
     }
 

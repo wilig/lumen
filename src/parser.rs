@@ -162,9 +162,18 @@ impl Parser {
             path.push(seg.0);
         }
 
+        // Optional alias: `import std/raylib as rl`
+        let alias = if matches!(self.peek_kind(), TokenKind::As) {
+            self.bump();
+            Some(self.expect_ident("alias name after `as`")?.0)
+        } else {
+            None
+        };
+
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Ok(Import {
             path,
+            alias,
             span: merge(start, end),
         })
     }

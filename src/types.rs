@@ -1528,11 +1528,7 @@ impl<'a> FnChecker<'a> {
                 }
                 return Some(Ty::Error);
             }
-            ("rl", _) if !self.module.imports.iter().any(|i| i == "std/rl" || i == "std/raylib") => {
-                self.errors.push(TypeError {
-                    span,
-                    message: format!("`rl.{method}` requires `import std/rl`"),
-                });
+            (_unknown_mod, _) if !self.module.modules.contains_key(_unknown_mod) => {
                 return None;
             }
             _ => {}
@@ -2167,13 +2163,14 @@ mod tests {
         let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
         let mut imported = Vec::new();
         for imp in &m.imports {
-            let mod_name = imp.path.last().cloned().unwrap_or_default();
-            let mod_path = std_dir.join(format!("{mod_name}.lm"));
+            let file_name = imp.path.last().cloned().unwrap_or_default();
+            let reg_name = imp.alias.clone().unwrap_or_else(|| file_name.clone());
+            let mod_path = std_dir.join(format!("{file_name}.lm"));
             if mod_path.exists() {
                 let mod_src = std::fs::read_to_string(&mod_path).unwrap();
                 let mod_tokens = lex(&mod_src).unwrap();
                 let mod_ast = parse(mod_tokens).unwrap();
-                imported.push(ParsedImport { name: mod_name, module: mod_ast });
+                imported.push(ParsedImport { name: reg_name, module: mod_ast });
             }
         }
         typecheck(&m, &imported)
