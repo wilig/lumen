@@ -1,0 +1,34 @@
+{
+  "name": "lumen",
+  "displayName": "Lumen",
+  "description": "Syntax highlighting for the Lumen programming language.",
+  "version": "0.1.0",
+  "publisher": "lumen",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wilig/lumen"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lumen",
+        "aliases": ["Lumen", "lumen"],
+        "extensions": [".lm"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lumen",
+        "scopeName": "source.lumen",
+        "path": "./syntaxes/lumen.tmLanguage.json"
+      }
+    ]
+  }
+}

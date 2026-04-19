@@ -1,0 +1,264 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lumen",
+  "scopeName": "source.lumen",
+  "fileTypes": ["lm"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#triple-string" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#import" },
+    { "include": "#fn-decl" },
+    { "include": "#extern-fn-decl" },
+    { "include": "#msg-decl" },
+    { "include": "#actor-decl" },
+    { "include": "#type-decl" },
+    { "include": "#keyword" },
+    { "include": "#effect" },
+    { "include": "#builtin-type" },
+    { "include": "#generic-type" },
+    { "include": "#variant" },
+    { "include": "#builtin-fn" },
+    { "include": "#constant" },
+    { "include": "#operator" },
+    { "include": "#punctuation" },
+    { "include": "#fn-call" },
+    { "include": "#identifier" }
+  ],
+  "repository": {
+
+    "comment": {
+      "name": "comment.line.double-slash.lumen",
+      "match": "//.*$"
+    },
+
+    "string": {
+      "name": "string.quoted.double.lumen",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "include": "#string-escape" },
+        { "include": "#interpolation" }
+      ]
+    },
+
+    "triple-string": {
+      "name": "string.quoted.triple.lumen",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        { "include": "#string-escape" },
+        { "include": "#interpolation" }
+      ]
+    },
+
+    "string-escape": {
+      "name": "constant.character.escape.lumen",
+      "match": "\\\\(n|t|r|0|\\\\|\")"
+    },
+
+    "interpolation": {
+      "name": "meta.interpolation.lumen",
+      "begin": "\\\\\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.embedded.begin.lumen" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.embedded.end.lumen" }
+      },
+      "patterns": [
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keyword" },
+        { "include": "#builtin-type" },
+        { "include": "#generic-type" },
+        { "include": "#variant" },
+        { "include": "#constant" },
+        { "include": "#operator" },
+        { "include": "#fn-call" },
+        { "include": "#identifier" }
+      ]
+    },
+
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.lumen",
+          "match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.lumen",
+          "match": "\\b\\d+(i32|i64|u32|u64)?\\b"
+        }
+      ]
+    },
+
+    "import": {
+      "match": "\\b(import)\\s+([a-zA-Z_][a-zA-Z0-9_/]*)(?:\\s+(as)\\s+([a-zA-Z_][a-zA-Z0-9_]*))?",
+      "captures": {
+        "1": { "name": "keyword.control.import.lumen" },
+        "2": { "name": "entity.name.namespace.lumen" },
+        "3": { "name": "keyword.control.as.lumen" },
+        "4": { "name": "entity.name.namespace.lumen" }
+      }
+    },
+
+    "fn-decl": {
+      "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.function.lumen" },
+        "2": { "name": "entity.name.function.lumen" }
+      }
+    },
+
+    "extern-fn-decl": {
+      "match": "\\b(extern)\\s+(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.modifier.extern.lumen" },
+        "2": { "name": "keyword.declaration.function.lumen" },
+        "3": { "name": "entity.name.function.lumen" }
+      }
+    },
+
+    "msg-decl": {
+      "match": "\\b(msg)\\s+([A-Z][a-zA-Z0-9_]*)\\.([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.actor.lumen" },
+        "2": { "name": "entity.name.type.actor.lumen" },
+        "3": { "name": "entity.name.function.method.lumen" }
+      }
+    },
+
+    "actor-decl": {
+      "match": "\\b(actor)\\s+([A-Z][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.actor.lumen" },
+        "2": { "name": "entity.name.type.actor.lumen" }
+      }
+    },
+
+    "type-decl": {
+      "match": "\\b(type)\\s+([A-Z][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.type.lumen" },
+        "2": { "name": "entity.name.type.lumen" }
+      }
+    },
+
+    "keyword": {
+      "patterns": [
+        {
+          "name": "keyword.declaration.lumen",
+          "match": "\\b(let|var|fn|type|extern|actor|msg)\\b"
+        },
+        {
+          "name": "keyword.control.lumen",
+          "match": "\\b(if|else|match|for|in|return|spawn|send|ask|as)\\b"
+        },
+        {
+          "name": "keyword.control.import.lumen",
+          "match": "\\bimport\\b"
+        }
+      ]
+    },
+
+    "effect": {
+      "name": "storage.modifier.effect.lumen",
+      "comment": "io / pure are contextual keywords. Only treat as an effect annotation when they're NOT followed by a `.` (which would make them module references like `io.println`).",
+      "match": "\\b(io|pure)\\b(?!\\s*\\.)"
+    },
+
+    "builtin-type": {
+      "name": "support.type.primitive.lumen",
+      "match": "\\b(i32|i64|u32|u64|f64|bool|string|bytes|unit)\\b"
+    },
+
+    "generic-type": {
+      "name": "support.type.generic.lumen",
+      "match": "\\b(List|Map|Option|Result|Handle)\\b"
+    },
+
+    "variant": {
+      "name": "support.constant.variant.lumen",
+      "match": "\\b(Ok|Err|Some|None)\\b"
+    },
+
+    "builtin-fn": {
+      "name": "support.function.builtin.lumen",
+      "match": "\\b(assert|string_len|range)\\b(?=\\s*\\()"
+    },
+
+    "constant": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.lumen",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.unit.lumen",
+          "match": "\\b(unit)\\b"
+        }
+      ]
+    },
+
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.lumen",
+          "match": "(->|=>)"
+        },
+        {
+          "name": "keyword.operator.comparison.lumen",
+          "match": "(==|!=|<=|>=|<|>)"
+        },
+        {
+          "name": "keyword.operator.logical.lumen",
+          "match": "(&&|\\|\\||!)"
+        },
+        {
+          "name": "keyword.operator.assignment.lumen",
+          "match": "(\\+=|-=|\\*=|=)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.lumen",
+          "match": "(\\+|-|\\*|/|%)"
+        },
+        {
+          "name": "keyword.operator.try.lumen",
+          "match": "\\?"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.terminator.lumen", "match": ";" },
+        { "name": "punctuation.separator.lumen", "match": "[,:]" },
+        { "name": "punctuation.accessor.lumen", "match": "\\." },
+        { "name": "punctuation.alternation.lumen", "match": "\\|" }
+      ]
+    },
+
+    "fn-call": {
+      "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.call.lumen" }
+      }
+    },
+
+    "identifier": {
+      "patterns": [
+        {
+          "name": "variable.other.type.lumen",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+        },
+        {
+          "name": "variable.other.lumen",
+          "match": "\\b[a-z_][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

@@ -8,6 +8,7 @@ See:
 - [`docs/design.md`](docs/design.md) — design rationale and decisions
 - [`docs/grammar.ebnf`](docs/grammar.ebnf) — formal grammar
 - [`docs/fluency-validation.md`](docs/fluency-validation.md) — LLM fluency check and findings
+- [`tooling/vscode-lumen/`](tooling/vscode-lumen) — VS Code extension (syntax highlighting)
 - Beads issues (`bd list`) — tracked work
 
 ## Core idea
