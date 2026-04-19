@@ -28,6 +28,9 @@ id_twice:   7
 p1.fst = 7, p1.snd = hello
 p2.fst = key, p2.snd = 42
 bi = 100, bs = boxed
+m1 = nothing
+m2 = just 42
+m3 = just boxed string
 
 === list utilities ===
 nums:       [1, 2, 3, 4, 5]

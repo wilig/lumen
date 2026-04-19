@@ -1675,7 +1675,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     Ok(self.builder.use_var(var))
                 } else if name == "None" {
                     self.build_sum_block(0, None)
-                } else if let Some(sum_name) = self.find_sum_for_variant(name) {
+                } else if let Some(sum_name) = self.resolved_variant_sum(expr.span)
+                    .or_else(|| self.find_sum_for_variant(name))
+                {
                     let tag = self.variant_tag(&Ty::User(sum_name), name).unwrap_or(0);
                     self.build_sum_block(tag, None)
                 } else if let Some(&func_id) = self.cg.fn_ids.get(name) {
@@ -2052,13 +2054,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         }
 
         // User variant constructor (positional payload)?
-        if let Some(sum_name) = self.find_sum_for_variant(&name) {
-            let tag = self.variant_tag(&Ty::User(sum_name), &name).unwrap_or(0);
+        // Prefer the type-checker's recorded resolution (if the call was
+        // type-checked against an expected generic-sum instantiation),
+        // otherwise fall back to first-match across all sums.
+        if let Some(sum_name) = self.resolved_variant_sum(span)
+            .or_else(|| self.find_sum_for_variant(&name))
+        {
+            let tag = self.variant_tag(&Ty::User(sum_name.clone()), &name).unwrap_or(0);
             if args.is_empty() {
                 return self.build_sum_block(tag, None);
             }
             // Positional variant: allocate payload with fields.
-            let scrut_ty = Ty::User(self.find_sum_for_variant(&name).unwrap());
+            let scrut_ty = Ty::User(sum_name);
             let fields = self.variant_field_types(&scrut_ty, &name).unwrap_or_default();
             let layout = fields.clone();
             let payload = self.build_payload_block(&layout, args, span)?;
@@ -2616,7 +2623,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
         // Named-field variant constructor? (e.g. Circle { radius: 2 })
         if get_struct_fields(&self.cg.info.types, name).is_empty() {
-            if let Some(sum_name) = self.find_sum_for_variant(name) {
+            if let Some(sum_name) = self.resolved_variant_sum(span)
+                .or_else(|| self.find_sum_for_variant(name))
+            {
                 let scrut_ty = Ty::User(sum_name);
                 let tag = self.variant_tag(&scrut_ty, name).unwrap_or(0);
                 let var_fields = self.variant_field_types(&scrut_ty, name).unwrap_or_default();
@@ -3511,6 +3520,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 if let Some(ty) = self.name_types.get(name) {
                     return Ok(ty.clone());
                 }
+                // Variant constructor recorded by the type checker against
+                // an expected generic-sum instantiation (e.g. bare `Empty`
+                // resolved against expected = Node$I32).
+                if let Some(sum_name) = self.resolved_variant_sum(expr.span) {
+                    return Ok(Ty::User(sum_name));
+                }
+                // Bare zero-payload variant of any registered sum type.
+                if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    return Ok(Ty::User(sum_name));
+                }
                 // If the ident names a known function, return its FnPtr type.
                 if let Some(sig) = self.cg.info.fns.get(name) {
                     let params: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
@@ -3779,6 +3798,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 Ty::I32
             }
             ExprKind::StructLit { name, fields, .. } => {
+                // Variant constructor recorded by the type checker against
+                // an expected generic-sum instantiation (e.g. `Just { value: 42 }`
+                // resolved against expected = Maybe$I32) — that wins because
+                // the bare name is a variant, not a registered type.
+                if let Some(sum_name) = self.resolved_variant_sum(expr.span) {
+                    return Ok(Ty::User(sum_name));
+                }
+                // Bare variant of a non-generic sum (find_sum_for_variant
+                // covers it because the sum itself is registered in info.types).
+                if let Some(sum_name) = self.find_sum_for_variant(name) {
+                    return Ok(Ty::User(sum_name));
+                }
                 // For a generic-template struct, the actual concrete type
                 // is the mangled instantiation derived from field types.
                 let resolved = self.resolve_struct_lit_name(name, fields)?;
@@ -3881,6 +3912,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             }
         }
         None
+    }
+
+    /// If the type checker resolved this variant-constructor expression
+    /// against an expected generic-sum instantiation (recorded in
+    /// ModuleInfo.variant_resolutions), return that mangled sum name.
+    fn resolved_variant_sum(&self, span: Span) -> Option<String> {
+        self.cg.info.variant_resolutions.get(&span.start).cloned()
     }
 }
 
@@ -4067,7 +4105,13 @@ fn resolve_type_to_ty(ty: &ast::Type) -> Ty {
             ),
             ("Handle", 1) => Ty::Handle(Box::new(resolve_type_to_ty(&args[0]))),
             (other, 0) => Ty::User(other.to_string()),
-            _ => Ty::Error,
+            // Generic user-type instantiation: produce the mangled
+            // name. The type-checker pre-pass should have registered
+            // the corresponding TypeInfo in info.types under this name.
+            (other, _) => {
+                let resolved_args: Vec<Ty> = args.iter().map(resolve_type_to_ty).collect();
+                Ty::User(crate::types::mangle_type_instantiation(other, &resolved_args))
+            }
         },
         ast::TypeKind::FnPtr { params, ret } => {
             let param_tys = params.iter().map(resolve_type_to_ty).collect();

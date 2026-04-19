@@ -158,6 +158,12 @@ pub struct ModuleInfo {
     /// the user's "Pair" so the literal `Pair { ... }` written in source
     /// can resolve to the right concrete type when context provides one.
     pub generic_type_origins: HashMap<String, String>,
+    /// Variant-constructor expressions resolved by the type checker
+    /// against an expected-type context, keyed by `expr.span.start`.
+    /// Lets the codegen see which generic-sum instantiation a bare
+    /// `Empty` / `Cell { ... }` / `Cell(...)` belongs to without
+    /// re-running the inference itself.
+    pub variant_resolutions: HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +241,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         module_link_names: HashMap::new(),
         generic_type_templates: HashMap::new(),
         generic_type_origins: HashMap::new(),
+        variant_resolutions: HashMap::new(),
     };
 
     // Register imported module APIs.
@@ -530,7 +537,8 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             let Some(sig) = info.fns.get(&fn_name) else {
                 continue;
             };
-            let mut checker = FnChecker::new(&info, sig, &mut errors);
+            let sig = sig.clone();
+            let mut checker = FnChecker::new(&info, &sig, &mut errors);
             // Wrap body in a synthetic FnDecl for check_fn.
             let synthetic = FnDecl {
                 name: fn_name.clone(),
@@ -557,17 +565,29 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                 span: mh.span,
             };
             checker.check_fn(&synthetic);
+            let resolutions = std::mem::take(&mut checker.variant_resolutions);
+            drop(checker);
+            for (k, v) in resolutions {
+                info.variant_resolutions.insert(k, v);
+            }
         }
     }
 
     // Pass 4: check each fn body.
     for item in &module.items {
         if let Item::Fn(f) = item {
-            let Some(sig) = info.fns.get(&f.name) else {
+            let Some(sig) = info.fns.get(&f.name).cloned() else {
                 continue;
             };
-            let mut checker = FnChecker::new(&info, sig, &mut errors);
-            checker.check_fn(f);
+            let mut resolutions;
+            {
+                let mut checker = FnChecker::new(&info, &sig, &mut errors);
+                checker.check_fn(f);
+                resolutions = std::mem::take(&mut checker.variant_resolutions);
+            }
+            for (k, v) in resolutions.drain() {
+                info.variant_resolutions.insert(k, v);
+            }
         }
     }
 
@@ -745,18 +765,46 @@ fn register_generic_instantiations(
                         Err(e) => { errors.push(e); Ty::Error }
                     };
                     let ty = substitute_generic(raw, &subs);
-                    // If this field references another generic type, queue it.
                     queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
                     resolved.push((f.name.clone(), ty));
                 }
                 TypeInfo::Struct { fields: resolved, span: template.span }
             }
-            TypeBody::Sum(_) => {
-                errors.push(TypeError {
-                    span: template.span,
-                    message: format!("generic sum types are not yet supported (`{name}<...>`)"),
-                });
-                TypeInfo::Struct { fields: Vec::new(), span: template.span }
+            TypeBody::Sum(variants) => {
+                let mut out = Vec::new();
+                for v in variants {
+                    let payload = match &v.payload {
+                        None => None,
+                        Some(VariantPayload::Named(fields)) => {
+                            let mut resolved = Vec::new();
+                            for f in fields {
+                                let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
+                                    Ok(t) => t,
+                                    Err(e) => { errors.push(e); Ty::Error }
+                                };
+                                let ty = substitute_generic(raw, &subs);
+                                queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
+                                resolved.push((f.name.clone(), ty));
+                            }
+                            Some(VariantPayloadInfo::Named(resolved))
+                        }
+                        Some(VariantPayload::Positional(tys)) => {
+                            let mut resolved = Vec::new();
+                            for t in tys {
+                                let raw = match resolve_type_with_params(t, &info.types, &template.type_params) {
+                                    Ok(t) => t,
+                                    Err(e) => { errors.push(e); Ty::Error }
+                                };
+                                let ty = substitute_generic(raw, &subs);
+                                queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
+                                resolved.push(ty);
+                            }
+                            Some(VariantPayloadInfo::Positional(resolved))
+                        }
+                    };
+                    out.push(VariantInfo { name: v.name.clone(), payload });
+                }
+                TypeInfo::Sum { variants: out, span: template.span }
             }
         };
         info.types.insert(mangled, body);
@@ -981,6 +1029,12 @@ struct FnChecker<'a> {
     /// When inside a lambda, the scope depth at which the lambda starts.
     /// `lookup` will not search scopes below this depth, preventing capture.
     lambda_scope_floor: Option<usize>,
+    /// Variant-constructor expressions resolved against an expected
+    /// type during this fn's body check, keyed by `expr.span.start`.
+    /// Drained into ModuleInfo.variant_resolutions after check_fn so
+    /// the codegen can see which generic-sum instantiation a bare
+    /// `Empty` / `Cell { ... }` / `Cell(...)` belongs to.
+    variant_resolutions: HashMap<u32, String>,
 }
 
 #[derive(Default)]
@@ -1003,6 +1057,7 @@ impl<'a> FnChecker<'a> {
             scopes: Vec::new(),
             errors,
             lambda_scope_floor: None,
+            variant_resolutions: HashMap::new(),
         }
     }
 
@@ -1262,6 +1317,54 @@ impl<'a> FnChecker<'a> {
                         return self.check_struct_lit_fields(
                             mangled, *name_span, fields, spread.as_deref(), expr.span, def_fields,
                         );
+                    }
+                }
+                // Variant constructor with named fields against an
+                // expected generic-sum instantiation (e.g.
+                // `Cell { val: 5, next: 0 }` where expected = Node$I32).
+                if let Some(Some(VariantPayloadInfo::Named(def_fields))) = self.find_variant_payload_in(mangled, name) {
+                    let def_fields = def_fields.clone();
+                    self.check_struct_lit_fields(
+                        name, *name_span, fields, spread.as_deref(), expr.span, def_fields,
+                    );
+                    self.variant_resolutions.insert(expr.span.start, mangled.clone());
+                    return Ty::User(mangled.clone());
+                }
+            }
+        }
+        // Bare ident referring to a no-payload variant of an expected
+        // generic-sum instantiation (e.g. `Empty` where expected = Node$I32).
+        if let ExprKind::Ident(name) = &expr.kind {
+            if let Ty::User(mangled) = expected {
+                if let Some(None) = self.find_variant_payload_in(mangled, name) {
+                    self.variant_resolutions.insert(expr.span.start, mangled.clone());
+                    return Ty::User(mangled.clone());
+                }
+            }
+        }
+        // Positional-payload variant constructor against an expected
+        // generic-sum instantiation (e.g. `Cell(5, 0)` where expected =
+        // Node$I32).
+        if let ExprKind::Call { callee, args } = &expr.kind {
+            if let ExprKind::Ident(name) = &callee.kind {
+                if let Ty::User(mangled) = expected {
+                    if let Some(Some(VariantPayloadInfo::Positional(types))) = self.find_variant_payload_in(mangled, name) {
+                        let types = types.clone();
+                        if args.len() != types.len() {
+                            self.errors.push(TypeError {
+                                span: expr.span,
+                                message: format!(
+                                    "variant `{name}` of `{mangled}` expects {} positional args, found {}",
+                                    types.len(), args.len()
+                                ),
+                            });
+                        } else {
+                            for (i, t) in types.iter().enumerate() {
+                                self.check_expr(&args[i].value, t);
+                            }
+                        }
+                        self.variant_resolutions.insert(expr.span.start, mangled.clone());
+                        return Ty::User(mangled.clone());
                     }
                 }
             }
@@ -2177,6 +2280,23 @@ impl<'a> FnChecker<'a> {
         self.check_expr(&args[0].value, &Ty::I32);
         self.check_expr(&args[1].value, &Ty::I32);
         Ty::List(Box::new(Ty::I32))
+    }
+
+    /// Look up `variant_name` inside the sum type `type_name`. Returns
+    /// the variant's payload (None for no-payload variants like `Empty`,
+    /// `Some(Named(...))` for `Cell { val: T, ... }`, or
+    /// `Some(Positional(...))` for `Some(v)`-shaped constructors).
+    /// Returns None if `type_name` isn't a sum type or doesn't have the
+    /// variant.
+    fn find_variant_payload_in(&self, type_name: &str, variant_name: &str) -> Option<&Option<VariantPayloadInfo>> {
+        if let Some(TypeInfo::Sum { variants, .. }) = self.module.types.get(type_name) {
+            for v in variants {
+                if v.name == variant_name {
+                    return Some(&v.payload);
+                }
+            }
+        }
+        None
     }
 
     fn find_variant(&self, name: &str) -> Option<(String, VariantClone)> {

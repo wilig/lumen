@@ -25,6 +25,7 @@ type Point = { x: f64, y: f64 }
 
 type Pair<A, B> = { fst: A, snd: B }
 type Box<T> = { val: T }
+type Maybe<T> = | Nothing | Just { value: T }
 
 // --- Actor (used by both actors and multi_actor sections) ---
 actor Counter {
@@ -164,6 +165,23 @@ fn main(): i32 io {
     let bi: Box<i32> = Box { val: 100 }
     let bs: Box<string> = Box { val: "boxed" }
     io.println("bi = \{bi.val}, bs = \{bs.val}")
+
+    // generic sum types
+    let m1: Maybe<i32> = Nothing
+    let m2: Maybe<i32> = Just { value: 42 }
+    let m3: Maybe<string> = Just { value: "boxed string" }
+    match m1 {
+        Nothing => io.println("m1 = nothing"),
+        Just { value: v } => io.println("m1 = just \{v}"),
+    }
+    match m2 {
+        Nothing => io.println("m2 = nothing"),
+        Just { value: v } => io.println("m2 = just \{v}"),
+    }
+    match m3 {
+        Nothing => io.println("m3 = nothing"),
+        Just { value: s } => io.println("m3 = just \{s}"),
+    }
 
     // list_utils
     section("list utilities")
