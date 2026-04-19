@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -605,4 +606,67 @@ int32_t lumen_gt_write(int fd, int64_t bytes_ptr) {
         }
     }
     return (int32_t)written;
+}
+
+// --- Math helpers --------------------------------------------------------
+
+double lumen_sqrt(double x) { return sqrt(x); }
+double lumen_abs(double x) { return fabs(x); }
+double lumen_cos(double x) { return cos(x); }
+double lumen_sin(double x) { return sin(x); }
+double lumen_clamp(double x, double lo, double hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+double lumen_rand_f64(void) { return (double)rand() / (double)RAND_MAX; }
+
+// --- String helpers (println, itoa, concat) ------------------------------
+
+void lumen_println(int64_t str_ptr) {
+    if (str_ptr == 0) { write(1, "\n", 1); return; }
+    char *buf = (char *)(uintptr_t)str_ptr;
+    int32_t len = *(int32_t *)buf;
+    write(1, buf + 4, len);
+    write(1, "\n", 1);
+}
+
+// Convert i32 to Lumen string [len:i32 | digits].
+int64_t lumen_itoa(int32_t n) {
+    char tmp[16];
+    int neg = 0;
+    int32_t v = n;
+    if (v < 0) { neg = 1; v = -v; }
+    int pos = 0;
+    if (v == 0) { tmp[pos++] = '0'; }
+    else { while (v > 0) { tmp[pos++] = '0' + (v % 10); v /= 10; } }
+    if (neg) tmp[pos++] = '-';
+    // Reverse into a Lumen string.
+    int32_t len = pos;
+    char *raw = (char *)malloc(8 + 4 + len);
+    *(int32_t *)(raw + 0) = 1;            // rc
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
+    char *payload = raw + 8;
+    *(int32_t *)payload = len;
+    for (int i = 0; i < len; i++) {
+        payload[4 + i] = tmp[len - 1 - i];
+    }
+    return (int64_t)(uintptr_t)payload;
+}
+
+// Concatenate two Lumen strings → new Lumen string.
+int64_t lumen_concat(int64_t a_ptr, int64_t b_ptr) {
+    char *a = (char *)(uintptr_t)a_ptr;
+    char *b = (char *)(uintptr_t)b_ptr;
+    int32_t a_len = a ? *(int32_t *)a : 0;
+    int32_t b_len = b ? *(int32_t *)b : 0;
+    int32_t total = a_len + b_len;
+    char *raw = (char *)malloc(8 + 4 + total);
+    *(int32_t *)(raw + 0) = 1;            // rc
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
+    char *payload = raw + 8;
+    *(int32_t *)payload = total;
+    if (a_len > 0) memcpy(payload + 4, a + 4, a_len);
+    if (b_len > 0) memcpy(payload + 4 + a_len, b + 4, b_len);
+    return (int64_t)(uintptr_t)payload;
 }

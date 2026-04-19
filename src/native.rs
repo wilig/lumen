@@ -249,26 +249,26 @@ impl<'a> NativeCodegen<'a> {
         desc.define(vec![0u8; 8].into_boxed_slice());
         obj.define_data(frame_chain_data, &desc).unwrap();
 
-        // Declare internal helpers (defined later).
+        // String helpers (now in rt.c, linked externally).
         let mut concat_sig = obj.make_signature();
         concat_sig.params.push(AbiParam::new(PTR));
         concat_sig.params.push(AbiParam::new(PTR));
         concat_sig.returns.push(AbiParam::new(PTR));
         let helper_concat = obj
-            .declare_function("lumen_concat", Linkage::Local, &concat_sig)
+            .declare_function("lumen_concat", Linkage::Import, &concat_sig)
             .unwrap();
 
         let mut println_sig = obj.make_signature();
         println_sig.params.push(AbiParam::new(PTR));
         let helper_println = obj
-            .declare_function("lumen_println", Linkage::Local, &println_sig)
+            .declare_function("lumen_println", Linkage::Import, &println_sig)
             .unwrap();
 
         let mut itoa_sig = obj.make_signature();
         itoa_sig.params.push(AbiParam::new(cl_types::I32));
         itoa_sig.returns.push(AbiParam::new(PTR));
         let helper_itoa = obj
-            .declare_function("lumen_itoa", Linkage::Local, &itoa_sig)
+            .declare_function("lumen_itoa", Linkage::Import, &itoa_sig)
             .unwrap();
 
         // rc_alloc(size: i64) -> ptr: malloc(size+8), set rc=1, return ptr+8
@@ -820,10 +820,7 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
-        // Define helper bodies.
-        self.define_concat_helper()?;
-        self.define_println_helper()?;
-        self.define_itoa_helper()?;
+        // Define helper bodies (concat/println/itoa are now in rt.c).
         self.define_print_frames_helper()?;
         self.define_rc_alloc_helper()?;
         self.define_rc_incr_helper()?;
@@ -1419,273 +1416,6 @@ impl<'a> NativeCodegen<'a> {
         Ok(())
     }
 
-    // --- Helpers (defined as Cranelift functions) ------------------------
-
-    fn define_concat_helper(&mut self) -> Result<(), NativeError> {
-        // lumen_concat(a: ptr, b: ptr) -> ptr
-        // Same logic as the Wasm string_concat helper.
-        let sig = {
-            let mut s = self.obj.make_signature();
-            s.params.push(AbiParam::new(PTR));
-            s.params.push(AbiParam::new(PTR));
-            s.returns.push(AbiParam::new(PTR));
-            s
-        };
-        let mut ctx = self.obj.make_context();
-        ctx.func.signature = sig;
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        // (sealed later)
-
-        let a = builder.block_params(block)[0];
-        let b = builder.block_params(block)[1];
-        let flags = MemFlags::new();
-
-        // len_a = *(a) as i64 (load i32, extend)
-        let len_a_i32 = builder.ins().load(cl_types::I32, flags, a, 0);
-        let len_a = builder.ins().uextend(PTR, len_a_i32);
-        let len_b_i32 = builder.ins().load(cl_types::I32, flags, b, 0);
-        let len_b = builder.ins().uextend(PTR, len_b_i32);
-
-        let total = builder.ins().iadd(len_a, len_b);
-        let total_i32 = builder.ins().ireduce(cl_types::I32, total);
-
-        // Allocate result via rc_alloc(4 + total).
-        let four = builder.ins().iconst(PTR, 4);
-        let alloc_size = builder.ins().iadd(total, four);
-        let rc_alloc_ref = self.obj.declare_func_in_func(self.helper_rc_alloc, builder.func);
-        let alloc_call = builder.ins().call(rc_alloc_ref, &[alloc_size]);
-        let result = builder.inst_results(alloc_call)[0];
-
-        // *result = total_i32
-        builder.ins().store(flags, total_i32, result, 0);
-
-        // memcpy(result+4, a+4, len_a)
-        let dst1 = builder.ins().iadd_imm(result, 4);
-        let src1 = builder.ins().iadd_imm(a, 4);
-        builder.call_memcpy(self.obj.target_config(), dst1, src1, len_a);
-
-        // memcpy(result+4+len_a, b+4, len_b)
-        let dst2 = builder.ins().iadd(dst1, len_a);
-        let src2 = builder.ins().iadd_imm(b, 4);
-        builder.call_memcpy(self.obj.target_config(), dst2, src2, len_b);
-
-        builder.ins().return_(&[result]);
-        builder.seal_all_blocks();
-        builder.finalize();
-
-        self.obj.define_function(self.helper_concat, &mut ctx).unwrap();
-        Ok(())
-    }
-
-    fn define_println_helper(&mut self) -> Result<(), NativeError> {
-        // lumen_println(s: ptr) — prints the string followed by \n.
-        let sig = {
-            let mut s = self.obj.make_signature();
-            s.params.push(AbiParam::new(PTR));
-            s
-        };
-        let mut ctx = self.obj.make_context();
-        ctx.func.signature = sig;
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        // (sealed later)
-
-        let s = builder.block_params(block)[0];
-        let flags = MemFlags::new();
-
-        // Concat s + "\n".
-        let nl_id = *self.string_data.get("\n").unwrap();
-        let nl_gv = self.declare_data_in_func(nl_id, &mut builder);
-        let nl = builder.ins().global_value(PTR, nl_gv);
-
-        let concat_ref = self
-            .obj
-            .declare_func_in_func(self.helper_concat, builder.func);
-        let with_nl = builder.ins().call(concat_ref, &[s, nl]);
-        let with_nl = builder.inst_results(with_nl)[0];
-
-        // Read len, compute data ptr.
-        let len_i32 = builder.ins().load(cl_types::I32, flags, with_nl, 0);
-        let len = builder.ins().uextend(PTR, len_i32);
-        let data = builder.ins().iadd_imm(with_nl, 4);
-
-        // write(1, data, len)
-        let fd = builder.ins().iconst(cl_types::I32, 1);
-        let write_ref = self
-            .obj
-            .declare_func_in_func(self.libc_write, builder.func);
-        builder.ins().call(write_ref, &[fd, data, len]);
-
-        builder.ins().return_(&[]);
-        builder.seal_all_blocks();
-        builder.finalize();
-
-        self.obj.define_function(self.helper_println, &mut ctx).unwrap();
-        Ok(())
-    }
-
-    fn define_itoa_helper(&mut self) -> Result<(), NativeError> {
-        // lumen_itoa(n: i32) -> ptr (string)
-        // Same algorithm as the Wasm version: reverse digit extraction.
-        // For brevity, this is a simplified version that handles the
-        // common case. A full production itoa would handle i32::MIN.
-        let sig = {
-            let mut s = self.obj.make_signature();
-            s.params.push(AbiParam::new(cl_types::I32));
-            s.returns.push(AbiParam::new(PTR));
-            s
-        };
-        let mut ctx = self.obj.make_context();
-        ctx.func.signature = sig;
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-
-        let n = builder.block_params(entry)[0];
-        let flags = MemFlags::new();
-
-        // Save bump watermark so we can reclaim scratch after rc_alloc'ing the result.
-        let bump_gv = self.declare_data_in_func(self.bump_ptr_data, &mut builder);
-        let heap_gv = self.declare_data_in_func(self.heap_data, &mut builder);
-        let bump_addr = builder.ins().global_value(PTR, bump_gv);
-        let saved_off = builder.ins().load(PTR, flags, bump_addr, 0);
-        let watermark_var = builder.declare_var(PTR);
-        builder.def_var(watermark_var, saved_off);
-
-        // Allocate 16-byte scratch in heap (bump).
-        let heap_base = builder.ins().global_value(PTR, heap_gv);
-        let scratch = builder.ins().iadd(heap_base, saved_off);
-        let new_off = builder.ins().iadd_imm(saved_off, 16);
-        builder.ins().store(flags, new_off, bump_addr, 0);
-
-        // Simple approach: format into scratch[0..15] backwards.
-        // Use a loop block for digit extraction.
-
-        // is_neg = n < 0
-        let zero_i32 = builder.ins().iconst(cl_types::I32, 0);
-        let is_neg = builder.ins().icmp(IntCC::SignedLessThan, n, zero_i32);
-
-        // abs = is_neg ? (0 - n) : n
-        let neg_n = builder.ins().ineg(n);
-        let abs_val = builder.ins().select(is_neg, neg_n, n);
-
-        // pos = scratch + 15  (write position, working backwards)
-        let pos_var = builder.declare_var(PTR);
-        let init_pos = builder.ins().iadd_imm(scratch, 15);
-        builder.def_var(pos_var, init_pos);
-
-        let abs_var = builder.declare_var(cl_types::I32);
-        builder.def_var(abs_var, abs_val);
-
-        // if abs == 0: write '0', else loop
-        let is_zero = builder.ins().icmp_imm(IntCC::Equal, abs_val, 0);
-
-        let zero_block = builder.create_block();
-        let loop_header = builder.create_block();
-        let loop_body = builder.create_block();
-        let after_digits = builder.create_block();
-
-        builder.ins().brif(is_zero, zero_block, &[], loop_header, &[]);
-        // (sealed later)
-
-        // Zero block: write '0'.
-        builder.switch_to_block(zero_block);
-        let pos = builder.use_var(pos_var);
-        let ascii_0 = builder.ins().iconst(cl_types::I8, 48);
-        builder.ins().store(flags, ascii_0, pos, 0);
-        let pos = builder.ins().iadd_imm(pos, -1);
-        builder.def_var(pos_var, pos);
-        builder.ins().jump(after_digits, &[]);
-        // (sealed later)
-
-        // Loop header: check if abs > 0.
-        builder.switch_to_block(loop_header);
-        let abs = builder.use_var(abs_var);
-        let done = builder.ins().icmp_imm(IntCC::Equal, abs, 0);
-        builder.ins().brif(done, after_digits, &[], loop_body, &[]);
-        // (sealed later)
-
-        // Loop body: extract one digit.
-        builder.switch_to_block(loop_body);
-        let abs = builder.use_var(abs_var);
-        let ten = builder.ins().iconst(cl_types::I32, 10);
-        let digit = builder.ins().srem(abs, ten);
-        let digit_byte = builder.ins().iadd_imm(digit, 48);
-        let digit_byte = builder.ins().ireduce(cl_types::I8, digit_byte);
-        let pos = builder.use_var(pos_var);
-        builder.ins().store(flags, digit_byte, pos, 0);
-        let pos = builder.ins().iadd_imm(pos, -1);
-        builder.def_var(pos_var, pos);
-        let abs = builder.ins().sdiv(abs, ten);
-        builder.def_var(abs_var, abs);
-        builder.ins().jump(loop_header, &[]);
-        // (sealed later)
-
-        // After digits: handle sign, then build result string.
-        builder.switch_to_block(after_digits);
-        let neg_block = builder.create_block();
-        let final_block = builder.create_block();
-
-        let _pos = builder.use_var(pos_var);
-        builder.ins().brif(is_neg, neg_block, &[], final_block, &[]);
-        // (sealed later)
-
-        // Neg block: write '-'.
-        builder.switch_to_block(neg_block);
-        let pos = builder.use_var(pos_var);
-        let minus = builder.ins().iconst(cl_types::I8, 45);
-        builder.ins().store(flags, minus, pos, 0);
-        let pos = builder.ins().iadd_imm(pos, -1);
-        builder.def_var(pos_var, pos);
-        builder.ins().jump(final_block, &[]);
-        // (sealed later)
-
-        // Final: allocate result string [len | bytes].
-        builder.switch_to_block(final_block);
-        let pos = builder.use_var(pos_var);
-        // start = pos + 1
-        let start = builder.ins().iadd_imm(pos, 1);
-        // end = scratch + 16
-        let end = builder.ins().iadd_imm(scratch, 16);
-        let len = builder.ins().isub(end, start);
-        let len_i32 = builder.ins().ireduce(cl_types::I32, len);
-
-        // Allocate (4 + len) via rc_alloc so the result survives RC.
-        let four = builder.ins().iconst(PTR, 4);
-        let alloc_size = builder.ins().iadd(len, four);
-        let rc_alloc_ref = self.obj.declare_func_in_func(self.helper_rc_alloc, builder.func);
-        let alloc_call = builder.ins().call(rc_alloc_ref, &[alloc_size]);
-        let result = builder.inst_results(alloc_call)[0];
-
-        // *result = len_i32
-        builder.ins().store(flags, len_i32, result, 0);
-        // memcpy(result+4, start, len)
-        let dst = builder.ins().iadd_imm(result, 4);
-        builder.call_memcpy(self.obj.target_config(), dst, start, len);
-
-        // Restore bump watermark: the result is rc_alloc'd (malloc) so it
-        // survives; the scratch was bump-allocated and is now reclaimed.
-        let wm = builder.use_var(watermark_var);
-        let bump_addr2 = builder.ins().global_value(PTR, bump_gv);
-        builder.ins().store(flags, wm, bump_addr2, 0);
-
-        builder.ins().return_(&[result]);
-        builder.seal_all_blocks();
-        builder.finalize();
-
-        self.obj.define_function(self.helper_itoa, &mut ctx).unwrap();
-        Ok(())
-    }
 
     fn declare_data_in_func(
         &mut self,

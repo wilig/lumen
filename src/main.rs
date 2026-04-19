@@ -52,7 +52,7 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
     let rt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime");
     let rt_src = rt_dir.join("rt.c");
     let rt_obj = format!("{stem}_rt.o");
-    let mut link_args = vec![obj_path.clone(), "-o".to_string(), exe_path.clone(), "-lc".to_string()];
+    let mut link_args = vec![obj_path.clone(), "-o".to_string(), exe_path.clone(), "-lc".to_string(), "-lm".to_string()];
 
     // Compile the main runtime.
     if rt_src.exists() {

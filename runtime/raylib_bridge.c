@@ -228,14 +228,4 @@ void rl_set_camera(double tx, double ty, double ox, double oy, double rot, doubl
 void rl_begin_mode_2d(void) { BeginMode2D(g_camera); }
 void rl_end_mode_2d(void) { EndMode2D(); }
 
-// --- Math helpers ---
-double lumen_sqrt(double x) { return sqrt(x); }
-double lumen_abs(double x) { return fabs(x); }
-double lumen_cos(double x) { return cos(x); }
-double lumen_sin(double x) { return sin(x); }
-double lumen_clamp(double x, double lo, double hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
-}
-double lumen_rand_f64(void) { return (double)rand() / (double)RAND_MAX; }
+// Math helpers moved to rt.c so they're available without raylib.
