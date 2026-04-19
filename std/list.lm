@@ -13,50 +13,44 @@ extern fn set(list: i64, index: i32, value: i64): i64 link "lumen_list_set"
 extern fn remove(list: i64, index: i32): i64 link "lumen_list_remove"
 
 // --- Generic utilities (in Lumen) ---------------------------------------
-//
-// These wrappers call the externs via `list.X` qualifiers (rather than
-// the bare names) to dodge a global-fn_ids name collision when other
-// stdlib modules export the same short names — e.g. std/map.new vs
-// std/list.new. Tracked as lumen-nk3; once that's fixed, the qualifiers
-// can come back off.
 
 fn is_empty<T>(xs: List<T>): bool {
-    return list.len(xs) == 0
+    return len(xs) == 0
 }
 
 fn first<T>(xs: List<T>): Option<T> {
-    if list.len(xs) == 0 {
+    if len(xs) == 0 {
         return None
     }
-    return Some(list.get(xs, 0))
+    return Some(get(xs, 0))
 }
 
 fn last<T>(xs: List<T>): Option<T> {
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     if n == 0 {
         return None
     }
-    return Some(list.get(xs, n - 1))
+    return Some(get(xs, n - 1))
 }
 
 // Apply `f` to each element, collecting the results in a new list.
 fn map<A, B>(xs: List<A>, f: fn(A): B): List<B> {
-    var out: List<B> = list.new()
-    let n: i32 = list.len(xs)
+    var out: List<B> = new(8)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        out = list.push(out, f(list.get(xs, i)))
+        out = push(out, f(get(xs, i)))
     }
     return out
 }
 
 // Keep only the elements for which `pred` returns true.
 fn filter<T>(xs: List<T>, pred: fn(T): bool): List<T> {
-    var out: List<T> = list.new()
-    let n: i32 = list.len(xs)
+    var out: List<T> = new(8)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        let v: T = list.get(xs, i)
+        let v: T = get(xs, i)
         if pred(v) {
-            out = list.push(out, v)
+            out = push(out, v)
         }
     }
     return out
@@ -64,9 +58,9 @@ fn filter<T>(xs: List<T>, pred: fn(T): bool): List<T> {
 
 // Return Some(first matching element) or None.
 fn find<T>(xs: List<T>, pred: fn(T): bool): Option<T> {
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        let v: T = list.get(xs, i)
+        let v: T = get(xs, i)
         if pred(v) {
             return Some(v)
         }
@@ -75,9 +69,9 @@ fn find<T>(xs: List<T>, pred: fn(T): bool): Option<T> {
 }
 
 fn any<T>(xs: List<T>, pred: fn(T): bool): bool {
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        if pred(list.get(xs, i)) {
+        if pred(get(xs, i)) {
             return true
         }
     }
@@ -85,9 +79,9 @@ fn any<T>(xs: List<T>, pred: fn(T): bool): bool {
 }
 
 fn all<T>(xs: List<T>, pred: fn(T): bool): bool {
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        if pred(list.get(xs, i)) == false {
+        if pred(get(xs, i)) == false {
             return false
         }
     }
@@ -96,9 +90,9 @@ fn all<T>(xs: List<T>, pred: fn(T): bool): bool {
 
 fn count<T>(xs: List<T>, pred: fn(T): bool): i32 {
     var c: i32 = 0
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        if pred(list.get(xs, i)) {
+        if pred(get(xs, i)) {
             c = c + 1
         }
     }
@@ -108,51 +102,51 @@ fn count<T>(xs: List<T>, pred: fn(T): bool): i32 {
 // fold(xs, init, f) = f(f(f(init, xs[0]), xs[1]), xs[2]), ...
 fn fold<A, B>(xs: List<A>, init: B, f: fn(B, A): B): B {
     var acc: B = init
-    let n: i32 = list.len(xs)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        acc = f(acc, list.get(xs, i))
+        acc = f(acc, get(xs, i))
     }
     return acc
 }
 
 fn reverse<T>(xs: List<T>): List<T> {
-    var out: List<T> = list.new()
-    let n: i32 = list.len(xs)
+    var out: List<T> = new(8)
+    let n: i32 = len(xs)
     for i in range(0, n) {
-        out = list.push(out, list.get(xs, n - 1 - i))
+        out = push(out, get(xs, n - 1 - i))
     }
     return out
 }
 
 fn concat<T>(xs: List<T>, ys: List<T>): List<T> {
-    var out: List<T> = list.new()
-    let nx: i32 = list.len(xs)
-    let ny: i32 = list.len(ys)
+    var out: List<T> = new(8)
+    let nx: i32 = len(xs)
+    let ny: i32 = len(ys)
     for i in range(0, nx) {
-        out = list.push(out, list.get(xs, i))
+        out = push(out, get(xs, i))
     }
     for i in range(0, ny) {
-        out = list.push(out, list.get(ys, i))
+        out = push(out, get(ys, i))
     }
     return out
 }
 
 fn take<T>(xs: List<T>, n: i32): List<T> {
-    var out: List<T> = list.new()
-    let cap: i32 = list.len(xs)
+    var out: List<T> = new(8)
+    let cap: i32 = len(xs)
     let stop: i32 = if n < cap { n } else { cap }
     for i in range(0, stop) {
-        out = list.push(out, list.get(xs, i))
+        out = push(out, get(xs, i))
     }
     return out
 }
 
 fn drop<T>(xs: List<T>, n: i32): List<T> {
-    var out: List<T> = list.new()
-    let cap: i32 = list.len(xs)
+    var out: List<T> = new(8)
+    let cap: i32 = len(xs)
     let start: i32 = if n < cap { n } else { cap }
     for i in range(start, cap) {
-        out = list.push(out, list.get(xs, i))
+        out = push(out, get(xs, i))
     }
     return out
 }

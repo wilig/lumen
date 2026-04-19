@@ -155,6 +155,13 @@ struct NativeCodegen<'a> {
 
     /// Imported module function FuncIds: C link name → FuncId.
     module_fn_ids: HashMap<String, FuncId>,
+    /// Unqualified-name → FuncId scoped per imported module. When
+    /// compiling a module's body the lookup checks here first
+    /// (using FnEmitter::current_module) before falling back to the
+    /// global fn_ids — that's how `len(xs)` inside std/list resolves
+    /// to lumen_list_len even when std/map (which also exports `len`)
+    /// is imported in the same program.
+    local_fn_ids: HashMap<String, HashMap<String, FuncId>>,
 
     /// Uses WASI / io module.
     uses_io: bool,
@@ -181,6 +188,10 @@ struct MonomorphRequest {
     sig: crate::types::FnSig,
     subs: HashMap<String, Ty>,
     decl: ast::FnDecl,
+    /// When the original generic fn lives inside an imported module,
+    /// the module's name. Threads through so the monomorphized body's
+    /// unqualified calls resolve via the right local_fn_ids.
+    current_module: Option<String>,
 }
 
 impl<'a> NativeCodegen<'a> {
@@ -511,6 +522,7 @@ impl<'a> NativeCodegen<'a> {
             lambda_ids: HashMap::new(),
             lambda_sigs: HashMap::new(),
             module_fn_ids: HashMap::new(),
+            local_fn_ids: HashMap::new(),
             uses_io: false,
             debug_mode: false,
             source_path: String::new(),
@@ -604,9 +616,16 @@ impl<'a> NativeCodegen<'a> {
                             }
                         }
                     }
-                    // Register under the Lumen-facing name so compile_call finds it.
+                    // Register under the Lumen-facing name in the
+                    // module's LOCAL fn_ids so intra-module unqualified
+                    // calls (e.g. `len(xs)` inside std/list) resolve to
+                    // this module's extern, regardless of which other
+                    // modules with same-named externs are imported.
                     if let Some(&id) = self.module_fn_ids.get(ef.link_name.as_deref().unwrap_or(&ef.name)) {
-                        self.fn_ids.insert(ef.name.clone(), id);
+                        self.local_fn_ids
+                            .entry(mod_name.to_string())
+                            .or_insert_with(HashMap::new)
+                            .insert(ef.name.clone(), id);
                     }
                 }
             }
@@ -632,13 +651,18 @@ impl<'a> NativeCodegen<'a> {
                     }
                 }
             }
-            // Register unmangled names for intra-module calls (non-generic only).
+            // Register unmangled names for intra-module calls in the
+            // module's local fn_ids (non-generic only — generics are
+            // resolved via monomorphize_module_method_if_generic).
             for item in &mod_ast.items {
                 if let Item::Fn(f) = item {
                     if !f.type_params.is_empty() { continue; }
                     let mangled = format!("{mod_name}${}", f.name);
                     if let Some(&id) = self.fn_ids.get(&mangled) {
-                        self.fn_ids.insert(f.name.clone(), id);
+                        self.local_fn_ids
+                            .entry(mod_name.to_string())
+                            .or_insert_with(HashMap::new)
+                            .insert(f.name.clone(), id);
                     }
                 }
             }
@@ -660,7 +684,9 @@ impl<'a> NativeCodegen<'a> {
                             body: f.body.clone(),
                             span: f.span,
                         };
-                        self.define_function(&synthetic, func_id)?;
+                        // Mark this as a module body so unqualified calls
+                        // inside it resolve via local_fn_ids[mod_name].
+                        self.define_module_function(&synthetic, func_id, mod_name)?;
                     }
                 }
             }
@@ -1198,7 +1224,21 @@ impl<'a> NativeCodegen<'a> {
     fn define_function(&mut self, f: &FnDecl, func_id: FuncId) -> Result<(), NativeError> {
         let sig = self.info.fns.get(&f.name).cloned()
             .unwrap_or_else(|| self.lambda_sigs[&f.name].clone());
-        self.define_function_with_sig(f, func_id, &sig, HashMap::new())
+        self.define_function_with_sig(f, func_id, &sig, HashMap::new(), None)
+    }
+
+    /// Define a non-generic fn body that lives inside an imported module
+    /// — sets `current_module` so unqualified intra-module calls resolve
+    /// via the module's local_fn_ids.
+    fn define_module_function(
+        &mut self,
+        f: &FnDecl,
+        func_id: FuncId,
+        module: &str,
+    ) -> Result<(), NativeError> {
+        let sig = self.info.fns.get(&f.name).cloned()
+            .unwrap_or_else(|| self.lambda_sigs[&f.name].clone());
+        self.define_function_with_sig(f, func_id, &sig, HashMap::new(), Some(module.to_string()))
     }
 
     fn define_monomorphization(&mut self, req: MonomorphRequest) -> Result<(), NativeError> {
@@ -1208,7 +1248,8 @@ impl<'a> NativeCodegen<'a> {
             name: req.mangled_name.clone(),
             ..req.decl
         };
-        self.define_function_with_sig(&renamed, req.func_id, &req.sig, req.subs)
+        let current_module = req.current_module.clone();
+        self.define_function_with_sig(&renamed, req.func_id, &req.sig, req.subs, current_module)
     }
 
     fn define_function_with_sig(
@@ -1217,6 +1258,7 @@ impl<'a> NativeCodegen<'a> {
         func_id: FuncId,
         sig: &crate::types::FnSig,
         active_subs: HashMap<String, Ty>,
+        current_module: Option<String>,
     ) -> Result<(), NativeError> {
         let cl_sig = self.build_sig_from(sig);
 
@@ -1233,6 +1275,7 @@ impl<'a> NativeCodegen<'a> {
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
             fb.active_subs = active_subs;
+            fb.current_module = current_module;
 
             // Declare params as variables. Pointer-typed params are
             // registered on the cleanup stack — the caller incr'd them
@@ -1366,6 +1409,11 @@ struct FnEmitter<'a, 'b, 'c> {
     /// Active type-parameter substitutions when compiling a monomorphized
     /// generic fn body (T → I32, etc). Empty for non-generic fns.
     active_subs: HashMap<String, Ty>,
+    /// When compiling a body that lives inside an imported stdlib module,
+    /// the module name. Unqualified user-fn calls inside that body
+    /// resolve via `cg.local_fn_ids[current_module]` first, falling back
+    /// to the global `cg.fn_ids` only if not found there.
+    current_module: Option<String>,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -1385,6 +1433,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             cleanup_stack: Vec::new(),
             hit_return: false,
             active_subs: HashMap::new(),
+            current_module: None,
         }
     }
 
@@ -1865,7 +1914,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         arg_tys: &[Ty],
     ) -> Option<(String, crate::types::FnSig)> {
         let sig = self.cg.info.fns.get(name)?.clone();
-        self.do_monomorphize(name, name, &sig, arg_tys)
+        // No module context for user-module fns.
+        self.do_monomorphize(name, name, &sig, arg_tys, None)
     }
 
     /// Like monomorphize_if_generic, but for module-qualified calls
@@ -1879,19 +1929,21 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     ) -> Option<(String, crate::types::FnSig)> {
         let sig = self.cg.info.modules.get(module)?.get(method)?.clone();
         let qualified = format!("{module}.{method}");
-        self.do_monomorphize(&qualified, &qualified, &sig, arg_tys)
+        self.do_monomorphize(&qualified, &qualified, &sig, arg_tys, Some(module.to_string()))
     }
 
     /// Shared monomorphization logic. `qualified_name` is the base for
     /// name mangling; `template_key` is the key into `generic_templates`.
-    /// (Currently the same string, kept separate so refactors that
-    /// distinguish them have an obvious knob.)
+    /// `module` records which imported module owns the template (so the
+    /// monomorphized body's unqualified calls resolve via the right
+    /// local_fn_ids); None for templates from the user's module.
     fn do_monomorphize(
         &mut self,
         qualified_name: &str,
         template_key: &str,
         sig: &crate::types::FnSig,
         arg_tys: &[Ty],
+        module: Option<String>,
     ) -> Option<(String, crate::types::FnSig)> {
         if sig.type_params.is_empty() {
             return None;
@@ -1936,6 +1988,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     sig: subbed_sig.clone(),
                     subs,
                     decl,
+                    current_module: module,
                 });
             }
         }
@@ -2070,10 +2123,21 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 None => (name.clone(), self.cg.info.fns.get(&name).cloned()),
             };
 
-        let func_id = self.cg.fn_ids.get(&effective_name).ok_or_else(|| NativeError {
-            span,
-            message: format!("unknown function `{name}`"),
-        })?;
+        // Inside a module body, unqualified calls resolve via the
+        // module's local_fn_ids first (avoids global-fn_ids collisions
+        // when multiple stdlib modules export the same short name —
+        // e.g. std/list.new vs std/map.new).
+        let func_id = self.current_module
+            .as_ref()
+            .and_then(|m| self.cg.local_fn_ids.get(m))
+            .and_then(|m| m.get(&effective_name))
+            .copied()
+            .or_else(|| self.cg.fn_ids.get(&effective_name).copied())
+            .ok_or_else(|| NativeError {
+                span,
+                message: format!("unknown function `{name}`"),
+            })?;
+        let func_id = &func_id;
         let func_ref = self
             .cg
             .obj
@@ -3467,9 +3531,22 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         return Ok(sig.ret.clone());
                     }
                     // Unqualified call inside an imported module wrapper:
-                    // search the imported module sigs for the same name.
-                    for (_mod, mod_fns) in &self.cg.info.modules {
-                        if let Some(sig) = mod_fns.get(name) {
+                    // prefer the current module's sig (if set) — otherwise
+                    // HashMap iteration order would pick whichever module
+                    // exported the name first, which is nondeterministic.
+                    if let Some(m) = self.current_module.as_ref() {
+                        if let Some(sig) = self.cg.info.modules.get(m).and_then(|mf| mf.get(name)) {
+                            return Ok(sig.ret.clone());
+                        }
+                    }
+                    // Fall back to the first match across all modules
+                    // (rare — only matters for non-generic, non-current-module
+                    // unqualified calls). Iterate sorted by module name so
+                    // the choice is at least deterministic across runs.
+                    let mut mod_names: Vec<&String> = self.cg.info.modules.keys().collect();
+                    mod_names.sort();
+                    for m in mod_names {
+                        if let Some(sig) = self.cg.info.modules.get(m).and_then(|mf| mf.get(name)) {
                             return Ok(sig.ret.clone());
                         }
                     }

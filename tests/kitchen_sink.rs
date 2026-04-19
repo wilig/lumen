@@ -23,9 +23,11 @@ fn kitchen_sink_matches_snapshot() {
     let actual_path = format!("{workspace}/tests/kitchen_sink.actual");
     let scratch_file = "/tmp/lumen_kitchen_sink.txt";
 
-    // Compile via the regular CLI (matches what users run).
-    let build = Command::new(env!("CARGO"))
-        .args(["run", "--quiet", "--", "build", &src])
+    // Compile via the already-built `lumen` binary. Going through
+    // `cargo run` here would race with the cargo job that's running
+    // this test (rebuilding the lib mid-test → flaky failures).
+    let build = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .args(["build", &src])
         .current_dir(workspace)
         .output()
         .expect("failed to invoke compiler");
