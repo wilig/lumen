@@ -610,9 +610,15 @@ impl<'a> NativeCodegen<'a> {
                     }
                 }
             }
-            // Declare each fn.
+            // Declare each fn. Generic ones get stashed as templates and
+            // monomorphized on demand from each call site.
             for item in &mod_ast.items {
                 if let Item::Fn(f) = item {
+                    if !f.type_params.is_empty() {
+                        let key = format!("{mod_name}.{}", f.name);
+                        self.generic_templates.insert(key, f.clone());
+                        continue;
+                    }
                     let mangled = format!("{mod_name}${}", f.name);
                     if let Some(mod_sigs) = self.info.modules.get(mod_name) {
                         if let Some(sig) = mod_sigs.get(&f.name) {
@@ -626,19 +632,22 @@ impl<'a> NativeCodegen<'a> {
                     }
                 }
             }
-            // Register unmangled names for intra-module calls.
+            // Register unmangled names for intra-module calls (non-generic only).
             for item in &mod_ast.items {
                 if let Item::Fn(f) = item {
+                    if !f.type_params.is_empty() { continue; }
                     let mangled = format!("{mod_name}${}", f.name);
                     if let Some(&id) = self.fn_ids.get(&mangled) {
                         self.fn_ids.insert(f.name.clone(), id);
                     }
                 }
             }
-            // Compile each fn body with mangled name.
+            // Compile each fn body with mangled name (skip generic templates —
+            // they're compiled per monomorphization in the drain loop).
             let fn_ids = self.fn_ids.clone();
             for item in &mod_ast.items {
                 if let Item::Fn(f) = item {
+                    if !f.type_params.is_empty() { continue; }
                     let mangled = format!("{mod_name}${}", f.name);
                     if let Some(&func_id) = fn_ids.get(&mangled) {
                         let synthetic = FnDecl {
@@ -1450,9 +1459,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 // Prefer the user's annotation when it's more specific than
                 // what we inferred (e.g. `var m: Map<string, i32> = map.new()`
                 // — map.new returns Map<_, Error>, but the annotation pins V).
+                // Inside a generic body we also substitute type-parameter
+                // names (e.g. `let r: List<B>` becomes `List<String>` when
+                // monomorphizing with B=String).
                 let lumen_ty = match ty {
                     Some(annot) => {
-                        let annot_ty = resolve_type_to_ty(annot);
+                        let raw = resolve_type_to_ty(annot);
+                        let annot_ty = substitute_ty(raw, &self.active_subs);
                         if ty_more_specific(&annot_ty, &inferred_ty) { annot_ty } else { inferred_ty }
                     }
                     None => inferred_ty,
@@ -1842,7 +1855,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         })
     }
 
-    /// If `name` is a generic fn, ensure a monomorphization exists for the
+    /// If `name` is a generic user fn, ensure a monomorphization exists for the
     /// given argument types and return (mangled_name, substituted_sig).
     /// Returns None for non-generic callees so the caller can use `name`
     /// as-is.
@@ -1852,6 +1865,34 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         arg_tys: &[Ty],
     ) -> Option<(String, crate::types::FnSig)> {
         let sig = self.cg.info.fns.get(name)?.clone();
+        self.do_monomorphize(name, name, &sig, arg_tys)
+    }
+
+    /// Like monomorphize_if_generic, but for module-qualified calls
+    /// (e.g. list.map). The template is stored under the qualified name
+    /// "module.fn" so the user-fn and module-fn paths don't collide.
+    fn monomorphize_module_method_if_generic(
+        &mut self,
+        module: &str,
+        method: &str,
+        arg_tys: &[Ty],
+    ) -> Option<(String, crate::types::FnSig)> {
+        let sig = self.cg.info.modules.get(module)?.get(method)?.clone();
+        let qualified = format!("{module}.{method}");
+        self.do_monomorphize(&qualified, &qualified, &sig, arg_tys)
+    }
+
+    /// Shared monomorphization logic. `qualified_name` is the base for
+    /// name mangling; `template_key` is the key into `generic_templates`.
+    /// (Currently the same string, kept separate so refactors that
+    /// distinguish them have an obvious knob.)
+    fn do_monomorphize(
+        &mut self,
+        qualified_name: &str,
+        template_key: &str,
+        sig: &crate::types::FnSig,
+        arg_tys: &[Ty],
+    ) -> Option<(String, crate::types::FnSig)> {
         if sig.type_params.is_empty() {
             return None;
         }
@@ -1868,10 +1909,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let type_args: Vec<Ty> = sig.type_params.iter()
             .map(|p| subs.get(p).cloned().unwrap_or(Ty::Error))
             .collect();
-        let mangled = mangle_monomorph_name(name, &type_args);
+        let mangled = mangle_monomorph_name(qualified_name, &type_args);
 
-        // Build the substituted FnSig (always — we need it for rc_incr decisions
-        // and the cl signature).
         let subbed_params: Vec<(String, Ty)> = sig.params.iter()
             .map(|(n, t)| (n.clone(), substitute_ty(t.clone(), &subs)))
             .collect();
@@ -1884,15 +1923,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         };
 
         if !self.cg.monomorph_done.contains(&mangled) {
-            // First time we've seen this instantiation. Declare the function
-            // and queue body compilation.
             let cl_sig = self.cg.build_sig_from(&subbed_sig);
             let func_id = self.cg.obj
                 .declare_function(&mangled, Linkage::Local, &cl_sig)
                 .unwrap();
             self.cg.fn_ids.insert(mangled.clone(), func_id);
             self.cg.monomorph_done.insert(mangled.clone());
-            if let Some(decl) = self.cg.generic_templates.get(name).cloned() {
+            if let Some(decl) = self.cg.generic_templates.get(template_key).cloned() {
                 self.cg.monomorph_queue.push(MonomorphRequest {
                     mangled_name: mangled.clone(),
                     func_id,
@@ -2300,6 +2337,45 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                            else { self.call_builtin(func_id, args) };
                 }
             }
+            // Generic Lumen fn in an imported module: monomorphize per
+            // call-site arg types, then call the specialized FuncId.
+            // Has to come before the non-generic Lumen-fn lookup because
+            // generic fns aren't registered there.
+            let is_generic = self.cg.info.modules
+                .get(mod_name.as_str())
+                .and_then(|m| m.get(method))
+                .map(|sig| !sig.type_params.is_empty())
+                .unwrap_or(false);
+            if is_generic {
+                // Compile args first to know their types.
+                let mut arg_vals = Vec::with_capacity(args.len());
+                let mut arg_tys = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(self.compile_expr(&a.value)?);
+                    arg_tys.push(self.infer_ty(&a.value)?);
+                }
+                if let Some((mangled, subbed_sig)) =
+                    self.monomorphize_module_method_if_generic(mod_name, method, &arg_tys)
+                {
+                    let func_id = *self.cg.fn_ids.get(&mangled).unwrap();
+                    let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+                    // rc_incr each pointer-typed argument (caller-side ref count).
+                    for (i, (_, pty)) in subbed_sig.params.iter().enumerate() {
+                        if !is_scalar(pty) {
+                            if let Some(&val) = arg_vals.get(i) {
+                                self.emit_rc_incr(val);
+                            }
+                        }
+                    }
+                    let call = self.builder.ins().call(func_ref, &arg_vals);
+                    let results = self.builder.inst_results(call);
+                    if results.is_empty() {
+                        return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+                    }
+                    return Ok(results[0]);
+                }
+            }
+
             // Check Lumen fn by mod_name:method key.
             let fn_key = format!("{mod_name}:{method}");
             if let Some(&func_id) = self.cg.module_fn_ids.get(&fn_key) {
@@ -3467,7 +3543,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     // List<T> operations
                     if m == "list" && method == "new" {
-                        return Ok(Ty::List(Box::new(Ty::I64)));
+                        // Element type starts as Error so a `var xs: List<T> = list.new()`
+                        // annotation refines via ty_more_specific. Without annotation, the
+                        // first list.push (which refines via its arg type) pins it.
+                        return Ok(Ty::List(Box::new(Ty::Error)));
                     }
                     if m == "list" && method == "len" {
                         return Ok(Ty::I32);
@@ -3565,6 +3644,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     // Fall through to imported module lookup.
                     if let Some(mod_fns) = self.cg.info.modules.get(m.as_str()) {
                         if let Some(sig) = mod_fns.get(method.as_str()) {
+                            // Generic module fn: infer the substitution
+                            // from arg types and apply to the return.
+                            if !sig.type_params.is_empty() {
+                                let mut subs: HashMap<String, Ty> = HashMap::new();
+                                for (i, (_, pty)) in sig.params.iter().enumerate() {
+                                    if let Some(arg) = args.get(i) {
+                                        let at = self.infer_ty(&arg.value)?;
+                                        unify_into(pty, &at, &mut subs);
+                                    }
+                                }
+                                return Ok(substitute_ty(sig.ret.clone(), &subs));
+                            }
                             return Ok(sig.ret.clone());
                         }
                     }

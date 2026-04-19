@@ -1,6 +1,152 @@
+// std/list — list operations.
+//
+// The `_*` externs are the i64-shaped primitives backed by C; the
+// generic Lumen wrappers above them are what user code calls. All
+// mutating operations return the (possibly relocated) list pointer —
+// rebind with `xs = list.push(xs, v)`.
+
 extern fn new(elem_size: i32): i64 link "lumen_list_new"
 extern fn len(list: i64): i32 link "lumen_list_len"
 extern fn push(list: i64, value: i64): i64 link "lumen_list_push"
 extern fn get(list: i64, index: i32): i64 link "lumen_list_get"
 extern fn set(list: i64, index: i32, value: i64): i64 link "lumen_list_set"
 extern fn remove(list: i64, index: i32): i64 link "lumen_list_remove"
+
+// --- Generic utilities (in Lumen) ---------------------------------------
+
+fn is_empty<T>(xs: List<T>): bool {
+    return len(xs) == 0
+}
+
+fn first<T>(xs: List<T>): Option<T> {
+    if len(xs) == 0 {
+        return None
+    }
+    return Some(get(xs, 0))
+}
+
+fn last<T>(xs: List<T>): Option<T> {
+    let n: i32 = len(xs)
+    if n == 0 {
+        return None
+    }
+    return Some(get(xs, n - 1))
+}
+
+// Apply `f` to each element, collecting the results in a new list.
+fn map<A, B>(xs: List<A>, f: fn(A): B): List<B> {
+    var out: List<B> = new(8)
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        out = push(out, f(get(xs, i)))
+    }
+    return out
+}
+
+// Keep only the elements for which `pred` returns true.
+fn filter<T>(xs: List<T>, pred: fn(T): bool): List<T> {
+    var out: List<T> = new(8)
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        let v: T = get(xs, i)
+        if pred(v) {
+            out = push(out, v)
+        }
+    }
+    return out
+}
+
+// Return Some(first matching element) or None.
+fn find<T>(xs: List<T>, pred: fn(T): bool): Option<T> {
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        let v: T = get(xs, i)
+        if pred(v) {
+            return Some(v)
+        }
+    }
+    return None
+}
+
+fn any<T>(xs: List<T>, pred: fn(T): bool): bool {
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        if pred(get(xs, i)) {
+            return true
+        }
+    }
+    return false
+}
+
+fn all<T>(xs: List<T>, pred: fn(T): bool): bool {
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        if pred(get(xs, i)) == false {
+            return false
+        }
+    }
+    return true
+}
+
+fn count<T>(xs: List<T>, pred: fn(T): bool): i32 {
+    var c: i32 = 0
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        if pred(get(xs, i)) {
+            c = c + 1
+        }
+    }
+    return c
+}
+
+// fold(xs, init, f) = f(f(f(init, xs[0]), xs[1]), xs[2]), ...
+fn fold<A, B>(xs: List<A>, init: B, f: fn(B, A): B): B {
+    var acc: B = init
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        acc = f(acc, get(xs, i))
+    }
+    return acc
+}
+
+fn reverse<T>(xs: List<T>): List<T> {
+    var out: List<T> = new(8)
+    let n: i32 = len(xs)
+    for i in range(0, n) {
+        out = push(out, get(xs, n - 1 - i))
+    }
+    return out
+}
+
+fn concat<T>(xs: List<T>, ys: List<T>): List<T> {
+    var out: List<T> = new(8)
+    let nx: i32 = len(xs)
+    let ny: i32 = len(ys)
+    for i in range(0, nx) {
+        out = push(out, get(xs, i))
+    }
+    for i in range(0, ny) {
+        out = push(out, get(ys, i))
+    }
+    return out
+}
+
+fn take<T>(xs: List<T>, n: i32): List<T> {
+    var out: List<T> = new(8)
+    let cap: i32 = len(xs)
+    let stop: i32 = if n < cap { n } else { cap }
+    for i in range(0, stop) {
+        out = push(out, get(xs, i))
+    }
+    return out
+}
+
+fn drop<T>(xs: List<T>, n: i32): List<T> {
+    var out: List<T> = new(8)
+    let cap: i32 = len(xs)
+    let start: i32 = if n < cap { n } else { cap }
+    for i in range(start, cap) {
+        out = push(out, get(xs, i))
+    }
+    return out
+}

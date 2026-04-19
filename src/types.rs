@@ -1678,6 +1678,19 @@ impl<'a> FnChecker<'a> {
                         self.check_expr(&args[i].value, pty);
                     }
                 }
+                // Generic callee: infer the substitution from arg types
+                // and apply to the return so the call site sees the
+                // concrete type instead of Ty::Generic.
+                if !sig.type_params.is_empty() {
+                    let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+                    let mut subs: HashMap<String, Ty> = HashMap::new();
+                    for (i, (_, pty)) in sig.params.iter().enumerate() {
+                        if let Some(at) = arg_tys.get(i) {
+                            unify_for_subs(pty, at, &mut subs);
+                        }
+                    }
+                    return Some(substitute_generic(sig.ret.clone(), &subs));
+                }
                 return Some(sig.ret.clone());
             }
         }
@@ -2231,6 +2244,48 @@ impl<'a> FnChecker<'a> {
 /// Compatible means "equal *or* one side is Ty::Error (which silences
 /// cascades)". Crucially, this is not subtyping — i32 and i64 are NOT
 /// compatible; you have to `as`-cast. The one exception is [`Ty::Error`].
+/// Walk a generic param type alongside a concrete arg type and bind
+/// any Ty::Generic names into `subs`. First binding wins.
+fn unify_for_subs(generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty>) {
+    match (generic, concrete) {
+        (Ty::Generic(name), c) => {
+            subs.entry(name.clone()).or_insert_with(|| c.clone());
+        }
+        (Ty::List(g), Ty::List(c)) => unify_for_subs(g, c, subs),
+        (Ty::Map(gk, gv), Ty::Map(ck, cv)) => { unify_for_subs(gk, ck, subs); unify_for_subs(gv, cv, subs); }
+        (Ty::Option(g), Ty::Option(c)) => unify_for_subs(g, c, subs),
+        (Ty::Result(go, ge), Ty::Result(co, ce)) => { unify_for_subs(go, co, subs); unify_for_subs(ge, ce, subs); }
+        (Ty::Handle(g), Ty::Handle(c)) => unify_for_subs(g, c, subs),
+        (Ty::Tuple(gs), Ty::Tuple(cs)) if gs.len() == cs.len() => {
+            for (g, c) in gs.iter().zip(cs.iter()) { unify_for_subs(g, c, subs); }
+        }
+        (Ty::FnPtr { params: gp, ret: gr }, Ty::FnPtr { params: cp, ret: cr }) => {
+            for (g, c) in gp.iter().zip(cp.iter()) { unify_for_subs(g, c, subs); }
+            unify_for_subs(gr, cr, subs);
+        }
+        _ => {}
+    }
+}
+
+/// Replace Ty::Generic(name) inside `ty` with substitutions from `subs`.
+fn substitute_generic(ty: Ty, subs: &HashMap<String, Ty>) -> Ty {
+    if subs.is_empty() { return ty; }
+    match ty {
+        Ty::Generic(name) => subs.get(&name).cloned().unwrap_or(Ty::Generic(name)),
+        Ty::List(inner) => Ty::List(Box::new(substitute_generic(*inner, subs))),
+        Ty::Map(k, v) => Ty::Map(Box::new(substitute_generic(*k, subs)), Box::new(substitute_generic(*v, subs))),
+        Ty::Option(inner) => Ty::Option(Box::new(substitute_generic(*inner, subs))),
+        Ty::Result(o, e) => Ty::Result(Box::new(substitute_generic(*o, subs)), Box::new(substitute_generic(*e, subs))),
+        Ty::Handle(inner) => Ty::Handle(Box::new(substitute_generic(*inner, subs))),
+        Ty::Tuple(elems) => Ty::Tuple(elems.into_iter().map(|t| substitute_generic(t, subs)).collect()),
+        Ty::FnPtr { params, ret } => Ty::FnPtr {
+            params: params.into_iter().map(|t| substitute_generic(t, subs)).collect(),
+            ret: Box::new(substitute_generic(*ret, subs)),
+        },
+        other => other,
+    }
+}
+
 fn compatible(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Error, _) | (_, Ty::Error) => true,
@@ -2253,24 +2308,22 @@ fn compatible(a: &Ty, b: &Ty) -> bool {
         (Ty::Map(ka, va), Ty::Map(kb, vb)) => compatible(ka, kb) && compatible(va, vb),
         // Any pointer-based type is compatible with i64.
         (Ty::User(_), Ty::I64) | (Ty::I64, Ty::User(_)) => true,
-        // Option<Error> from `None` unifies with any Option<T>.
-        (Ty::Option(inner), Ty::Option(_)) | (Ty::Option(_), Ty::Option(inner))
-            if matches!(**inner, Ty::Error) =>
-        {
-            true
-        }
-        // Result<T, Error> from bare Ok(v) / Err(e) unifies with any Result
-        // whose T (or E respectively) matches.
+        // Option / Result are compatible component-wise. Error in any
+        // position is absorbed by the (Error, _) rule above.
+        (Ty::Option(a), Ty::Option(b)) => compatible(a, b),
         (Ty::Result(oa, ea), Ty::Result(ob, eb)) => {
-            (compatible(oa, ob) && compatible(ea, eb))
-                || (matches!(**ea, Ty::Error) && compatible(oa, ob))
-                || (matches!(**eb, Ty::Error) && compatible(oa, ob))
-                || (matches!(**oa, Ty::Error) && compatible(ea, eb))
-                || (matches!(**ob, Ty::Error) && compatible(ea, eb))
+            compatible(oa, ob) && compatible(ea, eb)
         }
         (Ty::Tuple(a_elems), Ty::Tuple(b_elems)) => {
             a_elems.len() == b_elems.len()
                 && a_elems.iter().zip(b_elems.iter()).all(|(a, b)| compatible(a, b))
+        }
+        // Function pointers — needed so `fn(i32): i32` can be passed where
+        // a generic `fn(A): B` is expected.
+        (Ty::FnPtr { params: pa, ret: ra }, Ty::FnPtr { params: pb, ret: rb })
+            if pa.len() == pb.len() => {
+            pa.iter().zip(pb.iter()).all(|(a, b)| compatible(a, b))
+                && compatible(ra, rb)
         }
         _ => a == b,
     }
