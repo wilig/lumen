@@ -706,3 +706,20 @@ int64_t lumen_concat(int64_t a_ptr, int64_t b_ptr) {
     if (b_len > 0) memcpy(payload + 4 + a_len, b + 4, b_len);
     return (int64_t)(uintptr_t)payload;
 }
+
+// --- debug.print primitives (output to stderr) ---------------------------
+
+void lumen_debug_i32(int32_t v) { fprintf(stderr, "%d", v); }
+void lumen_debug_i64(int64_t v) { fprintf(stderr, "%lld", (long long)v); }
+void lumen_debug_f64(double v) { fprintf(stderr, "%g", v); }
+void lumen_debug_bool(int32_t v) { fprintf(stderr, v ? "true" : "false"); }
+void lumen_debug_str(int64_t ptr) {
+    if (ptr == 0) { fprintf(stderr, "\"\""); return; }
+    char *buf = (char *)(uintptr_t)ptr;
+    int32_t len = *(int32_t *)buf;
+    fprintf(stderr, "\"");
+    fwrite(buf + 4, 1, len, stderr);
+    fprintf(stderr, "\"");
+}
+void lumen_debug_raw(const char *s, int32_t len) { fwrite(s, 1, len, stderr); }
+void lumen_debug_newline(void) { fprintf(stderr, "\n"); }

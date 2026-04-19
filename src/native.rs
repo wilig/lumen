@@ -76,6 +76,15 @@ struct NativeCodegen<'a> {
     rt_send: FuncId,
     rt_ask: FuncId,
     rt_drain: FuncId,
+    // debug.print primitives
+    debug_i32: FuncId,
+    debug_i64: FuncId,
+    debug_f64: FuncId,
+    debug_bool: FuncId,
+    debug_str: FuncId,
+    debug_raw: FuncId,
+    debug_newline: FuncId,
+    debug_data_counter: usize,
 
     /// Per-actor dispatch function IDs (actor_name → FuncId).
     dispatch_fns: HashMap<String, FuncId>,
@@ -241,6 +250,35 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_rt_drain", Linkage::Import, &rt_drain_sig)
             .unwrap();
 
+        // --- debug.print primitives ---
+        let mut di32_sig = obj.make_signature();
+        di32_sig.params.push(AbiParam::new(cl_types::I32));
+        let debug_i32 = obj.declare_function("lumen_debug_i32", Linkage::Import, &di32_sig).unwrap();
+
+        let mut di64_sig = obj.make_signature();
+        di64_sig.params.push(AbiParam::new(cl_types::I64));
+        let debug_i64 = obj.declare_function("lumen_debug_i64", Linkage::Import, &di64_sig).unwrap();
+
+        let mut df64_sig = obj.make_signature();
+        df64_sig.params.push(AbiParam::new(cl_types::F64));
+        let debug_f64 = obj.declare_function("lumen_debug_f64", Linkage::Import, &df64_sig).unwrap();
+
+        let mut dbool_sig = obj.make_signature();
+        dbool_sig.params.push(AbiParam::new(cl_types::I32));
+        let debug_bool = obj.declare_function("lumen_debug_bool", Linkage::Import, &dbool_sig).unwrap();
+
+        let mut dstr_sig = obj.make_signature();
+        dstr_sig.params.push(AbiParam::new(PTR));
+        let debug_str = obj.declare_function("lumen_debug_str", Linkage::Import, &dstr_sig).unwrap();
+
+        let mut draw_sig = obj.make_signature();
+        draw_sig.params.push(AbiParam::new(PTR));
+        draw_sig.params.push(AbiParam::new(cl_types::I32));
+        let debug_raw = obj.declare_function("lumen_debug_raw", Linkage::Import, &draw_sig).unwrap();
+
+        let dnl_sig = obj.make_signature();
+        let debug_newline = obj.declare_function("lumen_debug_newline", Linkage::Import, &dnl_sig).unwrap();
+
         // --- Module functions are now declared from parsed std/*.lm files ---
         // (see compile_module → "Declare imported module extern fns")
         // print_frames: () -> void. Walks the frame_chain and prints each.
@@ -264,6 +302,14 @@ impl<'a> NativeCodegen<'a> {
             rt_send,
             rt_ask,
             rt_drain,
+            debug_i32,
+            debug_i64,
+            debug_f64,
+            debug_bool,
+            debug_str,
+            debug_raw,
+            debug_newline,
+            debug_data_counter: 0,
             dispatch_fns: HashMap::new(),
             heap_data,
             bump_ptr_data,
@@ -1649,6 +1695,17 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         if let ExprKind::Ident(mod_name) = &receiver.kind {
             // --- Special cases that need custom codegen ---
 
+            // debug.print: compile-time specialized formatting
+            if mod_name == "debug" && method == "print" {
+                let val = self.compile_expr(&args[0].value)?;
+                let ty = self.infer_ty(&args[0].value)?;
+                self.emit_debug_print(val, &ty)?;
+                // newline
+                let nl_ref = self.cg.obj.declare_func_in_func(self.cg.debug_newline, self.builder.func);
+                self.builder.ins().call(nl_ref, &[]);
+                return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+            }
+
             // net.tcp_write: call + ireduce i64→i32
             if mod_name == "net" && method == "tcp_write" {
                 let fd = self.compile_expr(&args[0].value)?;
@@ -1977,6 +2034,136 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[size_val]);
         Ok(self.builder.inst_results(call)[0])
+    }
+
+    // --- debug.print codegen -----------------------------------------------
+
+    /// Emit a raw string literal to stderr.
+    fn emit_debug_raw(&mut self, s: &str) {
+        // Create a data object for this string on the fly.
+        let name = format!("__dbg_{}", self.cg.string_data.len() + self.cg.debug_data_counter);
+        self.cg.debug_data_counter += 1;
+        let data_id = self.cg.obj.declare_data(&name, Linkage::Local, false, false).unwrap();
+        let mut desc = DataDescription::new();
+        desc.define(s.as_bytes().to_vec().into_boxed_slice());
+        self.cg.obj.define_data(data_id, &desc).unwrap();
+        let gv = self.cg.obj.declare_data_in_func(data_id, self.builder.func);
+        let ptr = self.builder.ins().global_value(PTR, gv);
+        let len = self.builder.ins().iconst(cl_types::I32, s.len() as i64);
+        let func_ref = self.cg.obj.declare_func_in_func(self.cg.debug_raw, self.builder.func);
+        self.builder.ins().call(func_ref, &[ptr, len]);
+    }
+
+    /// Emit code to print a value of the given type to stderr.
+    fn emit_debug_print(&mut self, val: Value, ty: &Ty) -> Result<(), NativeError> {
+        match ty {
+            Ty::I32 | Ty::U32 => {
+                let f = self.cg.obj.declare_func_in_func(self.cg.debug_i32, self.builder.func);
+                self.builder.ins().call(f, &[val]);
+            }
+            Ty::I64 | Ty::U64 => {
+                let f = self.cg.obj.declare_func_in_func(self.cg.debug_i64, self.builder.func);
+                self.builder.ins().call(f, &[val]);
+            }
+            Ty::F64 => {
+                let f = self.cg.obj.declare_func_in_func(self.cg.debug_f64, self.builder.func);
+                self.builder.ins().call(f, &[val]);
+            }
+            Ty::Bool => {
+                let f = self.cg.obj.declare_func_in_func(self.cg.debug_bool, self.builder.func);
+                self.builder.ins().call(f, &[val]);
+            }
+            Ty::String | Ty::Bytes => {
+                let f = self.cg.obj.declare_func_in_func(self.cg.debug_str, self.builder.func);
+                self.builder.ins().call(f, &[val]);
+            }
+            Ty::Unit => {
+                self.emit_debug_raw("unit");
+            }
+            Ty::User(name) => {
+                let fields = get_struct_fields(&self.cg.info.types, name);
+                if fields.is_empty() {
+                    // Sum type or unknown — just print the name.
+                    self.emit_debug_raw(name);
+                } else {
+                    self.emit_debug_raw(&format!("{name} {{ "));
+                    for (i, (fname, fty)) in fields.iter().enumerate() {
+                        if i > 0 { self.emit_debug_raw(", "); }
+                        self.emit_debug_raw(&format!("{fname}: "));
+                        let (offset, _) = field_offset(&fields, fname);
+                        let cl_ty = lumen_to_cl(fty);
+                        let fval = self.builder.ins().load(cl_ty, MemFlags::new(), val, offset);
+                        self.emit_debug_print(fval, fty)?;
+                    }
+                    self.emit_debug_raw(" }");
+                }
+            }
+            Ty::Tuple(elems) => {
+                self.emit_debug_raw("(");
+                let fields = tuple_as_fields(elems);
+                for (i, (fname, fty)) in fields.iter().enumerate() {
+                    if i > 0 { self.emit_debug_raw(", "); }
+                    let (offset, _) = field_offset(&fields, fname);
+                    let cl_ty = lumen_to_cl(fty);
+                    let fval = self.builder.ins().load(cl_ty, MemFlags::new(), val, offset);
+                    self.emit_debug_print(fval, fty)?;
+                }
+                self.emit_debug_raw(")");
+            }
+            Ty::List(inner) => {
+                // Call list_len, iterate, print each element.
+                self.emit_debug_raw("[");
+                let len_fid = self.module_func("lumen_list_len");
+                let len_ref = self.cg.obj.declare_func_in_func(len_fid, self.builder.func);
+                let len_call = self.builder.ins().call(len_ref, &[val]);
+                let len = self.builder.inst_results(len_call)[0];
+                // Simple loop: for i in 0..len
+                let get_fid = self.module_func("lumen_list_get");
+                let get_ref = self.cg.obj.declare_func_in_func(get_fid, self.builder.func);
+                let counter = self.fresh_var(cl_types::I32);
+                let zero = self.builder.ins().iconst(cl_types::I32, 0);
+                self.builder.def_var(counter, zero);
+                let header = self.builder.create_block();
+                let body = self.builder.create_block();
+                let exit = self.builder.create_block();
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(header);
+                let i = self.builder.use_var(counter);
+                let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, len);
+                self.builder.ins().brif(done, exit, &[], body, &[]);
+                self.builder.switch_to_block(body);
+                let i = self.builder.use_var(counter);
+                // Print ", " separator after first element
+                let is_first = self.builder.ins().icmp_imm(IntCC::Equal, i, 0);
+                let sep_bb = self.builder.create_block();
+                let after_sep = self.builder.create_block();
+                self.builder.ins().brif(is_first, after_sep, &[], sep_bb, &[]);
+                self.builder.switch_to_block(sep_bb);
+                self.emit_debug_raw(", ");
+                self.builder.ins().jump(after_sep, &[]);
+                self.builder.switch_to_block(after_sep);
+                let i = self.builder.use_var(counter);
+                let elem_call = self.builder.ins().call(get_ref, &[val, i]);
+                let elem = self.builder.inst_results(elem_call)[0];
+                // If inner type is i32, ireduce
+                let elem_val = if lumen_to_cl(inner) == cl_types::I32 {
+                    self.builder.ins().ireduce(cl_types::I32, elem)
+                } else { elem };
+                self.emit_debug_print(elem_val, inner)?;
+                let one = self.builder.ins().iconst(cl_types::I32, 1);
+                let i = self.builder.use_var(counter);
+                let next = self.builder.ins().iadd(i, one);
+                self.builder.def_var(counter, next);
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(exit);
+                self.emit_debug_raw("]");
+            }
+            _ => {
+                // Fallback: print the type name.
+                self.emit_debug_raw(&format!("<{}>", ty.display()));
+            }
+        }
+        Ok(())
     }
 
     fn emit_rc_incr(&mut self, ptr: Value) {

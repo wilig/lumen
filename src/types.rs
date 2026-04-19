@@ -1502,8 +1502,17 @@ impl<'a> FnChecker<'a> {
         args: &[Arg],
         span: Span,
     ) -> Option<Ty> {
-        // --- Special cases: list type inference ---
+        // --- Special cases ---
         match (module, method) {
+            // debug.print accepts any type, returns unit.
+            ("debug", "print") => {
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: "`debug.print` expects 1 arg".into() });
+                } else {
+                    self.infer_expr(&args[0].value);
+                }
+                return Some(Ty::Unit);
+            }
             ("list", "new") => {
                 return Some(Ty::List(Box::new(Ty::Error)));
             }
