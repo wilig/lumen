@@ -24,6 +24,11 @@ pick first: kept
 head ints:  10
 id_twice:   7
 
+=== type generics ===
+p1.fst = 7, p1.snd = hello
+p2.fst = key, p2.snd = 42
+bi = 100, bs = boxed
+
 === list utilities ===
 nums:       [1, 2, 3, 4, 5]
 doubled:    [2, 4, 6, 8, 10]

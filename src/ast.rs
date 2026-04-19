@@ -114,6 +114,10 @@ pub enum Effect {
 pub struct TypeDecl {
     pub name: String,
     pub name_span: Span,
+    /// Generic type parameters: `type Pair<A, B> = { ... }` → ["A", "B"].
+    /// Empty for non-generic types. Each instantiation is monomorphized
+    /// per usage into a fresh struct/sum decl with the params substituted.
+    pub type_params: Vec<String>,
     pub body: TypeBody,
     pub span: Span,
 }

@@ -23,6 +23,9 @@ type Shape =
 
 type Point = { x: f64, y: f64 }
 
+type Pair<A, B> = { fst: A, snd: B }
+type Box<T> = { val: T }
+
 // --- Actor (used by both actors and multi_actor sections) ---
 actor Counter {
     count: i32
@@ -151,6 +154,16 @@ fn main(): i32 io {
         None => io.println("(empty)"),
     }
     io.println("id_twice:   \{id_twice(7)}")
+
+    // type generics (struct templates)
+    section("type generics")
+    let p1: Pair<i32, string> = Pair { fst: 7, snd: "hello" }
+    let p2: Pair<string, i32> = Pair { fst: "key", snd: 42 }
+    io.println("p1.fst = \{p1.fst}, p1.snd = \{p1.snd}")
+    io.println("p2.fst = \{p2.fst}, p2.snd = \{p2.snd}")
+    let bi: Box<i32> = Box { val: 100 }
+    let bs: Box<string> = Box { val: "boxed" }
+    io.println("bi = \{bi.val}, bs = \{bs.val}")
 
     // list_utils
     section("list utilities")

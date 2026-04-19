@@ -148,6 +148,24 @@ pub struct ModuleInfo {
     pub modules: HashMap<String, HashMap<String, FnSig>>,
     /// Imported module extern fn link names: module_name → (fn_name → link_name).
     pub module_link_names: HashMap<String, HashMap<String, String>>,
+    /// Generic type templates (struct/sum decls with type params).
+    /// Each instantiation `Foo<args>` referenced anywhere in the program
+    /// is monomorphized into a fresh entry in `types` under a mangled
+    /// name (e.g. "Pair$I32_Str") during a pre-pass.
+    pub generic_type_templates: HashMap<String, GenericTypeTemplate>,
+    /// Mangled instantiation name → template name. Lets check_expr for a
+    /// struct literal recognize that "Pair$I32_Str" was instantiated from
+    /// the user's "Pair" so the literal `Pair { ... }` written in source
+    /// can resolve to the right concrete type when context provides one.
+    pub generic_type_origins: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenericTypeTemplate {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub body: TypeBody,
+    pub span: Span,
 }
 
 /// Signature of an actor message handler.
@@ -215,6 +233,8 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         imports: module.imports.iter().map(|i| i.path.join("/")).collect(),
         modules: HashMap::new(),
         module_link_names: HashMap::new(),
+        generic_type_templates: HashMap::new(),
+        generic_type_origins: HashMap::new(),
     };
 
     // Register imported module APIs.
@@ -272,11 +292,27 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             }
         }
         if let Item::Type(td) = item {
-            if info.types.contains_key(&td.name) {
+            if info.types.contains_key(&td.name) || info.generic_type_templates.contains_key(&td.name) {
                 errors.push(TypeError {
                     span: td.name_span,
                     message: format!("duplicate type `{}`", td.name),
                 });
+                continue;
+            }
+            // Generic type decls are stored as templates. Each
+            // instantiation is materialized in `info.types` lazily as
+            // the program references it (see register_generic_instantiations
+            // below).
+            if !td.type_params.is_empty() {
+                info.generic_type_templates.insert(
+                    td.name.clone(),
+                    GenericTypeTemplate {
+                        name: td.name.clone(),
+                        type_params: td.type_params.clone(),
+                        body: td.body.clone(),
+                        span: td.span,
+                    },
+                );
                 continue;
             }
             // Insert a placeholder so later resolution can see the name.
@@ -346,6 +382,14 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         };
         info.types.insert(td.name.clone(), body);
     }
+
+    // Pass 2.5: monomorphize all generic-type instantiations referenced
+    // anywhere in the program. Walks every type position (fn sigs, let
+    // annotations, type-decl field types) and registers each unique
+    // `Foo<args>` as a fresh entry in `info.types` under a mangled name
+    // ("Pair$I32_Str"). Done before Pass 3 so fn sigs and bodies
+    // resolve cleanly.
+    register_generic_instantiations(module, imported, &mut info, &mut errors);
 
     // Pass 2b: resolve actor type bodies.
     for item in &module.items {
@@ -542,7 +586,7 @@ fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeE
     resolve_type_with_params(t, types, &[])
 }
 
-fn resolve_type_with_params(
+pub fn resolve_type_with_params(
     t: &Type,
     types: &HashMap<String, TypeInfo>,
     type_params: &[String],
@@ -585,6 +629,23 @@ fn resolve_type_with_params(
                 Ok(Ty::Handle(Box::new(resolve_type_with_params(&args[0], types, type_params)?)))
             }
             _ if args.is_empty() && types.contains_key(name) => Ok(Ty::User(name.clone())),
+            // Generic user-type instantiation: `Pair<i32, string>` →
+            // Ty::User("Pair$I32_Str") if the pre-pass registered it.
+            _ if !args.is_empty() => {
+                let resolved_args: Result<Vec<Ty>, TypeError> = args.iter()
+                    .map(|a| resolve_type_with_params(a, types, type_params))
+                    .collect();
+                let resolved_args = resolved_args?;
+                let mangled = mangle_type_instantiation(name, &resolved_args);
+                if types.contains_key(&mangled) {
+                    Ok(Ty::User(mangled))
+                } else {
+                    Err(TypeError {
+                        span: t.span,
+                        message: format!("unknown type `{name}<...>`"),
+                    })
+                }
+            }
             _ => Err(TypeError {
                 span: t.span,
                 message: format!("unknown type `{name}`"),
@@ -602,6 +663,310 @@ fn resolve_type_with_params(
             Ok(Ty::FnPtr { params: param_tys?, ret: Box::new(ret_ty) })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic-type instantiation pre-pass
+// ---------------------------------------------------------------------------
+
+/// Walk every type position in the user's module + imports, find each
+/// `Foo<args>` where Foo is a generic type template, substitute its body
+/// and register a monomorphized TypeInfo under a mangled name. Iterates
+/// to fixpoint so an instantiation referencing another generic type
+/// inside its body (e.g. struct fields of `Pair<List<i32>, Other<i32>>`)
+/// pulls in everything needed.
+fn register_generic_instantiations(
+    module: &Module,
+    imported: &[ParsedImport],
+    info: &mut ModuleInfo,
+    errors: &mut Vec<TypeError>,
+) {
+    if info.generic_type_templates.is_empty() {
+        return;
+    }
+    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Seed: walk the user's module and every imported module's items.
+    let mut collect = |m: &Module, info: &ModuleInfo, worklist: &mut Vec<_>, seen: &mut std::collections::HashSet<String>| {
+        let mut collected = Vec::new();
+        collect_generic_uses_in_module(m, info, &mut collected);
+        for inst in collected {
+            let key = mangle_type_instantiation(&inst.0, &inst.1);
+            if seen.insert(key) {
+                worklist.push(inst);
+            }
+        }
+    };
+    collect(module, info, &mut worklist, &mut seen);
+    for imp in imported {
+        collect(&imp.module, info, &mut worklist, &mut seen);
+    }
+
+    // Process worklist. Each instantiation may reference more generic
+    // types in its substituted fields → add them to the worklist.
+    while let Some((name, args)) = worklist.pop() {
+        let template = match info.generic_type_templates.get(&name).cloned() {
+            Some(t) => t,
+            None => continue,
+        };
+        if template.type_params.len() != args.len() {
+            errors.push(TypeError {
+                span: template.span,
+                message: format!(
+                    "`{name}<...>` expects {} type arguments, found {}",
+                    template.type_params.len(),
+                    args.len()
+                ),
+            });
+            continue;
+        }
+        let mangled = mangle_type_instantiation(&name, &args);
+        if info.types.contains_key(&mangled) { continue; }
+
+        // Insert a placeholder so recursive references (e.g. Tree<T> in
+        // its own variant body) terminate.
+        info.types.insert(mangled.clone(), TypeInfo::Struct {
+            fields: Vec::new(),
+            span: template.span,
+        });
+        info.generic_type_origins.insert(mangled.clone(), name.clone());
+
+        let subs: HashMap<String, Ty> = template.type_params.iter().zip(args.iter())
+            .map(|(p, a)| (p.clone(), a.clone()))
+            .collect();
+
+        let body = match &template.body {
+            TypeBody::Struct(fields) => {
+                let mut resolved = Vec::new();
+                for f in fields {
+                    let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
+                        Ok(t) => t,
+                        Err(e) => { errors.push(e); Ty::Error }
+                    };
+                    let ty = substitute_generic(raw, &subs);
+                    // If this field references another generic type, queue it.
+                    queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
+                    resolved.push((f.name.clone(), ty));
+                }
+                TypeInfo::Struct { fields: resolved, span: template.span }
+            }
+            TypeBody::Sum(_) => {
+                errors.push(TypeError {
+                    span: template.span,
+                    message: format!("generic sum types are not yet supported (`{name}<...>`)"),
+                });
+                TypeInfo::Struct { fields: Vec::new(), span: template.span }
+            }
+        };
+        info.types.insert(mangled, body);
+    }
+}
+
+pub fn mangle_type_instantiation(name: &str, args: &[Ty]) -> String {
+    let mut s = name.to_string();
+    s.push('$');
+    for (i, t) in args.iter().enumerate() {
+        if i > 0 { s.push('_'); }
+        s.push_str(&mangle_ty_for_type_inst(t));
+    }
+    s
+}
+
+fn mangle_ty_for_type_inst(t: &Ty) -> String {
+    match t {
+        Ty::I32 => "I32".into(),
+        Ty::I64 => "I64".into(),
+        Ty::U32 => "U32".into(),
+        Ty::U64 => "U64".into(),
+        Ty::F64 => "F64".into(),
+        Ty::Bool => "Bool".into(),
+        Ty::String => "Str".into(),
+        Ty::Bytes => "Bytes".into(),
+        Ty::Unit => "Unit".into(),
+        Ty::List(inner) => format!("L{}", mangle_ty_for_type_inst(inner)),
+        Ty::Map(k, v) => format!("M{}V{}", mangle_ty_for_type_inst(k), mangle_ty_for_type_inst(v)),
+        Ty::Option(inner) => format!("O{}", mangle_ty_for_type_inst(inner)),
+        Ty::Result(o, e) => format!("R{}E{}", mangle_ty_for_type_inst(o), mangle_ty_for_type_inst(e)),
+        Ty::Handle(inner) => format!("H{}", mangle_ty_for_type_inst(inner)),
+        Ty::Tuple(elems) => format!("T{}", elems.iter().map(mangle_ty_for_type_inst).collect::<Vec<_>>().join("_")),
+        Ty::User(n) => format!("U{}", n),
+        Ty::FnPtr { .. } => "Fn".into(),
+        Ty::Generic(n) => format!("G{}", n),
+        Ty::Error => "Err".into(),
+    }
+}
+
+/// Collect every (template_name, type_args) usage in a module's items.
+fn collect_generic_uses_in_module(m: &Module, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    for item in &m.items {
+        match item {
+            Item::Fn(f) => {
+                for p in &f.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
+                collect_generic_uses_in_ast_type(&f.return_type, info, out);
+                collect_generic_uses_in_block(&f.body, info, out);
+            }
+            Item::ExternFn(ef) => {
+                for p in &ef.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
+                collect_generic_uses_in_ast_type(&ef.return_type, info, out);
+            }
+            Item::Type(td) => {
+                if td.type_params.is_empty() {
+                    match &td.body {
+                        TypeBody::Struct(fields) => {
+                            for f in fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
+                        }
+                        TypeBody::Sum(variants) => {
+                            for v in variants {
+                                if let Some(p) = &v.payload {
+                                    match p {
+                                        VariantPayload::Named(fields) => {
+                                            for f in fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
+                                        }
+                                        VariantPayload::Positional(tys) => {
+                                            for t in tys { collect_generic_uses_in_ast_type(t, info, out); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Item::Actor(ad) => {
+                for f in &ad.fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
+            }
+            Item::MsgHandler(mh) => {
+                for p in &mh.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
+                collect_generic_uses_in_ast_type(&mh.return_type, info, out);
+                collect_generic_uses_in_block(&mh.body, info, out);
+            }
+        }
+    }
+}
+
+fn collect_generic_uses_in_ast_type(t: &crate::ast::Type, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    match &t.kind {
+        TypeKind::Named { name, args } => {
+            // Recurse into args first.
+            for a in args { collect_generic_uses_in_ast_type(a, info, out); }
+            if !args.is_empty() && info.generic_type_templates.contains_key(name) {
+                let resolved_args: Vec<Ty> = args.iter()
+                    .map(|a| resolve_type(a, &info.types).unwrap_or(Ty::Error))
+                    .collect();
+                if !resolved_args.iter().any(|t| matches!(t, Ty::Error)) {
+                    out.push((name.clone(), resolved_args));
+                }
+            }
+        }
+        TypeKind::Tuple(elems) => for e in elems { collect_generic_uses_in_ast_type(e, info, out); }
+        TypeKind::FnPtr { params, ret } => {
+            for p in params { collect_generic_uses_in_ast_type(p, info, out); }
+            collect_generic_uses_in_ast_type(ret, info, out);
+        }
+    }
+}
+
+fn collect_generic_uses_in_block(b: &Block, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    for s in &b.stmts { collect_generic_uses_in_stmt(s, info, out); }
+    if let Some(t) = &b.tail { collect_generic_uses_in_expr(t, info, out); }
+}
+
+fn collect_generic_uses_in_stmt(s: &Stmt, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    match &s.kind {
+        StmtKind::Let { ty, value, .. } | StmtKind::Var { ty, value, .. } => {
+            if let Some(t) = ty { collect_generic_uses_in_ast_type(t, info, out); }
+            collect_generic_uses_in_expr(value, info, out);
+        }
+        StmtKind::Assign { value, .. } => collect_generic_uses_in_expr(value, info, out),
+        StmtKind::LetTuple { value, .. } => collect_generic_uses_in_expr(value, info, out),
+        StmtKind::Expr(e) => collect_generic_uses_in_expr(e, info, out),
+        StmtKind::For { iter, body, .. } => {
+            collect_generic_uses_in_expr(iter, info, out);
+            collect_generic_uses_in_block(body, info, out);
+        }
+        StmtKind::Return(Some(e)) => collect_generic_uses_in_expr(e, info, out),
+        StmtKind::Return(None) => {}
+    }
+}
+
+fn collect_generic_uses_in_expr(e: &Expr, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    match &e.kind {
+        ExprKind::Cast { expr, to } => {
+            collect_generic_uses_in_expr(expr, info, out);
+            collect_generic_uses_in_ast_type(to, info, out);
+        }
+        ExprKind::Lambda { params, return_type, body } => {
+            for p in params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
+            collect_generic_uses_in_ast_type(return_type, info, out);
+            collect_generic_uses_in_block(body, info, out);
+        }
+        ExprKind::Block(b) => collect_generic_uses_in_block(b, info, out),
+        ExprKind::Paren(e) | ExprKind::Unary { rhs: e, .. } | ExprKind::Try(e) | ExprKind::TupleField { receiver: e, .. } => {
+            collect_generic_uses_in_expr(e, info, out)
+        }
+        ExprKind::Field { receiver, .. } => collect_generic_uses_in_expr(receiver, info, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_generic_uses_in_expr(lhs, info, out);
+            collect_generic_uses_in_expr(rhs, info, out);
+        }
+        ExprKind::Call { callee, args } => {
+            collect_generic_uses_in_expr(callee, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_generic_uses_in_expr(receiver, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+        }
+        ExprKind::If { cond, then_block, else_block } => {
+            collect_generic_uses_in_expr(cond, info, out);
+            collect_generic_uses_in_block(then_block, info, out);
+            collect_generic_uses_in_block(else_block, info, out);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            collect_generic_uses_in_expr(scrutinee, info, out);
+            for arm in arms { collect_generic_uses_in_expr(&arm.body, info, out); }
+        }
+        ExprKind::StructLit { fields, spread, .. } => {
+            for f in fields { collect_generic_uses_in_expr(&f.value, info, out); }
+            if let Some(s) = spread { collect_generic_uses_in_expr(s, info, out); }
+        }
+        ExprKind::TupleLit(elems) => for e in elems { collect_generic_uses_in_expr(e, info, out); },
+        ExprKind::Spawn { fields, .. } => for f in fields { collect_generic_uses_in_expr(&f.value, info, out); },
+        ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
+            collect_generic_uses_in_expr(handle, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+        }
+        ExprKind::Interpolated(parts) => {
+            for p in parts {
+                if let crate::ast::InterpPiece::Expr(e) = p {
+                    collect_generic_uses_in_expr(e, info, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// During worklist processing, when a substituted field type is a Ty::User
+/// referring to another generic instantiation, queue that one too.
+fn queue_generic_uses_in_ty(ty: &Ty, info: &ModuleInfo, worklist: &mut Vec<(String, Vec<Ty>)>, seen: &mut std::collections::HashSet<String>) {
+    match ty {
+        Ty::List(inner) | Ty::Option(inner) | Ty::Handle(inner) => queue_generic_uses_in_ty(inner, info, worklist, seen),
+        Ty::Map(k, v) | Ty::Result(k, v) => {
+            queue_generic_uses_in_ty(k, info, worklist, seen);
+            queue_generic_uses_in_ty(v, info, worklist, seen);
+        }
+        Ty::Tuple(elems) => for t in elems { queue_generic_uses_in_ty(t, info, worklist, seen); },
+        Ty::FnPtr { params, ret } => {
+            for p in params { queue_generic_uses_in_ty(p, info, worklist, seen); }
+            queue_generic_uses_in_ty(ret, info, worklist, seen);
+        }
+        _ => {}
+    }
+    let _ = info;
+    let _ = worklist;
+    let _ = seen;
 }
 
 // ---------------------------------------------------------------------------
@@ -884,6 +1249,23 @@ impl<'a> FnChecker<'a> {
     }
 
     fn check_expr(&mut self, expr: &Expr, expected: &Ty) -> Ty {
+        // Special case: a struct literal whose name is a generic
+        // template, with an expected type that's a known instantiation
+        // of that template. Use the mangled type for field validation
+        // so e.g. `let p: Pair<i32, string> = Pair { fst: 1, snd: "hi" }`
+        // checks fields against Pair$I32_Str.
+        if let ExprKind::StructLit { name, name_span, fields, spread } = &expr.kind {
+            if let Ty::User(mangled) = expected {
+                if self.module.generic_type_origins.get(mangled).map(|s| s.as_str()) == Some(name.as_str()) {
+                    if let Some(TypeInfo::Struct { fields: def_fields, .. }) = self.module.types.get(mangled) {
+                        let def_fields = def_fields.clone();
+                        return self.check_struct_lit_fields(
+                            mangled, *name_span, fields, spread.as_deref(), expr.span, def_fields,
+                        );
+                    }
+                }
+            }
+        }
         let actual = self.infer_expr(expr);
         if !compatible(&actual, expected) {
             self.errors.push(TypeError {
@@ -2246,7 +2628,7 @@ impl<'a> FnChecker<'a> {
 /// compatible; you have to `as`-cast. The one exception is [`Ty::Error`].
 /// Walk a generic param type alongside a concrete arg type and bind
 /// any Ty::Generic names into `subs`. First binding wins.
-fn unify_for_subs(generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty>) {
+pub fn unify_for_subs(generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty>) {
     match (generic, concrete) {
         (Ty::Generic(name), c) => {
             subs.entry(name.clone()).or_insert_with(|| c.clone());

@@ -2568,6 +2568,40 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(())
     }
 
+    /// If `name` is a generic struct template, infer its concrete
+    /// instantiation by walking the struct literal's field values to
+    /// derive the type-param substitution, then return the mangled
+    /// name (already registered by the type-checker pre-pass). For a
+    /// non-generic struct, returns `name` unchanged.
+    fn resolve_struct_lit_name(
+        &self,
+        name: &str,
+        fields: &[ast::FieldInit],
+    ) -> Result<String, NativeError> {
+        let template = match self.cg.info.generic_type_templates.get(name).cloned() {
+            Some(t) => t,
+            None => return Ok(name.to_string()),
+        };
+        let template_fields = match &template.body {
+            ast::TypeBody::Struct(fs) => fs.clone(),
+            _ => return Ok(name.to_string()),
+        };
+        let mut subs: HashMap<String, Ty> = HashMap::new();
+        for tf in &template_fields {
+            if let Some(init) = fields.iter().find(|fi| fi.name == tf.name) {
+                let val_ty = self.infer_ty(&init.value)?;
+                let template_field_ty = crate::types::resolve_type_with_params(
+                    &tf.ty, &self.cg.info.types, &template.type_params,
+                ).unwrap_or(Ty::Error);
+                crate::types::unify_for_subs(&template_field_ty, &val_ty, &mut subs);
+            }
+        }
+        let type_args: Vec<Ty> = template.type_params.iter()
+            .map(|p| subs.get(p).cloned().unwrap_or(Ty::Error))
+            .collect();
+        Ok(crate::types::mangle_type_instantiation(name, &type_args))
+    }
+
     fn compile_struct_lit(
         &mut self,
         name: &str,
@@ -2575,6 +2609,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         spread: Option<&ast::Expr>,
         span: Span,
     ) -> Result<Value, NativeError> {
+        // Generic struct template? Infer the mangled instantiation name
+        // from the field-value types, then dispatch to that.
+        let resolved_name = self.resolve_struct_lit_name(name, fields)?;
+        let name = resolved_name.as_str();
+
         // Named-field variant constructor? (e.g. Circle { radius: 2 })
         if get_struct_fields(&self.cg.info.types, name).is_empty() {
             if let Some(sum_name) = self.find_sum_for_variant(name) {
@@ -3739,7 +3778,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
                 Ty::I32
             }
-            ExprKind::StructLit { name, .. } => Ty::User(name.clone()),
+            ExprKind::StructLit { name, fields, .. } => {
+                // For a generic-template struct, the actual concrete type
+                // is the mangled instantiation derived from field types.
+                let resolved = self.resolve_struct_lit_name(name, fields)?;
+                Ty::User(resolved)
+            }
             ExprKind::Field { receiver, name } => {
                 let recv_ty = self.infer_ty(receiver)?;
                 let type_name = if let Ty::User(tn) = recv_ty {
