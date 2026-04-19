@@ -56,13 +56,17 @@ pub struct MsgHandlerDecl {
 }
 
 /// `extern fn malloc(size: i64): i64`
+/// `extern fn sqrt(x: f64): f64 link "lumen_sqrt"`
 /// Declares an external C-ABI function resolved by the linker.
+/// If `link_name` is set, that symbol is used for linking instead of `name`.
 #[derive(Debug, Clone)]
 pub struct ExternFnDecl {
     pub name: String,
     pub name_span: Span,
     pub params: Vec<Param>,
     pub return_type: Type,
+    /// Optional C symbol name: `link "lumen_sqrt"`.
+    pub link_name: Option<String>,
     pub span: Span,
 }
 

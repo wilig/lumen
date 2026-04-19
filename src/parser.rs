@@ -203,13 +203,29 @@ impl Parser {
 
         self.expect(&TokenKind::Colon, "`:` before return type")?;
         let return_type = self.parse_type()?;
-        let end = return_type.span;
+        let mut end = return_type.span;
+
+        // Optional link name: `link "c_symbol_name"`
+        let link_name = if matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "link") {
+            self.bump(); // consume `link`
+            match self.peek_kind().clone() {
+                TokenKind::StringLit(s) => {
+                    let tok = self.bump();
+                    end = tok.span;
+                    Some(s)
+                }
+                _ => return Err(self.error_here("expected string literal after `link`".into())),
+            }
+        } else {
+            None
+        };
 
         Ok(ExternFnDecl {
             name,
             name_span,
             params,
             return_type,
+            link_name,
             span: merge(start, end),
         })
     }
@@ -1849,6 +1865,14 @@ mod tests {
     fn extern_fn_parses() {
         let m = parse_ok("extern fn malloc(size: i64): i64");
         assert!(matches!(&m.items[0], Item::ExternFn(_)));
+    }
+
+    #[test]
+    fn extern_fn_with_link_name() {
+        let m = parse_ok(r#"extern fn sqrt(x: f64): f64 link "lumen_sqrt""#);
+        let Item::ExternFn(ef) = &m.items[0] else { panic!() };
+        assert_eq!(ef.name, "sqrt");
+        assert_eq!(ef.link_name.as_deref(), Some("lumen_sqrt"));
     }
 
     #[test]

@@ -812,9 +812,12 @@ impl<'a> NativeCodegen<'a> {
         for item in &module.items {
             if let Item::ExternFn(ef) = item {
                 let sig = self.build_sig(&ef.name);
+                // Use link_name for the linker symbol if specified,
+                // but register under the Lumen-facing name in fn_ids.
+                let symbol = ef.link_name.as_deref().unwrap_or(&ef.name);
                 let id = self
                     .obj
-                    .declare_function(&ef.name, Linkage::Import, &sig)
+                    .declare_function(symbol, Linkage::Import, &sig)
                     .unwrap();
                 self.fn_ids.insert(ef.name.clone(), id);
             }
