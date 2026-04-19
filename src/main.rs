@@ -7,24 +7,66 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-
-    match argv.as_slice() {
-        [_, "build", path] => cmd_build_native(path, false),
-        [_, "build", "--debug", path] | [_, "build", path, "--debug"] => cmd_build_native(path, true),
-        [_, "run", path] => cmd_run(path),
-        [_, "--version"] | [_, "-V"] => {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        print_usage();
+        return ExitCode::from(1);
+    }
+    match args[0].as_str() {
+        "build" => {
+            let mut debug = false;
+            let mut path = None;
+            let mut extra_link_flags = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--debug" => debug = true,
+                    s if s.starts_with("-l") || s.starts_with("-L") || s.starts_with("-framework") || s.starts_with("-Wl,") => {
+                        extra_link_flags.push(args[i].clone());
+                    }
+                    "-framework" => {
+                        extra_link_flags.push(args[i].clone());
+                        if i + 1 < args.len() {
+                            i += 1;
+                            extra_link_flags.push(args[i].clone());
+                        }
+                    }
+                    _ if !args[i].starts_with('-') && path.is_none() => {
+                        path = Some(args[i].as_str());
+                    }
+                    other => {
+                        eprintln!("unknown option: {other}");
+                        return ExitCode::from(1);
+                    }
+                }
+                i += 1;
+            }
+            match path {
+                Some(p) => cmd_build_native(p, debug, &extra_link_flags),
+                None => { eprintln!("error: no input file"); ExitCode::from(1) }
+            }
+        }
+        "run" => {
+            if let Some(path) = args.get(1) {
+                cmd_run(path)
+            } else {
+                eprintln!("error: no input file");
+                ExitCode::from(1)
+            }
+        }
+        "--version" | "-V" => {
             println!("lumen {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        _ => {
-            eprintln!(
-                "usage:\n  lumen build [--debug] <path.lm>\n  lumen run   <path.lm>\n  lumen --version"
-            );
-            ExitCode::from(1)
-        }
+        _ => { print_usage(); ExitCode::from(1) }
     }
+}
+
+fn print_usage() {
+    eprintln!("usage:");
+    eprintln!("  lumen build [--debug] <path.lm> [-lname] [-Lpath] [-framework name]");
+    eprintln!("  lumen run   <path.lm>");
+    eprintln!("  lumen --version");
 }
 
 /// Format an error with source context: the offending line + a caret.
@@ -113,7 +155,7 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
     Ok((obj, stem.to_string(), imports))
 }
 
-fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, String> {
+fn link(obj_bytes: &[u8], stem: &str, imports: &[String], extra_link_flags: &[String]) -> Result<String, String> {
     let obj_path = format!("{stem}.o");
     let exe_path = stem.to_string();
     std::fs::write(&obj_path, obj_bytes).map_err(|e| format!("write {obj_path}: {e}"))?;
@@ -136,7 +178,7 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
         link_args.insert(1, rt_obj.clone());
     }
 
-    // Compile and link the raylib bridge only when the source imports std/raylib.
+    // Compile the raylib bridge when vendor/raylib is imported.
     let rl_bridge_src = rt_dir.join("raylib_bridge.c");
     let rl_bridge_obj = format!("{stem}_rl.o");
     let uses_raylib = imports.iter().any(|i| i == "vendor/raylib" || i == "std/rl" || i == "std/raylib");
@@ -147,39 +189,12 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
             .map_err(|e| format!("failed to compile raylib bridge: {e}"))?;
         if cc_status.success() {
             link_args.insert(2, rl_bridge_obj.clone());
-            // Add raylib link flags (platform-specific).
-            #[cfg(target_os = "linux")]
-            for flag in [
-                "-L/usr/lib/odin/vendor/raylib/linux",
-                "-Wl,-rpath,/usr/lib/odin/vendor/raylib/linux",
-                "-lraylib", "-lm", "-lGL", "-ldl", "-lpthread",
-            ] {
-                link_args.push(flag.to_string());
-            }
-            #[cfg(target_os = "macos")]
-            {
-                // Check for homebrew raylib.
-                if let Ok(out) = std::process::Command::new("brew")
-                    .args(["--prefix", "raylib"])
-                    .output()
-                {
-                    if out.status.success() {
-                        let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        link_args.push(format!("-L{prefix}/lib"));
-                        link_args.push(format!("-I{prefix}/include"));
-                    }
-                }
-                for flag in [
-                    "-lraylib", "-lm",
-                    "-framework", "OpenGL",
-                    "-framework", "Cocoa",
-                    "-framework", "IOKit",
-                    "-framework", "CoreVideo",
-                ] {
-                    link_args.push(flag.to_string());
-                }
-            }
         }
+    }
+
+    // Append user-provided linker flags (e.g. -lraylib -L/path/to/lib).
+    for flag in extra_link_flags {
+        link_args.push(flag.clone());
     }
 
     let status = std::process::Command::new("cc")
@@ -195,9 +210,9 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
     Ok(exe_path)
 }
 
-fn cmd_build_native(path: &str, debug: bool) -> ExitCode {
+fn cmd_build_native(path: &str, debug: bool, extra_link_flags: &[String]) -> ExitCode {
     match compile_to_object(path, debug) {
-        Ok((obj, stem, imports)) => match link(&obj, &stem, &imports) {
+        Ok((obj, stem, imports)) => match link(&obj, &stem, &imports, extra_link_flags) {
             Ok(exe) => {
                 eprintln!("wrote {exe}");
                 ExitCode::SUCCESS
@@ -222,7 +237,7 @@ fn cmd_run(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let exe = match link(&obj, &stem, &imports) {
+    let exe = match link(&obj, &stem, &imports, &[]) {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{msg}");
