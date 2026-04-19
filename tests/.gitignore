@@ -1,0 +1,5 @@
+kitchen_sink
+kitchen_sink.o
+kitchen_sink.actual
+_minimal*
+_partial*

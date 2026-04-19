@@ -1,0 +1,247 @@
+// Snapshot test for the language: combines the deterministic example
+// programs into a single binary whose stdout is compared against
+// tests/kitchen_sink.expected. If you change the language and a demo's
+// output drifts, this test fires; if the new output is intentional,
+// `cp tests/kitchen_sink.actual tests/kitchen_sink.expected`.
+//
+// Skipped from the kitchen sink: bench_*, ffi_time, gc_stress (timing or
+// nondeterministic), tcp_echo, web_server, concurrent_server (network),
+// bricks (raylib).
+
+import std/io
+import std/int
+import std/list
+import std/map
+import std/string
+import std/bytes
+import std/fs
+
+// --- Types ---
+type Shape =
+    | Circle { radius: i32 }
+    | Rectangle { width: i32, height: i32 }
+
+type Point = { x: f64, y: f64 }
+
+// --- Actor (used by both actors and multi_actor sections) ---
+actor Counter {
+    count: i32
+}
+
+msg Counter.add(self, n: i32): Counter {
+    return Counter { count: self.count + n }
+}
+
+msg Counter.get(self): i32 {
+    return self.count
+}
+
+// --- Helpers ---
+fn sum_of_squares(n: i32): i32 {
+    var total: i32 = 0
+    for i in range(1, n + 1) {
+        total = total + i * i
+    }
+    return total
+}
+
+fn approx_area(s: Shape): i32 {
+    return match s {
+        Circle { radius: r } => 3 * r * r,
+        Rectangle { width: w, height: h } => w * h,
+    }
+}
+
+fn divide(a: i32, b: i32): Result<i32, string> {
+    return if b == 0 {
+        Err("division by zero")
+    } else {
+        Ok(a / b)
+    }
+}
+
+fn compute(): Result<i32, string> {
+    let x = divide(100, 5)?
+    let y = divide(x, 4)?
+    return Ok(x + y)
+}
+
+// Generics
+fn id<T>(x: T): T {
+    return x
+}
+
+fn pick_first<A, B>(a: A, b: B): A {
+    return a
+}
+
+fn head<T>(xs: List<T>): Option<T> {
+    if list.len(xs) == 0 {
+        return None
+    }
+    return Some(list.get(xs, 0))
+}
+
+fn id_twice<T>(x: T): T {
+    return id(id(x))
+}
+
+// List utility callbacks
+fn double_n(n: i32): i32 {
+    return n * 2
+}
+
+fn is_even(n: i32): bool {
+    return n % 2 == 0
+}
+
+fn add_pair(a: i32, b: i32): i32 {
+    return a + b
+}
+
+// Section divider
+fn section(title: string): unit io {
+    io.println("")
+    io.println("=== \{title} ===")
+}
+
+fn main(): i32 io {
+    // hello
+    section("hello")
+    io.println("hello, world")
+
+    // sum_of_squares
+    section("sum of squares")
+    io.println("1..10 = \{sum_of_squares(10)}")
+
+    // match_demo
+    section("match")
+    let c: Shape = Circle { radius: 5 }
+    let r: Shape = Rectangle { width: 4, height: 6 }
+    io.println("circle area ~ \{approx_area(c)}")
+    io.println("rect area   = \{approx_area(r)}")
+
+    // assert_demo (only the passing path — a failing assert would abort
+    // the whole test).
+    section("assert")
+    let x: i32 = 21
+    assert(x + x == 42)
+    assert(x > 0, "x must be positive")
+    io.println("asserts ok")
+
+    // error_chain
+    section("error chain")
+    match compute() {
+        Ok(n) => io.println("got \{n}"),
+        Err(e) => io.println("err: \{e}"),
+    }
+
+    // generics_demo
+    section("generics")
+    io.println("id i32:     \{id(42)}")
+    io.println("id string:  \{id("hello")}")
+    io.println("id float:   \{id(3.14)}")
+    io.println("pick first: \{pick_first(7, "ignored")}")
+    io.println("pick first: \{pick_first("kept", 99)}")
+    var ints: List<i32> = list.new()
+    ints = list.push(ints, 10)
+    ints = list.push(ints, 20)
+    match head(ints) {
+        Some(n) => io.println("head ints:  \{n}"),
+        None => io.println("(empty)"),
+    }
+    io.println("id_twice:   \{id_twice(7)}")
+
+    // list_utils
+    section("list utilities")
+    var nums: List<i32> = list.new()
+    nums = list.push(nums, 1)
+    nums = list.push(nums, 2)
+    nums = list.push(nums, 3)
+    nums = list.push(nums, 4)
+    nums = list.push(nums, 5)
+    io.println("nums:       \{nums}")
+    io.println("doubled:    \{list.map(nums, double_n)}")
+    io.println("evens:      \{list.filter(nums, is_even)}")
+    io.println("any even:   \{list.any(nums, is_even)}")
+    io.println("count even: \{list.count(nums, is_even)}")
+    io.println("sum:        \{list.fold(nums, 0, add_pair)}")
+    io.println("reverse:    \{list.reverse(nums)}")
+    io.println("take 3:     \{list.take(nums, 3)}")
+    io.println("drop 3:     \{list.drop(nums, 3)}")
+
+    // map_demo
+    section("map")
+    var ages: Map<string, i32> = map.new()
+    ages = map.set(ages, "alice", 30)
+    ages = map.set(ages, "bob", 25)
+    ages = map.set(ages, "carol", 42)
+    io.println("size = \{map.len(ages)}")
+    match map.get(ages, "alice") {
+        Some(age) => io.println("alice -> \{age}"),
+        None => io.println("alice: not found"),
+    }
+    match map.get(ages, "doug") {
+        Some(age) => io.println("doug -> \{age}"),
+        None => io.println("doug: not found"),
+    }
+    io.println("has bob? \{map.contains(ages, "bob")}")
+    ages = map.remove(ages, "bob")
+    io.println("after remove, has bob? \{map.contains(ages, "bob")}")
+
+    // println_universal
+    section("universal print")
+    io.println(42)
+    io.println(3.14)
+    io.println(true)
+    let p: Point = Point { x: 10.5, y: 20.25 }
+    io.println(p)
+    io.println((1, "two", 3.0))
+
+    // interp_demo
+    section("interpolation")
+    let name: string = "Alice"
+    let age: i32 = 30
+    io.println("Hello, \{name}!")
+    io.println("\{name} is \{age} years old")
+    io.println("sum = \{1 + 2 + 3}, product = \{2 * 21}")
+    io.println("not interpolated: \\{name}")
+
+    // file_io (writes to a deterministic /tmp path; cleaned up by
+    // the integration test wrapper before the next run)
+    section("file io")
+    let path: string = "/tmp/lumen_kitchen_sink.txt"
+    let body: bytes = bytes.from_string("hello from kitchen sink\n")
+    match fs.write_file(path, body) {
+        Ok(_) => io.println("wrote ok"),
+        Err(e) => io.println("write failed: \{e}"),
+    }
+    match fs.read_file(path) {
+        Ok(b) => io.println("read back: \{string.from_bytes(b)}"),
+        Err(e) => io.println("read failed: \{e}"),
+    }
+    match fs.read_file("/no/such/file") {
+        Ok(_) => io.println("unexpected"),
+        Err(e) => io.println("expected ENOENT: errno=\{e}"),
+    }
+
+    // actors
+    section("actors")
+    let acc = spawn Counter { count: 0 }
+    send acc.add(10)
+    send acc.add(5)
+    io.println("counter = \{ask acc.get()}")
+
+    // multi_actor
+    section("multi actor")
+    let a = spawn Counter { count: 0 }
+    let b = spawn Counter { count: 100 }
+    send a.add(10)
+    send b.add(20)
+    send a.add(5)
+    send b.add(30)
+    io.println("a = \{ask a.get()}")
+    io.println("b = \{ask b.get()}")
+
+    return 0
+}

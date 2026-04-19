@@ -803,7 +803,12 @@ void lumen_io_str(int64_t ptr) {
     fwrite(buf + 4, 1, len, stdout);
 }
 void lumen_io_raw(const char *s, int32_t len) { fwrite(s, 1, len, stdout); }
-void lumen_io_newline(void) { fputc('\n', stdout); }
+// Flush in newline so io.println output stays in order with lumen_println
+// (which writes via raw write(1, ...) and bypasses stdio buffering).
+// Without this, when stdout is a pipe (e.g. piped into a test harness),
+// fprintf-buffered io_* output and write-direct lumen_println output
+// interleave out of order.
+void lumen_io_newline(void) { fputc('\n', stdout); fflush(stdout); }
 
 // --- String-buffer helpers (string interpolation) ------------------------
 // A growable byte buffer used to assemble interpolated strings. After all
