@@ -1514,6 +1514,16 @@ impl<'a> FnChecker<'a> {
                 }
                 return Some(Ty::Unit);
             }
+            // io.println accepts any type, returns unit, requires io effect.
+            ("io", "println") => {
+                self.check_effect(Effect::Io, span);
+                if args.len() != 1 {
+                    self.errors.push(TypeError { span, message: "`io.println` expects 1 arg".into() });
+                } else {
+                    self.infer_expr(&args[0].value);
+                }
+                return Some(Ty::Unit);
+            }
             ("list", "new") => {
                 return Some(Ty::List(Box::new(Ty::Error)));
             }

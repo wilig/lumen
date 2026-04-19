@@ -789,6 +789,22 @@ void lumen_debug_str(int64_t ptr) {
 void lumen_debug_raw(const char *s, int32_t len) { fwrite(s, 1, len, stderr); }
 void lumen_debug_newline(void) { fprintf(stderr, "\n"); }
 
+// --- io.println formatting primitives (output to stdout) -----------------
+// Mirror the debug.* primitives but write to stdout and DO NOT wrap strings
+// in quotes (println should print the string content directly).
+void lumen_io_i32(int32_t v) { fprintf(stdout, "%d", v); }
+void lumen_io_i64(int64_t v) { fprintf(stdout, "%lld", (long long)v); }
+void lumen_io_f64(double v) { fprintf(stdout, "%g", v); }
+void lumen_io_bool(int32_t v) { fputs(v ? "true" : "false", stdout); }
+void lumen_io_str(int64_t ptr) {
+    if (ptr == 0) return;
+    char *buf = (char *)(uintptr_t)ptr;
+    int32_t len = *(int32_t *)buf;
+    fwrite(buf + 4, 1, len, stdout);
+}
+void lumen_io_raw(const char *s, int32_t len) { fwrite(s, 1, len, stdout); }
+void lumen_io_newline(void) { fputc('\n', stdout); }
+
 // --- assert builtin ------------------------------------------------------
 // cond: 0 = fail, nonzero = pass.
 // msg_ptr: optional Lumen string (0 if absent).

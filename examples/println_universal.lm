@@ -1,0 +1,30 @@
+import std/io
+import std/list
+
+type Point = { x: f64, y: f64 }
+
+fn main(): i32 io {
+    // Strings still go through the fast path.
+    io.println("hello")
+
+    // Scalars now work directly.
+    io.println(42)
+    io.println(3.14)
+    io.println(true)
+    io.println(false)
+
+    // Structs print field-by-field.
+    let p: Point = Point { x: 10.5, y: 20.25 }
+    io.println(p)
+
+    // Tuples and lists.
+    io.println((1, "two", 3.0))
+
+    var xs: List<i32> = list.new()
+    xs = list.push(xs, 1)
+    xs = list.push(xs, 2)
+    xs = list.push(xs, 3)
+    io.println(xs)
+
+    return 0
+}
