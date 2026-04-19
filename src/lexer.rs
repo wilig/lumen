@@ -76,9 +76,12 @@ pub enum TokenKind {
     FatArrow, // =>
 
     // --- Operators --------------------------------------------------------
-    Eq,    // =
-    EqEq,  // ==
-    NotEq, // !=
+    Eq,      // =
+    PlusEq,  // +=
+    MinusEq, // -=
+    StarEq,  // *=
+    EqEq,    // ==
+    NotEq,   // !=
     Lt,
     Gt,
     LtEq,
@@ -201,6 +204,26 @@ impl<'a> Lexer<'a> {
                         self.bump();
                     }
                 }
+                Some(b'/') if self.peek_at(1) == Some(b'*') => {
+                    // Block comment: /* ... */ (supports nesting).
+                    self.bump(); // /
+                    self.bump(); // *
+                    let mut depth = 1u32;
+                    while depth > 0 {
+                        match self.peek() {
+                            None => break, // unterminated — lexer will hit EOF
+                            Some(b'/') if self.peek_at(1) == Some(b'*') => {
+                                self.bump(); self.bump();
+                                depth += 1;
+                            }
+                            Some(b'*') if self.peek_at(1) == Some(b'/') => {
+                                self.bump(); self.bump();
+                                depth -= 1;
+                            }
+                            _ => { self.bump(); }
+                        }
+                    }
+                }
                 _ => return,
             }
         }
@@ -292,15 +315,19 @@ impl<'a> Lexer<'a> {
                 }
                 _ => TokenKind::Gt,
             },
-            b'+' => TokenKind::Plus,
+            b'+' => match self.peek() {
+                Some(b'=') => { self.bump(); TokenKind::PlusEq }
+                _ => TokenKind::Plus,
+            },
             b'-' => match self.peek() {
-                Some(b'>') => {
-                    self.bump();
-                    TokenKind::Arrow
-                }
+                Some(b'>') => { self.bump(); TokenKind::Arrow }
+                Some(b'=') => { self.bump(); TokenKind::MinusEq }
                 _ => TokenKind::Minus,
             },
-            b'*' => TokenKind::Star,
+            b'*' => match self.peek() {
+                Some(b'=') => { self.bump(); TokenKind::StarEq }
+                _ => TokenKind::Star,
+            },
             b'/' => TokenKind::Slash,
             b'%' => TokenKind::Percent,
             _ => {

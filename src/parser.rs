@@ -565,13 +565,13 @@ impl Parser {
         }
     }
 
-    /// True iff the current token is an IDENT followed by a bare `=` (not
-    /// `==`, `=>`).
+    /// True iff the current token is an IDENT followed by `=`, `+=`, `-=`,
+    /// or `*=` (not `==`, `=>`).
     fn is_assign_ahead(&self) -> bool {
         let Some(next) = self.peek_at(1) else {
             return false;
         };
-        matches!(next.kind, TokenKind::Eq)
+        matches!(next.kind, TokenKind::Eq | TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq)
     }
 
     fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -632,8 +632,25 @@ impl Parser {
 
     fn parse_assign_stmt(&mut self) -> Result<Stmt, ParseError> {
         let (name, name_span) = self.expect_ident("assignment target")?;
-        self.expect(&TokenKind::Eq, "`=` in assignment")?;
-        let value = self.parse_expr(ExprCtx::normal())?;
+        // Check for compound assignment (+=, -=, *=) and desugar.
+        let compound_op = match self.peek_kind() {
+            TokenKind::PlusEq => { self.bump(); Some(BinOp::Add) }
+            TokenKind::MinusEq => { self.bump(); Some(BinOp::Sub) }
+            TokenKind::StarEq => { self.bump(); Some(BinOp::Mul) }
+            _ => { self.expect(&TokenKind::Eq, "`=` in assignment")?; None }
+        };
+        let rhs = self.parse_expr(ExprCtx::normal())?;
+        let value = if let Some(op) = compound_op {
+            // Desugar: `x += e` → `x = x + e`
+            let lhs = Expr { kind: ExprKind::Ident(name.clone()), span: name_span };
+            let span = merge(name_span, rhs.span);
+            Expr {
+                kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                span,
+            }
+        } else {
+            rhs
+        };
         let span = merge(name_span, value.span);
         Ok(Stmt {
             kind: StmtKind::Assign { name, value },
@@ -770,10 +787,19 @@ impl Parser {
         let cond = self.parse_expr(ExprCtx::no_struct())?;
         let then_block = self.parse_block()?;
         // else is optional: `if cond { ... }` without else has unit type.
+        // `else if` is sugar: parsed as `else { if ... }`.
         let (else_block, end_span) = if self.eat(&TokenKind::Else).is_some() {
-            let eb = self.parse_block()?;
-            let sp = eb.span;
-            (eb, sp)
+            if matches!(self.peek_kind(), TokenKind::If) {
+                // else-if chain: parse nested if as the else block's tail.
+                let nested_if = self.parse_if_expr()?;
+                let sp = nested_if.span;
+                let eb = Block { stmts: Vec::new(), tail: Some(Box::new(nested_if)), span: sp };
+                (eb, sp)
+            } else {
+                let eb = self.parse_block()?;
+                let sp = eb.span;
+                (eb, sp)
+            }
         } else {
             (Block { stmts: Vec::new(), tail: None, span: then_block.span }, then_block.span)
         };
@@ -1453,6 +1479,9 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::Arrow => "`->`".into(),
         TokenKind::FatArrow => "`=>`".into(),
         TokenKind::Eq => "`=`".into(),
+        TokenKind::PlusEq => "`+=`".into(),
+        TokenKind::MinusEq => "`-=`".into(),
+        TokenKind::StarEq => "`*=`".into(),
         TokenKind::EqEq => "`==`".into(),
         TokenKind::NotEq => "`!=`".into(),
         TokenKind::Lt => "`<`".into(),
@@ -1864,5 +1893,39 @@ mod tests {
         let Item::Fn(f) = &m.items[0] else { panic!() };
         let StmtKind::Let { value, .. } = &f.body.stmts[0].kind else { panic!() };
         assert!(matches!(value.kind, ExprKind::Try(_)));
+    }
+
+    #[test]
+    fn else_if_chain_parses() {
+        let m = parse_ok("fn f(x: i32): i32 { if x == 1 { 10 } else if x == 2 { 20 } else { 30 } }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        let tail = f.body.tail.as_ref().unwrap();
+        let ExprKind::If { else_block, .. } = &tail.kind else { panic!() };
+        // else block's tail should be a nested if
+        let nested = else_block.tail.as_ref().unwrap();
+        assert!(matches!(nested.kind, ExprKind::If { .. }));
+    }
+
+    #[test]
+    fn compound_assignment_parses() {
+        let m = parse_ok("fn f(): i32 { var x = 0 \n x += 5 \n x -= 2 \n x *= 3 \n return x }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        // x += 5 desugars to x = x + 5
+        let StmtKind::Assign { value, .. } = &f.body.stmts[1].kind else { panic!() };
+        assert!(matches!(value.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn block_comment_skipped() {
+        let m = parse_ok("fn f(): i32 { /* this is a comment */ 42 }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        assert!(f.body.tail.is_some());
+    }
+
+    #[test]
+    fn nested_block_comment_skipped() {
+        let m = parse_ok("fn f(): i32 { /* outer /* nested */ still comment */ 42 }");
+        let Item::Fn(f) = &m.items[0] else { panic!() };
+        assert!(f.body.tail.is_some());
     }
 }

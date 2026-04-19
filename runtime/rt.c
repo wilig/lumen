@@ -428,7 +428,8 @@ static void gt_entry(unsigned int lo, unsigned int hi) {
     swapcontext(&gt_pool[gt_current].ctx, &gt_sched_ctx);
 }
 
-static void gt_spawn(void (*fn)(int), int arg) {
+// Returns 0 on success, -1 if no free thread slot.
+static int gt_spawn(void (*fn)(int), int arg) {
     gt_init();
     int id = -1;
     for (int i = 0; i < GT_MAX; i++) {
@@ -436,7 +437,7 @@ static void gt_spawn(void (*fn)(int), int arg) {
             id = i; break;
         }
     }
-    if (id < 0) return;
+    if (id < 0) return -1;
 
     if (gt_pool[id].stack) free(gt_pool[id].stack);
     gt_pool[id].stack = malloc(GT_STACK_SIZE);
@@ -455,6 +456,7 @@ static void gt_spawn(void (*fn)(int), int arg) {
     makecontext(&gt_pool[id].ctx, (void (*)())gt_entry,
                 2, (unsigned int)(ptr & 0xFFFFFFFF), (unsigned int)(ptr >> 32));
     if (id >= gt_count) gt_count = id + 1;
+    return 0;
 }
 
 // Portable event flag constants for callsites below.
@@ -548,7 +550,10 @@ static void gt_accept_loop(int server_fd) {
             break;
         }
         fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK);
-        gt_spawn(gt_connection_handler, client);
+        if (gt_spawn(gt_connection_handler, client) < 0) {
+            fprintf(stderr, "warning: all green thread slots full, dropping connection\n");
+            close(client);
+        }
     }
 }
 
