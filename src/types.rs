@@ -214,7 +214,13 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
                 }).collect();
                 let ret = resolve_type(&ef.return_type, &info.types).unwrap_or(Ty::Error);
-                let sig = FnSig { params, ret, effect: Effect::Pure };
+                // io and net modules have io effect.
+                let effect = if imp.name == "io" || imp.name == "net" {
+                    Effect::Io
+                } else {
+                    Effect::Pure
+                };
+                let sig = FnSig { params, ret, effect };
                 if let Some(link) = &ef.link_name {
                     mod_links.insert(ef.name.clone(), link.clone());
                 } else {
@@ -1496,187 +1502,19 @@ impl<'a> FnChecker<'a> {
         args: &[Arg],
         span: Span,
     ) -> Option<Ty> {
+        // --- Special cases: list type inference ---
         match (module, method) {
-            ("int", "to_string_i32") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!(
-                            "`int.to_string_i32` expects 1 argument, found {}",
-                            args.len()
-                        ),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::String)
-            }
-            ("io", "println") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!(
-                            "`io.println` expects 1 argument, found {}",
-                            args.len()
-                        ),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::String);
-                }
-                Some(Ty::Unit)
-            }
-            ("bytes", "len") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`bytes.len` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::Bytes);
-                }
-                Some(Ty::I32)
-            }
-            ("bytes", "new") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`bytes.new` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::Bytes)
-            }
-            ("bytes", "get") => {
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`bytes.get` expects 2 arguments, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::Bytes);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("bytes", "concat") => {
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`bytes.concat` expects 2 arguments, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::Bytes);
-                    self.check_expr(&args[1].value, &Ty::Bytes);
-                }
-                Some(Ty::Bytes)
-            }
-            ("bytes", "from_string") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`bytes.from_string` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::String);
-                }
-                Some(Ty::Bytes)
-            }
-            ("string", "from_bytes") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`string.from_bytes` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::Bytes);
-                }
-                Some(Ty::String)
-            }
-            ("net", "tcp_listen") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.tcp_listen` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("net", "tcp_accept") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.tcp_accept` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("net", "tcp_read") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.tcp_read` expects 2 arguments, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                }
-                Some(Ty::Bytes)
-            }
-            ("net", "tcp_write") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.tcp_write` expects 2 arguments, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::Bytes);
-                }
-                Some(Ty::I32)
-            }
-            ("net", "serve") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.serve` expects 2 arguments (port, handler), found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    // Second arg is a function name — type-check it as an ident.
-                    // The codegen will resolve it to a func_addr.
-                }
-                Some(Ty::Unit)
-            }
-            // --- List operations ---
             ("list", "new") => {
-                Some(Ty::List(Box::new(Ty::Error)))
-            }
-            ("list", "len") => {
-                if args.len() != 1 { self.errors.push(TypeError { span, message: "`list.len` expects 1 arg".into() }); }
-                Some(Ty::I32)
+                return Some(Ty::List(Box::new(Ty::Error)));
             }
             ("list", "push") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.push` expects 2 args".into() }); }
-                // Infer element type from the second arg to refine List<Error>.
                 let list_ty = args.first().map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::List(Box::new(Ty::Error)));
                 let elem_ty = args.get(1).map(|a| self.infer_expr(&a.value));
-                match (&list_ty, elem_ty) {
-                    (Ty::List(inner), Some(et)) if matches!(**inner, Ty::Error) => {
-                        Some(Ty::List(Box::new(et)))
-                    }
+                return match (&list_ty, elem_ty) {
+                    (Ty::List(inner), Some(et)) if matches!(**inner, Ty::Error) => Some(Ty::List(Box::new(et))),
                     _ => Some(list_ty),
-                }
+                };
             }
             ("list", "get") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.get` expects 2 args".into() }); }
@@ -1688,336 +1526,40 @@ impl<'a> FnChecker<'a> {
                         }
                     }
                 }
-                // Return Error: compatible with any type, so field access
-                // on list elements works without proper generic tracking.
-                Some(Ty::Error)
+                return Some(Ty::Error);
             }
-            ("list", "set") => {
-                if args.len() != 3 { self.errors.push(TypeError { span, message: "`list.set` expects 3 args".into() }); }
-                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
-                Some(Ty::List(Box::new(Ty::Error)))
-            }
-            ("list", "remove") => {
-                if args.len() != 2 { self.errors.push(TypeError { span, message: "`list.remove` expects 2 args".into() }); }
-                if let Some(a) = args.first() { return Some(self.infer_expr(&a.value)); }
-                Some(Ty::List(Box::new(Ty::Error)))
-            }
-            ("net", "gt_read") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 2 {
-                    self.errors.push(TypeError { span, message: format!("`net.gt_read` expects 2 args, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                }
-                Some(Ty::Bytes)
-            }
-            ("net", "gt_write") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 2 {
-                    self.errors.push(TypeError { span, message: format!("`net.gt_write` expects 2 args, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::Bytes);
-                }
-                Some(Ty::I32)
-            }
-            ("net", "tcp_close") => {
-                self.check_effect(Effect::Io, span);
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!("`net.tcp_close` expects 1 argument, found {}", args.len()),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("http", "parse_method") | ("http", "parse_path") | ("http", "parse_body") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!(
-                            "`http.{method}` expects 1 argument, found {}",
-                            args.len()
-                        ),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::Bytes);
-                }
-                Some(Ty::String)
-            }
-            ("http", "format_response") => {
-                if args.len() != 2 {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!(
-                            "`http.format_response` expects 2 arguments, found {}",
-                            args.len()
-                        ),
-                    });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::String);
-                }
-                Some(Ty::Bytes)
-            }
-            // --- Raylib: Window ---
             ("rl", _) if !self.module.imports.iter().any(|i| i == "std/rl" || i == "std/raylib") => {
                 self.errors.push(TypeError {
                     span,
                     message: format!("`rl.{method}` requires `import std/rl`"),
                 });
-                None
+                return None;
             }
-            ("rl", "init_window") => {
-                if args.len() != 3 {
-                    self.errors.push(TypeError { span, message: format!("`rl.init_window` expects 3 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                    self.check_expr(&args[2].value, &Ty::String);
+            _ => {}
+        }
+        // --- Data-driven lookup from imported module .lm files ---
+        if let Some(mod_fns) = self.module.modules.get(module) {
+            if let Some(sig) = mod_fns.get(method) {
+                if sig.effect == Effect::Io {
+                    self.check_effect(Effect::Io, span);
                 }
-                Some(Ty::Unit)
-            }
-            ("rl", "close_window") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.close_window` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            ("rl", "window_should_close") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.window_should_close` expects 0 arguments".into() }); }
-                Some(Ty::I32)
-            }
-            ("rl", "set_target_fps") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`rl.set_target_fps` expects 1 argument, found {}", args.len()) });
+                if args.len() != sig.params.len() {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "`{module}.{method}` expects {} args, found {}",
+                            sig.params.len(), args.len()
+                        ),
+                    });
                 } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "get_frame_time") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.get_frame_time` expects 0 arguments".into() }); }
-                Some(Ty::F64)
-            }
-            // --- Raylib: Drawing ---
-            ("rl", "begin_drawing") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.begin_drawing` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            ("rl", "end_drawing") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.end_drawing` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            ("rl", "clear_background") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`rl.clear_background` expects 1 argument, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "draw_text") => {
-                if args.len() != 5 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_text` expects 5 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::String);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                    self.check_expr(&args[2].value, &Ty::I32);
-                    self.check_expr(&args[3].value, &Ty::I32);
-                    self.check_expr(&args[4].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "measure_text") => {
-                if args.len() != 2 {
-                    self.errors.push(TypeError { span, message: format!("`rl.measure_text` expects 2 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::String);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("rl", "draw_rect") => {
-                if args.len() != 5 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect` expects 5 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                    self.check_expr(&args[2].value, &Ty::F64);
-                    self.check_expr(&args[3].value, &Ty::F64);
-                    self.check_expr(&args[4].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "draw_rect_i") => {
-                if args.len() != 5 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect_i` expects 5 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                    self.check_expr(&args[2].value, &Ty::I32);
-                    self.check_expr(&args[3].value, &Ty::I32);
-                    self.check_expr(&args[4].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "draw_rect_pro") => {
-                if args.len() != 8 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_rect_pro` expects 8 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                    self.check_expr(&args[2].value, &Ty::F64);
-                    self.check_expr(&args[3].value, &Ty::F64);
-                    self.check_expr(&args[4].value, &Ty::F64);
-                    self.check_expr(&args[5].value, &Ty::F64);
-                    self.check_expr(&args[6].value, &Ty::F64);
-                    self.check_expr(&args[7].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "draw_circle") => {
-                if args.len() != 4 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_circle` expects 4 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                    self.check_expr(&args[2].value, &Ty::F64);
-                    self.check_expr(&args[3].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "draw_line") => {
-                if args.len() != 5 {
-                    self.errors.push(TypeError { span, message: format!("`rl.draw_line` expects 5 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::I32);
-                    self.check_expr(&args[2].value, &Ty::I32);
-                    self.check_expr(&args[3].value, &Ty::I32);
-                    self.check_expr(&args[4].value, &Ty::I32);
-                }
-                Some(Ty::Unit)
-            }
-            // --- Raylib: Input ---
-            ("rl", "is_key_pressed") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`rl.is_key_pressed` expects 1 argument, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("rl", "is_key_down") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`rl.is_key_down` expects 1 argument, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            ("rl", "is_gesture_detected") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`rl.is_gesture_detected` expects 1 argument, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                }
-                Some(Ty::I32)
-            }
-            // --- Raylib: Camera ---
-            ("rl", "set_camera") => {
-                if args.len() != 6 {
-                    self.errors.push(TypeError { span, message: format!("`rl.set_camera` expects 6 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                    self.check_expr(&args[2].value, &Ty::F64);
-                    self.check_expr(&args[3].value, &Ty::F64);
-                    self.check_expr(&args[4].value, &Ty::F64);
-                    self.check_expr(&args[5].value, &Ty::F64);
-                }
-                Some(Ty::Unit)
-            }
-            ("rl", "begin_mode_2d") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.begin_mode_2d` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            ("rl", "end_mode_2d") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.end_mode_2d` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            // --- Raylib: Audio ---
-            ("rl", "init_audio") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`rl.init_audio` expects 0 arguments".into() }); }
-                Some(Ty::Unit)
-            }
-            // --- Raylib: Colors ---
-            ("rl", "black") | ("rl", "white") | ("rl", "red") | ("rl", "green")
-            | ("rl", "blue") | ("rl", "yellow") | ("rl", "purple")
-            | ("rl", "darkblue") | ("rl", "darkgray") | ("rl", "gray") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: format!("`rl.{method}` expects 0 arguments") }); }
-                Some(Ty::I32)
-            }
-            ("rl", "color_alpha") => {
-                if args.len() != 2 {
-                    self.errors.push(TypeError { span, message: format!("`rl.color_alpha` expects 2 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::I32);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                }
-                Some(Ty::I32)
-            }
-            // --- Math ---
-            ("math", "sqrt") | ("math", "abs") | ("math", "cos") | ("math", "sin") => {
-                if args.len() != 1 {
-                    self.errors.push(TypeError { span, message: format!("`math.{method}` expects 1 argument, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                }
-                Some(Ty::F64)
-            }
-            ("math", "clamp") => {
-                if args.len() != 3 {
-                    self.errors.push(TypeError { span, message: format!("`math.clamp` expects 3 arguments, found {}", args.len()) });
-                } else {
-                    self.check_expr(&args[0].value, &Ty::F64);
-                    self.check_expr(&args[1].value, &Ty::F64);
-                    self.check_expr(&args[2].value, &Ty::F64);
-                }
-                Some(Ty::F64)
-            }
-            ("math", "rand") => {
-                if !args.is_empty() { self.errors.push(TypeError { span, message: "`math.rand` expects 0 arguments".into() }); }
-                Some(Ty::F64)
-            }
-            _ => {
-                // Fall through to imported module lookup.
-                if let Some(mod_fns) = self.module.modules.get(module) {
-                    if let Some(sig) = mod_fns.get(method) {
-                        if sig.effect == Effect::Io {
-                            self.check_effect(Effect::Io, span);
-                        }
-                        if args.len() != sig.params.len() {
-                            self.errors.push(TypeError {
-                                span,
-                                message: format!(
-                                    "`{module}.{method}` expects {} args, found {}",
-                                    sig.params.len(), args.len()
-                                ),
-                            });
-                        } else {
-                            for (i, (_, pty)) in sig.params.iter().enumerate() {
-                                self.check_expr(&args[i].value, pty);
-                            }
-                        }
-                        return Some(sig.ret.clone());
+                    for (i, (_, pty)) in sig.params.iter().enumerate() {
+                        self.check_expr(&args[i].value, pty);
                     }
                 }
-                None
+                return Some(sig.ret.clone());
             }
         }
+        None
     }
 
     /// Check that the current function's effect allows calling a function
@@ -2621,7 +2163,20 @@ mod tests {
     fn tc(src: &str) -> Result<ModuleInfo, Vec<TypeError>> {
         let toks = lex(src).unwrap();
         let m = parse(toks).unwrap();
-        typecheck(&m, &[])
+        // Resolve imports from std/ directory so tests can use module calls.
+        let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
+        let mut imported = Vec::new();
+        for imp in &m.imports {
+            let mod_name = imp.path.last().cloned().unwrap_or_default();
+            let mod_path = std_dir.join(format!("{mod_name}.lm"));
+            if mod_path.exists() {
+                let mod_src = std::fs::read_to_string(&mod_path).unwrap();
+                let mod_tokens = lex(&mod_src).unwrap();
+                let mod_ast = parse(mod_tokens).unwrap();
+                imported.push(ParsedImport { name: mod_name, module: mod_ast });
+            }
+        }
+        typecheck(&m, &imported)
     }
 
     fn tc_ok(src: &str) {
@@ -3030,11 +2585,12 @@ mod tests {
 
     #[test]
     fn math_module_returns_f64() {
-        tc_ok("fn f(): f64 { return math.sqrt(4.0) + math.abs(1.0 - 3.0) }");
+        tc_ok("import std/math \n fn f(): f64 { return math.sqrt(4.0) + math.abs(1.0 - 3.0) }");
     }
 
     #[test]
     fn int_module_returns_string() {
-        tc_ok(r#"fn f(): string { return int.to_string_i32(42) }"#);
+        tc_ok(r#"import std/int
+        fn f(): string { return int.to_string_i32(42) }"#);
     }
 }
