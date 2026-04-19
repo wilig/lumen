@@ -1,0 +1,35 @@
+// File system operations.
+//
+// File contents are exchanged as `bytes` so binary files (images, archives,
+// non-UTF-8 text) work without lossy reinterpretation. Convert to `string`
+// at the call site with `string.from_bytes(b)` when you want text.
+//
+// Errors are returned as POSIX errno values inside the Err arm. Common ones:
+//   2  ENOENT       no such file
+//   13 EACCES       permission denied
+//   21 EISDIR       is a directory
+//   28 ENOSPC       no space left on device
+//   36 ENAMETOOLONG path too long
+
+extern fn _read(path: string): bytes link "lumen_fs_read"
+extern fn _errno(): i32 link "lumen_fs_errno"
+extern fn _write(path: string, content: bytes): i32 link "lumen_fs_write"
+
+// Read the entire contents of `path` as bytes.
+fn read_file(path: string): Result<bytes, i32> io {
+    let b: bytes = _read(path)
+    let e: i32 = _errno()
+    if e != 0 {
+        return Err(e)
+    }
+    return Ok(b)
+}
+
+// Write `content` to `path`, replacing it if it exists.
+fn write_file(path: string, content: bytes): Result<unit, i32> io {
+    let e: i32 = _write(path, content)
+    if e != 0 {
+        return Err(e)
+    }
+    return Ok(unit)
+}

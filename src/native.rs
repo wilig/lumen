@@ -2645,6 +2645,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     ) -> Result<Value, NativeError> {
         let val = self.compile_expr(value)?;
         let ty = self.infer_ty(value)?;
+        // Pointer-typed payloads gain a new owner (the field block), so
+        // rc_incr to balance the eventual scope-exit decrement of `val`'s
+        // local binding. Without this the wrapped value is freed before
+        // the caller can match on it.
+        if !is_scalar(&ty) {
+            self.emit_rc_incr(val);
+        }
         let size = native_sizeof(&ty);
         let field_ptr = self.rc_alloc(size as i64)?;
         self.builder.ins().store(MemFlags::new(), val, field_ptr, 0);
@@ -2817,6 +2824,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
                 self.names.insert(bind_name.clone(), var);
+                self.name_types.insert(bind_name.clone(), fty);
             }
         }
         Ok(())
@@ -3142,6 +3150,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     if let Some(sig) = self.cg.info.fns.get(name) {
                         return Ok(sig.ret.clone());
+                    }
+                    // Unqualified call inside an imported module wrapper:
+                    // search the imported module sigs for the same name.
+                    for (_mod, mod_fns) in &self.cg.info.modules {
+                        if let Some(sig) = mod_fns.get(name) {
+                            return Ok(sig.ret.clone());
+                        }
                     }
                     if let Some(sum_name) = self.find_sum_for_variant(name) {
                         return Ok(Ty::User(sum_name));

@@ -912,3 +912,87 @@ void lumen_assert(int32_t cond, int64_t msg_ptr, int64_t file_ptr,
     }
     abort();
 }
+
+// --- File I/O ------------------------------------------------------------
+// All errors are reported as POSIX errno values; 0 means success.
+//
+// lumen_fs_read(path) returns the file contents as an rc_alloc'd Lumen
+// string (rc=1) on success, or 0 on failure. After every call, the most
+// recent errno is available via lumen_fs_errno() — the std/fs Lumen
+// wrapper checks this immediately and turns the pair into a Result.
+//
+// Single-OS-thread assumption: Lumen runs on cooperative green threads
+// today, so a static is safe. Switch to thread_local if/when that changes.
+
+static int32_t lumen_last_fs_errno = 0;
+
+int32_t lumen_fs_errno(void) { return lumen_last_fs_errno; }
+
+// Copy a Lumen string into a NUL-terminated C path buffer. Returns 0 on
+// success, sets errno and returns -1 if the path is missing or too long.
+static int lumen_fs_path_to_cstr(int64_t path_ptr, char *out, size_t out_size) {
+    if (path_ptr == 0) { errno = EINVAL; return -1; }
+    char *src = (char *)(uintptr_t)path_ptr;
+    int32_t len = *(int32_t *)src;
+    if (len < 0 || (size_t)len + 1 > out_size) { errno = ENAMETOOLONG; return -1; }
+    memcpy(out, src + 4, (size_t)len);
+    out[len] = 0;
+    return 0;
+}
+
+int64_t lumen_fs_read(int64_t path_ptr) {
+    char path[4096];
+    if (lumen_fs_path_to_cstr(path_ptr, path, sizeof(path)) != 0) {
+        lumen_last_fs_errno = errno;
+        return 0;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) { lumen_last_fs_errno = errno; return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) { lumen_last_fs_errno = errno; fclose(f); return 0; }
+    long size = ftell(f);
+    if (size < 0) { lumen_last_fs_errno = errno; fclose(f); return 0; }
+    rewind(f);
+
+    char *raw = (char *)malloc(8 + 4 + (size_t)size);
+    if (!raw) { lumen_last_fs_errno = ENOMEM; fclose(f); return 0; }
+    *(int32_t *)(raw + 0) = 1;            // rc
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic "LUME"
+    char *payload = raw + 8;
+    *(int32_t *)payload = (int32_t)size;
+    if (size > 0) {
+        size_t got = fread(payload + 4, 1, (size_t)size, f);
+        if (got != (size_t)size) {
+            int e = ferror(f) ? errno : EIO;
+            free(raw);
+            fclose(f);
+            lumen_last_fs_errno = e ? e : EIO;
+            return 0;
+        }
+    }
+    fclose(f);
+    lumen_last_fs_errno = 0;
+    return (int64_t)(uintptr_t)payload;
+}
+
+int32_t lumen_fs_write(int64_t path_ptr, int64_t content_ptr) {
+    char path[4096];
+    if (lumen_fs_path_to_cstr(path_ptr, path, sizeof(path)) != 0) {
+        return errno;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) return errno;
+    if (content_ptr != 0) {
+        char *src = (char *)(uintptr_t)content_ptr;
+        int32_t len = *(int32_t *)src;
+        if (len > 0) {
+            size_t put = fwrite(src + 4, 1, (size_t)len, f);
+            if (put != (size_t)len) {
+                int e = ferror(f) ? errno : EIO;
+                fclose(f);
+                return e ? e : EIO;
+            }
+        }
+    }
+    if (fclose(f) != 0) return errno;
+    return 0;
+}

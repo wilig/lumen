@@ -1,0 +1,35 @@
+import std/io
+import std/fs
+import std/bytes
+import std/string
+
+fn main(): i32 io {
+    let path: string = "/tmp/lumen_fs_demo.txt"
+    let body: bytes = bytes.from_string("Hello from Lumen!\nLine two.\n")
+
+    let w_err: i32 = match fs.write_file(path, body) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+    if w_err != 0 {
+        io.println("write failed: errno=\{w_err}")
+        return 1
+    }
+    io.println("wrote \{path}")
+
+    match fs.read_file(path) {
+        Ok(b) => {
+            let text: string = string.from_bytes(b)
+            io.println("read back:\n\{text}")
+        },
+        Err(e) => io.println("read failed: errno=\{e}"),
+    }
+
+    // Expected error: nonexistent file → ENOENT (errno 2 on Linux).
+    match fs.read_file("/no/such/file") {
+        Ok(_) => io.println("unexpected: read succeeded"),
+        Err(e) => io.println("expected ENOENT: errno=\{e}"),
+    }
+
+    return 0
+}
