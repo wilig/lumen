@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <signal.h>
 #include <math.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -705,6 +706,58 @@ int64_t lumen_concat(int64_t a_ptr, int64_t b_ptr) {
     if (a_len > 0) memcpy(payload + 4, a + 4, a_len);
     if (b_len > 0) memcpy(payload + 4 + a_len, b + 4, b_len);
     return (int64_t)(uintptr_t)payload;
+}
+
+// --- debug.print primitives (output to stderr) ---------------------------
+
+// --- Crash handler for --debug mode --------------------------------------
+
+// The frame chain is a global linked list. We declare it as extern here
+// since it's defined in the Cranelift-generated object.
+extern char *lumen_frame_chain;
+
+static void lumen_crash_handler(int sig) {
+    const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : "signal";
+    fprintf(stderr, "\n--- CRASH: %s ---\nStack trace:\n", name);
+    // Use the debug stack (array-based, set by lumen_debug_push/pop).
+    void lumen_debug_print_stack(void);
+    lumen_debug_print_stack();
+    fprintf(stderr, "---\n");
+    _exit(128 + sig);
+}
+
+// Called at program start in --debug mode to install the crash handler.
+void lumen_debug_init(void) {
+    signal(SIGSEGV, lumen_crash_handler);
+    signal(SIGABRT, lumen_crash_handler);
+}
+
+// Debug frame stack: fixed-size array of message pointers.
+// Much cheaper than linked-list allocation — just a pointer bump.
+#define DEBUG_STACK_MAX 4096
+static int64_t debug_stack[DEBUG_STACK_MAX];
+static int32_t debug_stack_top = 0;
+
+void lumen_debug_push(int64_t msg_ptr) {
+    if (debug_stack_top < DEBUG_STACK_MAX) {
+        debug_stack[debug_stack_top++] = msg_ptr;
+    }
+}
+
+void lumen_debug_pop(void) {
+    if (debug_stack_top > 0) debug_stack_top--;
+}
+
+// Print the debug stack (called by crash handler instead of frame_chain).
+void lumen_debug_print_stack(void) {
+    for (int i = debug_stack_top - 1; i >= 0; i--) {
+        char *msg = (char *)(uintptr_t)debug_stack[i];
+        if (msg) {
+            int32_t len = *(int32_t *)msg;
+            fwrite(msg + 4, 1, len, stderr);
+            fputc('\n', stderr);
+        }
+    }
 }
 
 // --- debug.print primitives (output to stderr) ---------------------------

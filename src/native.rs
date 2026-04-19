@@ -31,8 +31,10 @@ pub fn compile_native(
     module: &ast::Module,
     info: &ModuleInfo,
     imported_modules: &[(&str, &ast::Module)],
+    debug: bool,
 ) -> Result<Vec<u8>, NativeError> {
     let mut cg = NativeCodegen::new(info)?;
+    cg.debug_mode = debug;
     cg.compile_module(module, imported_modules)?;
     Ok(cg.finish())
 }
@@ -84,6 +86,9 @@ struct NativeCodegen<'a> {
     debug_str: FuncId,
     debug_raw: FuncId,
     debug_newline: FuncId,
+    debug_init: FuncId,
+    debug_push: FuncId,
+    debug_pop: FuncId,
     debug_data_counter: usize,
 
     /// Per-actor dispatch function IDs (actor_name → FuncId).
@@ -109,6 +114,8 @@ struct NativeCodegen<'a> {
 
     /// Uses WASI / io module.
     uses_io: bool,
+    /// Debug mode: emit frame chain push/pop for stack traces.
+    debug_mode: bool,
 }
 
 impl<'a> NativeCodegen<'a> {
@@ -167,7 +174,7 @@ impl<'a> NativeCodegen<'a> {
         let heap_data = obj.declare_data("lumen_heap", Linkage::Local, true, false).unwrap();
         let bump_ptr_data = obj.declare_data("lumen_bump", Linkage::Local, true, false).unwrap();
         let frame_chain_data =
-            obj.declare_data("lumen_frame_chain", Linkage::Local, true, false).unwrap();
+            obj.declare_data("lumen_frame_chain", Linkage::Export, true, false).unwrap();
 
         // Define heap: 1MB of zeros.
         let mut desc = DataDescription::new();
@@ -279,6 +286,16 @@ impl<'a> NativeCodegen<'a> {
         let dnl_sig = obj.make_signature();
         let debug_newline = obj.declare_function("lumen_debug_newline", Linkage::Import, &dnl_sig).unwrap();
 
+        let dinit_sig = obj.make_signature();
+        let debug_init = obj.declare_function("lumen_debug_init", Linkage::Import, &dinit_sig).unwrap();
+
+        let mut dpush_sig = obj.make_signature();
+        dpush_sig.params.push(AbiParam::new(PTR));
+        let debug_push = obj.declare_function("lumen_debug_push", Linkage::Import, &dpush_sig).unwrap();
+
+        let dpop_sig = obj.make_signature();
+        let debug_pop = obj.declare_function("lumen_debug_pop", Linkage::Import, &dpop_sig).unwrap();
+
         // --- Module functions are now declared from parsed std/*.lm files ---
         // (see compile_module → "Declare imported module extern fns")
         // print_frames: () -> void. Walks the frame_chain and prints each.
@@ -309,6 +326,9 @@ impl<'a> NativeCodegen<'a> {
             debug_str,
             debug_raw,
             debug_newline,
+            debug_init,
+            debug_push,
+            debug_pop,
             debug_data_counter: 0,
             dispatch_fns: HashMap::new(),
             heap_data,
@@ -319,6 +339,7 @@ impl<'a> NativeCodegen<'a> {
             lambda_sigs: HashMap::new(),
             module_fn_ids: HashMap::new(),
             uses_io: false,
+            debug_mode: false,
         })
     }
 
@@ -1005,14 +1026,49 @@ impl<'a> NativeCodegen<'a> {
                 }
             }
 
-            // Compile body. (Yield points are at loop headers only —
-            // function-entry yield causes recursive dispatch issues.)
+            // Debug mode: install crash handler at program start.
+            if fb.cg.debug_mode && f.name == "main" {
+                let init_ref = fb.cg.obj.declare_func_in_func(
+                    fb.cg.debug_init, fb.builder.func);
+                fb.builder.ins().call(init_ref, &[]);
+            }
+
+            // Debug mode: push frame message for stack traces.
+            let debug_enabled = fb.cg.debug_mode;
+            if debug_enabled {
+                let frame_msg = format!("  at {} (<source>:{}:{})", f.name, f.span.line, f.span.col);
+                let msg_name = format!("__frame_msg_{}", fb.cg.debug_data_counter);
+                fb.cg.debug_data_counter += 1;
+                let msg_data_id = fb.cg.obj.declare_data(&msg_name, Linkage::Local, false, false).unwrap();
+                let mut desc = DataDescription::new();
+                let bytes = frame_msg.as_bytes();
+                let mut payload = Vec::with_capacity(4 + bytes.len());
+                payload.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
+                payload.extend_from_slice(bytes);
+                desc.define(payload.into_boxed_slice());
+                fb.cg.obj.define_data(msg_data_id, &desc).unwrap();
+
+                let msg_gv = fb.cg.obj.declare_data_in_func(msg_data_id, fb.builder.func);
+                let msg_val = fb.builder.ins().global_value(PTR, msg_gv);
+                let push_ref = fb.cg.obj.declare_func_in_func(fb.cg.debug_push, fb.builder.func);
+                fb.builder.ins().call(push_ref, &[msg_val]);
+            }
+
+            // Compile body.
             fb.hit_return = false;
             let result = fb.compile_block_with_cleanup(&f.body, param_cleanup)?;
 
+            // Debug mode: pop frame before returning.
+            let emit_debug_pop = |fb: &mut FnEmitter| {
+                if debug_enabled {
+                    let pop_ref = fb.cg.obj.declare_func_in_func(fb.cg.debug_pop, fb.builder.func);
+                    fb.builder.ins().call(pop_ref, &[]);
+                }
+            };
+
             if fb.hit_return {
                 // The body ended with a return. We're on a dead block.
-                // Emit a correctly-typed return for the function signature.
+                emit_debug_pop(&mut fb);
                 if sig.ret == Ty::Unit {
                     fb.builder.ins().return_(&[]);
                 } else {
@@ -1021,14 +1077,13 @@ impl<'a> NativeCodegen<'a> {
                     fb.builder.ins().return_(&[dummy]);
                 }
             } else {
-                // If this is main, drain the message queue before returning.
                 if f.name == "main" {
                     let drain_ref = fb.cg.obj.declare_func_in_func(
                         fb.cg.rt_drain, fb.builder.func,
                     );
                     fb.builder.ins().call(drain_ref, &[]);
                 }
-                // Return.
+                emit_debug_pop(&mut fb);
                 if sig.ret == Ty::Unit {
                     fb.builder.ins().return_(&[]);
                 } else {

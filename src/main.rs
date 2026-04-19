@@ -11,7 +11,8 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
     match argv.as_slice() {
-        [_, "build", path] => cmd_build_native(path),
+        [_, "build", path] => cmd_build_native(path, false),
+        [_, "build", "--debug", path] | [_, "build", path, "--debug"] => cmd_build_native(path, true),
         [_, "run", path] => cmd_run(path),
         [_, "--version"] | [_, "-V"] => {
             println!("lumen {}", env!("CARGO_PKG_VERSION"));
@@ -19,7 +20,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage:\n  lumen build <path.lm>   # native executable\n  lumen run   <path.lm>   # compile + run\n  lumen --version"
+                "usage:\n  lumen build [--debug] <path.lm>\n  lumen run   <path.lm>\n  lumen --version"
             );
             ExitCode::from(1)
         }
@@ -47,7 +48,7 @@ fn format_error(src: &str, file: &str, kind: &str, line: u32, col: u32, end: u32
     out
 }
 
-fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), String> {
+fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<String>), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let tokens = lumen::lexer::lex(&src).map_err(|e| {
         format_error(&src, path, "lex error", e.span.line, e.span.col, 0, &e.message)
@@ -100,7 +101,7 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
     let imported_refs: Vec<(&str, &lumen::ast::Module)> = imported.iter()
         .map(|i| (i.name.as_str(), &i.module))
         .collect();
-    let obj = lumen::native::compile_native(&module, &info, &imported_refs)
+    let obj = lumen::native::compile_native(&module, &info, &imported_refs, debug)
         .map_err(|e| format_error(&src, path, "codegen error", e.span.line, e.span.col, e.span.end, &e.message))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
     Ok((obj, stem.to_string(), imports))
@@ -188,8 +189,8 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String]) -> Result<String, Stri
     Ok(exe_path)
 }
 
-fn cmd_build_native(path: &str) -> ExitCode {
-    match compile_to_object(path) {
+fn cmd_build_native(path: &str, debug: bool) -> ExitCode {
+    match compile_to_object(path, debug) {
         Ok((obj, stem, imports)) => match link(&obj, &stem, &imports) {
             Ok(exe) => {
                 eprintln!("wrote {exe}");
@@ -208,7 +209,7 @@ fn cmd_build_native(path: &str) -> ExitCode {
 }
 
 fn cmd_run(path: &str) -> ExitCode {
-    let (obj, stem, imports) = match compile_to_object(path) {
+    let (obj, stem, imports) = match compile_to_object(path, false) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("{msg}");
