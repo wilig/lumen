@@ -280,11 +280,13 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_rc_incr", Linkage::Local, &rc_incr_sig)
             .unwrap();
 
-        // rc_decr(ptr): if ptr in heap, rc--; if 0, free
+        // rc_decr(ptr): if ptr in heap, rc--; if 0, free.
+        // Exported so C runtime helpers (e.g. lumen_map_set when displacing
+        // an old key/value) can decrement Lumen-owned references.
         let mut rc_decr_sig = obj.make_signature();
         rc_decr_sig.params.push(AbiParam::new(PTR));
         let helper_rc_decr = obj
-            .declare_function("lumen_rc_decr", Linkage::Local, &rc_decr_sig)
+            .declare_function("lumen_rc_decr", Linkage::Export, &rc_decr_sig)
             .unwrap();
 
         // --- Actor runtime functions (from runtime/rt.c) ---
@@ -2064,19 +2066,39 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let call = self.builder.ins().call(func_ref, &[l, i, val64]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
-            // map.set: rc_incr pointer values, sextend i32→i64 (mirror list.push).
+            // map.set: rc_incr the key (always a pointer string) and the
+            // value (if pointer-typed) so the map keeps live references.
+            // Pass value_is_ptr so the C side rc_decr's a displaced value
+            // when overwriting an existing key.
             if mod_name == "map" && method == "set" {
                 let m = self.compile_expr(&args[0].value)?;
                 let k = self.compile_expr(&args[1].value)?;
                 let val_raw = self.compile_expr(&args[2].value)?;
                 let val_ty = self.infer_ty(&args[2].value)?;
-                if !is_scalar(&val_ty) { self.emit_rc_incr(val_raw); }
+                let value_is_ptr = !is_scalar(&val_ty);
+                self.emit_rc_incr(k);
+                if value_is_ptr { self.emit_rc_incr(val_raw); }
                 let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
                     self.builder.ins().sextend(cl_types::I64, val_raw)
                 } else { val_raw };
+                let flag = self.builder.ins().iconst(cl_types::I32, if value_is_ptr { 1 } else { 0 });
                 let fid = self.module_func("lumen_map_set");
                 let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[m, k, val64]);
+                let call = self.builder.ins().call(func_ref, &[m, k, val64, flag]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            // map.remove: pass value_is_ptr so C decrements the removed value.
+            // Key is always pointer-typed (string) and decremented unconditionally.
+            if mod_name == "map" && method == "remove" {
+                let m = self.compile_expr(&args[0].value)?;
+                let k = self.compile_expr(&args[1].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                let value_is_ptr = !is_scalar(&val_ty);
+                let flag = self.builder.ins().iconst(cl_types::I32, if value_is_ptr { 1 } else { 0 });
+                let fid = self.module_func("lumen_map_remove");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[m, k, flag]);
                 return Ok(self.builder.inst_results(call)[0]);
             }
             // map.get: returns Option<V>. Emit:
