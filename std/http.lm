@@ -1,4 +1,64 @@
-extern fn parse_method(raw: bytes): string link "lumen_http_parse_method"
-extern fn parse_path(raw: bytes): string link "lumen_http_parse_path"
-extern fn parse_body(raw: bytes): string link "lumen_http_parse_body"
-extern fn format_response(status: i32, body: string): bytes link "lumen_http_format_response"
+// HTTP parsing and formatting — written in Lumen.
+
+import std/bytes
+import std/string
+import std/int
+
+// Parse HTTP method (e.g. "GET").
+fn parse_method(raw: bytes): string {
+    let len = bytes.len(raw)
+    var i = 0
+    for _ in range(0, len) {
+        if bytes.get(raw, i) == 32 {
+            return string.from_bytes(bytes.slice(raw, 0, i))
+        }
+        i += 1
+    }
+    return string.from_bytes(raw)
+}
+
+// Parse HTTP path (e.g. "/index.html").
+fn parse_path(raw: bytes): string {
+    let len = bytes.len(raw)
+    var i = 0
+    for _ in range(0, len) {
+        if bytes.get(raw, i) == 32 {
+            i += 1
+            let start = i
+            for _ in range(start, len) {
+                if bytes.get(raw, i) == 32 {
+                    return string.from_bytes(bytes.slice(raw, start, i - start))
+                }
+                i += 1
+            }
+            return string.from_bytes(bytes.slice(raw, start, len - start))
+        }
+        i += 1
+    }
+    return ""
+}
+
+// Parse HTTP body (everything after "\r\n\r\n").
+fn parse_body(raw: bytes): string {
+    let len = bytes.len(raw)
+    for i in range(0, len - 3) {
+        if bytes.get(raw, i) == 13 {
+            if bytes.get(raw, i + 1) == 10 {
+                if bytes.get(raw, i + 2) == 13 {
+                    if bytes.get(raw, i + 3) == 10 {
+                        let start = i + 4
+                        return string.from_bytes(bytes.slice(raw, start, len - start))
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// Format HTTP/1.1 response.
+fn format_response(status: i32, body: string): bytes {
+    let body_len = bytes.len(bytes.from_string(body))
+    let s = "HTTP/1.1 " + int.to_string_i32(status) + " OK\r\nContent-Length: " + int.to_string_i32(body_len) + "\r\n\r\n" + body
+    return bytes.from_string(s)
+}

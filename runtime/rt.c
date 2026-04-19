@@ -128,6 +128,29 @@ static char *alloc_bytes(int32_t len) {
     return payload;
 }
 
+// Bytes length.
+int32_t lumen_bytes_len(int64_t bytes_ptr) {
+    if (bytes_ptr == 0) return 0;
+    return *(int32_t *)(uintptr_t)bytes_ptr;
+}
+
+// Bytes get: read one byte at index, zero-extend to i32.
+int32_t lumen_bytes_get(int64_t bytes_ptr, int32_t index) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    return (int32_t)(unsigned char)buf[4 + index];
+}
+
+// Allocate a new zero-filled bytes buffer.
+int64_t lumen_bytes_new(int32_t size) {
+    char *payload = alloc_bytes(size);
+    if (size > 0) memset(payload + 4, 0, size);
+    return (int64_t)(uintptr_t)payload;
+}
+
+// Identity: bytes and strings have the same representation.
+int64_t lumen_bytes_from_string(int64_t s) { return s; }
+int64_t lumen_string_from_bytes(int64_t b) { return b; }
+
 // Extract a slice of bytes: returns new bytes [start..start+slice_len].
 int64_t lumen_bytes_slice(int64_t bytes_ptr, int32_t start, int32_t slice_len) {
     char *src = (char *)(uintptr_t)bytes_ptr;

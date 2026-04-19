@@ -1648,42 +1648,6 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         if let ExprKind::Ident(mod_name) = &receiver.kind {
             // --- Special cases that need custom codegen ---
 
-            // Zero-cost identity conversions.
-            if (mod_name == "bytes" && method == "from_string")
-                || (mod_name == "string" && method == "from_bytes") {
-                return self.compile_expr(&args[0].value);
-            }
-
-            // bytes.len: inline load
-            if mod_name == "bytes" && method == "len" {
-                let b = self.compile_expr(&args[0].value)?;
-                return Ok(self.builder.ins().load(cl_types::I32, MemFlags::new(), b, 0));
-            }
-            // bytes.new: rc_alloc + memset
-            if mod_name == "bytes" && method == "new" {
-                let size_val = self.compile_expr(&args[0].value)?;
-                let size_ptr = self.builder.ins().uextend(PTR, size_val);
-                let four = self.builder.ins().iconst(PTR, 4);
-                let total = self.builder.ins().iadd(size_ptr, four);
-                let func_ref = self.cg.obj.declare_func_in_func(self.cg.helper_rc_alloc, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[total]);
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.ins().store(MemFlags::new(), size_val, ptr, 0);
-                let data_ptr = self.builder.ins().iadd_imm(ptr, 4);
-                let zero = self.builder.ins().iconst(cl_types::I8, 0);
-                self.builder.call_memset(self.cg.obj.target_config(), data_ptr, zero, size_ptr);
-                return Ok(ptr);
-            }
-            // bytes.get: inline load u8
-            if mod_name == "bytes" && method == "get" {
-                let b = self.compile_expr(&args[0].value)?;
-                let i = self.compile_expr(&args[1].value)?;
-                let i_ptr = self.builder.ins().sextend(PTR, i);
-                let base = self.builder.ins().iadd_imm(b, 4);
-                let addr = self.builder.ins().iadd(base, i_ptr);
-                let byte = self.builder.ins().load(cl_types::I8, MemFlags::new(), addr, 0);
-                return Ok(self.builder.ins().uextend(cl_types::I32, byte));
-            }
             // net.tcp_write: call + ireduce i64→i32
             if mod_name == "net" && method == "tcp_write" {
                 let fd = self.compile_expr(&args[0].value)?;
