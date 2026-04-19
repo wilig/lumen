@@ -30,9 +30,10 @@ use crate::types::{ModuleInfo, Ty, TypeInfo};
 pub fn compile_native(
     module: &ast::Module,
     info: &ModuleInfo,
+    imported_modules: &[(&str, &ast::Module)],
 ) -> Result<Vec<u8>, NativeError> {
     let mut cg = NativeCodegen::new(info)?;
-    cg.compile_module(module)?;
+    cg.compile_module(module, imported_modules)?;
     Ok(cg.finish())
 }
 
@@ -274,7 +275,7 @@ impl<'a> NativeCodegen<'a> {
         })
     }
 
-    fn compile_module(&mut self, module: &ast::Module) -> Result<(), NativeError> {
+    fn compile_module(&mut self, module: &ast::Module, imported_modules: &[(&str, &ast::Module)]) -> Result<(), NativeError> {
         self.uses_io = module.imports.iter().any(|im| im.path == ["std", "io"]);
 
         // Intern string literals + frame messages.
@@ -331,6 +332,67 @@ impl<'a> NativeCodegen<'a> {
                     let cl_sig = self.build_sig_from(sig);
                     let id = self.obj.declare_function(link_name, Linkage::Import, &cl_sig).unwrap();
                     self.module_fn_ids.insert(link_name.clone(), id);
+                }
+            }
+        }
+
+        // Declare and compile fn items from imported modules.
+        for &(mod_name, mod_ast) in imported_modules {
+            // Intern strings from the imported module.
+            self.intern_all_strings(mod_ast);
+            // Declare extern fns so the module's Lumen functions can call them.
+            for item in &mod_ast.items {
+                if let Item::ExternFn(ef) = item {
+                    let symbol = ef.link_name.as_deref().unwrap_or(&ef.name);
+                    if !self.module_fn_ids.contains_key(symbol) {
+                        let sig = self.info.modules.get(mod_name)
+                            .and_then(|m| m.get(&ef.name));
+                        if let Some(sig) = sig {
+                            let cl_sig = self.build_sig_from(sig);
+                            if let Ok(id) = self.obj.declare_function(symbol, Linkage::Import, &cl_sig) {
+                                self.module_fn_ids.insert(symbol.to_string(), id);
+                            }
+                        }
+                    }
+                    // Register under the Lumen-facing name so compile_call finds it.
+                    if let Some(&id) = self.module_fn_ids.get(ef.link_name.as_deref().unwrap_or(&ef.name)) {
+                        self.fn_ids.insert(ef.name.clone(), id);
+                    }
+                }
+            }
+            // Declare each fn.
+            for item in &mod_ast.items {
+                if let Item::Fn(f) = item {
+                    let mangled = format!("{mod_name}${}", f.name);
+                    if let Some(mod_sigs) = self.info.modules.get(mod_name) {
+                        if let Some(sig) = mod_sigs.get(&f.name) {
+                            let cl_sig = self.build_sig_from(sig);
+                            let id = self.obj.declare_function(&mangled, Linkage::Local, &cl_sig).unwrap();
+                            self.fn_ids.insert(mangled.clone(), id);
+                            self.lambda_sigs.insert(mangled, sig.clone());
+                            // Also register in module_fn_ids so compile_method_call can find it.
+                            self.module_fn_ids.insert(format!("{mod_name}:{}", f.name), id);
+                        }
+                    }
+                }
+            }
+            // Compile each fn body with mangled name.
+            let fn_ids = self.fn_ids.clone();
+            for item in &mod_ast.items {
+                if let Item::Fn(f) = item {
+                    let mangled = format!("{mod_name}${}", f.name);
+                    if let Some(&func_id) = fn_ids.get(&mangled) {
+                        let synthetic = FnDecl {
+                            name: mangled,
+                            name_span: f.name_span,
+                            params: f.params.clone(),
+                            return_type: f.return_type.clone(),
+                            effect: f.effect,
+                            body: f.body.clone(),
+                            span: f.span,
+                        };
+                        self.define_function(&synthetic, func_id)?;
+                    }
                 }
             }
         }
@@ -1702,24 +1764,27 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         }
         // Fall through to imported module lookup.
         if let ExprKind::Ident(mod_name) = &receiver.kind {
+            let is_void = self.cg.info.modules
+                .get(mod_name.as_str())
+                .and_then(|m| m.get(method))
+                .map(|sig| sig.ret == Ty::Unit)
+                .unwrap_or(false);
+
+            // Check extern fn by link name.
             if let Some(link_name) = self.cg.info.module_link_names
                 .get(mod_name.as_str())
                 .and_then(|m| m.get(method))
             {
-                // Look up the FuncId for this link name (declared in compile_module).
                 if let Some(&func_id) = self.cg.module_fn_ids.get(link_name.as_str()) {
-                    // Check if it's a void function by looking at the module sig.
-                    let is_void = self.cg.info.modules
-                        .get(mod_name.as_str())
-                        .and_then(|m| m.get(method))
-                        .map(|sig| sig.ret == Ty::Unit)
-                        .unwrap_or(false);
-                    if is_void {
-                        return self.call_builtin_void(func_id, args);
-                    } else {
-                        return self.call_builtin(func_id, args);
-                    }
+                    return if is_void { self.call_builtin_void(func_id, args) }
+                           else { self.call_builtin(func_id, args) };
                 }
+            }
+            // Check Lumen fn by mod_name:method key.
+            let fn_key = format!("{mod_name}:{method}");
+            if let Some(&func_id) = self.cg.module_fn_ids.get(&fn_key) {
+                return if is_void { self.call_builtin_void(func_id, args) }
+                       else { self.call_builtin(func_id, args) };
             }
         }
         Err(NativeError {

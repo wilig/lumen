@@ -128,6 +128,19 @@ static char *alloc_bytes(int32_t len) {
     return payload;
 }
 
+// Extract a slice of bytes: returns new bytes [start..start+slice_len].
+int64_t lumen_bytes_slice(int64_t bytes_ptr, int32_t start, int32_t slice_len) {
+    char *src = (char *)(uintptr_t)bytes_ptr;
+    int32_t src_len = *(int32_t *)src;
+    if (start < 0) start = 0;
+    if (start > src_len) start = src_len;
+    if (slice_len < 0) slice_len = 0;
+    if (start + slice_len > src_len) slice_len = src_len - start;
+    char *payload = alloc_bytes(slice_len);
+    if (slice_len > 0) memcpy(payload + 4, src + 4 + start, slice_len);
+    return (int64_t)(uintptr_t)payload;
+}
+
 // socket + setsockopt + bind + listen. Returns server fd (or -1 on error).
 int lumen_tcp_listen(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);

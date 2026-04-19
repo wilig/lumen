@@ -31,11 +31,17 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
     let tokens = lumen::lexer::lex(&src).map_err(|e| format!("lex error: {e}"))?;
     let module = lumen::parser::parse(tokens).map_err(|e| format!("parse error: {e}"))?;
 
-    // Resolve imports to stdlib .lm files and parse them.
+    // Resolve imports to stdlib .lm files, recursively following
+    // transitive imports (e.g. std/http imports std/bytes).
     let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("std");
     let mut imported = Vec::new();
-    for imp in &module.imports {
-        let mod_name = imp.path.last().cloned().unwrap_or_default();
+    let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = module.imports.iter()
+        .map(|imp| imp.path.last().cloned().unwrap_or_default())
+        .collect();
+    while let Some(mod_name) = queue.pop() {
+        if loaded.contains(&mod_name) { continue; }
+        loaded.insert(mod_name.clone());
         let mod_path = std_dir.join(format!("{mod_name}.lm"));
         if mod_path.exists() {
             let mod_src = std::fs::read_to_string(&mod_path)
@@ -44,6 +50,11 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
                 .map_err(|e| format!("lex error in std/{mod_name}.lm: {e}"))?;
             let mod_ast = lumen::parser::parse(mod_tokens)
                 .map_err(|e| format!("parse error in std/{mod_name}.lm: {e}"))?;
+            // Queue transitive imports.
+            for imp in &mod_ast.imports {
+                let dep = imp.path.last().cloned().unwrap_or_default();
+                if !loaded.contains(&dep) { queue.push(dep); }
+            }
             imported.push(lumen::types::ParsedImport { name: mod_name, module: mod_ast });
         }
     }
@@ -55,7 +66,10 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, String, Vec<String>), Strin
             .join("\n")
     })?;
     let imports = info.imports.clone();
-    let obj = lumen::native::compile_native(&module, &info)
+    let imported_refs: Vec<(&str, &lumen::ast::Module)> = imported.iter()
+        .map(|i| (i.name.as_str(), &i.module))
+        .collect();
+    let obj = lumen::native::compile_native(&module, &info, &imported_refs)
         .map_err(|e| format!("native codegen error: {e}"))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
     Ok((obj, stem.to_string(), imports))

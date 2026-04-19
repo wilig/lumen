@@ -1,1 +1,2 @@
 extern fn concat(a: bytes, b: bytes): bytes link "lumen_concat"
+extern fn slice(b: bytes, start: i32, len: i32): bytes link "lumen_bytes_slice"
