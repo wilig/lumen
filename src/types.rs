@@ -864,6 +864,17 @@ impl<'a> FnChecker<'a> {
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::UnitLit => Ty::Unit,
 
+            ExprKind::Interpolated(parts) => {
+                // Each embedded expression accepts any type (formatted at
+                // runtime). The result is always a string.
+                for p in parts {
+                    if let crate::ast::InterpPiece::Expr(e) = p {
+                        let _ = self.infer_expr(e);
+                    }
+                }
+                Ty::String
+            }
+
             ExprKind::Ident(name) => {
                 if let Some(b) = self.lookup(name) {
                     b.ty.clone()

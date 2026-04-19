@@ -47,6 +47,28 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, ParseError> {
     p.parse_module()
 }
 
+/// Parse a single expression from a snippet of source — used to compile
+/// the body of a `\{...}` interpolation. Errors carry the surrounding
+/// string literal's span so the user sees a location they recognize.
+fn parse_interp_expr(source: &str, _line: u32, _col: u32, str_span: Span) -> Result<Expr, ParseError> {
+    let tokens = crate::lexer::lex(source).map_err(|e| ParseError {
+        span: str_span,
+        message: format!("in string interpolation: {}", e.message),
+    })?;
+    let mut p = Parser::new(tokens);
+    let expr = p.parse_expr(ExprCtx::normal()).map_err(|e| ParseError {
+        span: str_span,
+        message: format!("in string interpolation: {}", e.message),
+    })?;
+    if !matches!(p.peek_kind(), TokenKind::Eof) {
+        return Err(ParseError {
+            span: str_span,
+            message: "in string interpolation: unexpected trailing tokens after expression".into(),
+        });
+    }
+    Ok(expr)
+}
+
 // ---------------------------------------------------------------------------
 // Parser state
 // ---------------------------------------------------------------------------
@@ -1149,6 +1171,25 @@ impl Parser {
                     span: tok.span,
                 })
             }
+            TokenKind::InterpolatedString(parts) => {
+                self.bump();
+                let mut pieces = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        crate::lexer::InterpPart::Lit(s) => {
+                            pieces.push(crate::ast::InterpPiece::Lit(s));
+                        }
+                        crate::lexer::InterpPart::Expr { source, line, col } => {
+                            let expr = parse_interp_expr(&source, line, col, tok.span)?;
+                            pieces.push(crate::ast::InterpPiece::Expr(expr));
+                        }
+                    }
+                }
+                Ok(Expr {
+                    kind: ExprKind::Interpolated(pieces),
+                    span: tok.span,
+                })
+            }
             TokenKind::True => {
                 self.bump();
                 Ok(Expr {
@@ -1489,6 +1530,7 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::IntLit { .. } => "integer literal".into(),
         TokenKind::FloatLit(_) => "float literal".into(),
         TokenKind::StringLit(_) => "string literal".into(),
+        TokenKind::InterpolatedString(_) => "interpolated string literal".into(),
         TokenKind::LBrace => "`{`".into(),
         TokenKind::RBrace => "`}`".into(),
         TokenKind::LParen => "`(`".into(),

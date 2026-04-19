@@ -328,6 +328,20 @@ pub enum ExprKind {
         return_type: Type,
         body: Block,
     },
+
+    /// String interpolation: `"hello \{name}!"` desugars to a sequence of
+    /// literal chunks and embedded expressions whose values are stringified
+    /// at runtime via the strbuf helpers.
+    Interpolated(Vec<InterpPiece>),
+}
+
+#[derive(Debug, Clone)]
+pub enum InterpPiece {
+    /// Literal text between interpolations.
+    Lit(String),
+    /// `\{expr}` — any expression; its runtime value is formatted into the
+    /// growing string.
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

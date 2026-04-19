@@ -805,6 +805,82 @@ void lumen_io_str(int64_t ptr) {
 void lumen_io_raw(const char *s, int32_t len) { fwrite(s, 1, len, stdout); }
 void lumen_io_newline(void) { fputc('\n', stdout); }
 
+// --- String-buffer helpers (string interpolation) ------------------------
+// A growable byte buffer used to assemble interpolated strings. After all
+// pieces are appended, lumen_strbuf_finish converts it into a Lumen string
+// ([rc:i32 | magic:i32 | len:i32 | bytes]) and frees the buffer.
+
+typedef struct {
+    char *data;
+    int32_t len;
+    int32_t cap;
+} LumenStrBuf;
+
+void *lumen_strbuf_new(void) {
+    LumenStrBuf *b = (LumenStrBuf *)malloc(sizeof(LumenStrBuf));
+    b->cap = 64;
+    b->len = 0;
+    b->data = (char *)malloc(b->cap);
+    return b;
+}
+
+static void lumen_strbuf_grow(LumenStrBuf *b, int32_t need) {
+    if (b->len + need <= b->cap) return;
+    while (b->cap < b->len + need) b->cap *= 2;
+    b->data = (char *)realloc(b->data, b->cap);
+}
+
+void lumen_strbuf_raw(void *buf, const char *s, int32_t len) {
+    LumenStrBuf *b = (LumenStrBuf *)buf;
+    lumen_strbuf_grow(b, len);
+    memcpy(b->data + b->len, s, len);
+    b->len += len;
+}
+
+void lumen_strbuf_str(void *buf, int64_t str_ptr) {
+    if (str_ptr == 0) return;
+    char *s = (char *)(uintptr_t)str_ptr;
+    int32_t len = *(int32_t *)s;
+    lumen_strbuf_raw(buf, s + 4, len);
+}
+
+void lumen_strbuf_i32(void *buf, int32_t v) {
+    char tmp[16];
+    int n = snprintf(tmp, sizeof(tmp), "%d", v);
+    lumen_strbuf_raw(buf, tmp, n);
+}
+
+void lumen_strbuf_i64(void *buf, int64_t v) {
+    char tmp[24];
+    int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+    lumen_strbuf_raw(buf, tmp, n);
+}
+
+void lumen_strbuf_f64(void *buf, double v) {
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%g", v);
+    lumen_strbuf_raw(buf, tmp, n);
+}
+
+void lumen_strbuf_bool(void *buf, int32_t v) {
+    if (v) lumen_strbuf_raw(buf, "true", 4);
+    else lumen_strbuf_raw(buf, "false", 5);
+}
+
+int64_t lumen_strbuf_finish(void *buf) {
+    LumenStrBuf *b = (LumenStrBuf *)buf;
+    int32_t total = b->len;
+    char *raw = (char *)malloc(8 + 4 + total);
+    *(int32_t *)(raw + 0) = 1;            // rc
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
+    char *payload = raw + 8;
+    *(int32_t *)payload = total;
+    if (total > 0) memcpy(payload + 4, b->data, total);
+    free(b->data);
+    free(b);
+    return (int64_t)(uintptr_t)payload;
+}
+
 // --- assert builtin ------------------------------------------------------
 // cond: 0 = fail, nonzero = pass.
 // msg_ptr: optional Lumen string (0 if absent).

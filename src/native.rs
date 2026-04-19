@@ -59,16 +59,18 @@ impl std::error::Error for NativeError {}
 const PTR: CLType = cl_types::I64;
 
 /// Where formatted output should go.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum PrintTarget {
     /// `debug.print` — writes to stderr, quotes strings (so `"hi"` is
     /// distinguishable from the bareword `hi`).
     Stderr,
     /// `io.println` — writes to stdout, prints strings as raw content.
     Stdout,
+    /// String interpolation — appends to the given strbuf pointer.
+    StrBuf(Value),
 }
 
-/// FuncIds for one of the two formatting helper sets (stderr or stdout).
+/// FuncIds for one of the formatting helper sets (stderr / stdout / strbuf).
 struct FmtFuncs {
     i32: FuncId,
     i64: FuncId,
@@ -76,6 +78,9 @@ struct FmtFuncs {
     bool: FuncId,
     str: FuncId,
     raw: FuncId,
+    /// First argument prepended to every helper call (the strbuf ptr).
+    /// `None` for stderr/stdout (those helpers take no extra arg).
+    leading: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +121,14 @@ struct NativeCodegen<'a> {
     io_str: FuncId,
     io_raw: FuncId,
     io_newline: FuncId,
+    strbuf_new: FuncId,
+    strbuf_finish: FuncId,
+    strbuf_raw: FuncId,
+    strbuf_str: FuncId,
+    strbuf_i32: FuncId,
+    strbuf_i64: FuncId,
+    strbuf_f64: FuncId,
+    strbuf_bool: FuncId,
     debug_init: FuncId,
     debug_push: FuncId,
     debug_pop: FuncId,
@@ -360,6 +373,48 @@ impl<'a> NativeCodegen<'a> {
         let io_nl_sig = obj.make_signature();
         let io_newline = obj.declare_function("lumen_io_newline", Linkage::Import, &io_nl_sig).unwrap();
 
+        // --- strbuf primitives (string interpolation) ---
+        // All take the buffer ptr as the first arg.
+        let mut sb_new_sig = obj.make_signature();
+        sb_new_sig.returns.push(AbiParam::new(PTR));
+        let strbuf_new = obj.declare_function("lumen_strbuf_new", Linkage::Import, &sb_new_sig).unwrap();
+
+        let mut sb_finish_sig = obj.make_signature();
+        sb_finish_sig.params.push(AbiParam::new(PTR));
+        sb_finish_sig.returns.push(AbiParam::new(PTR));
+        let strbuf_finish = obj.declare_function("lumen_strbuf_finish", Linkage::Import, &sb_finish_sig).unwrap();
+
+        let mut sb_raw_sig = obj.make_signature();
+        sb_raw_sig.params.push(AbiParam::new(PTR));           // buf
+        sb_raw_sig.params.push(AbiParam::new(PTR));           // ptr
+        sb_raw_sig.params.push(AbiParam::new(cl_types::I32)); // len
+        let strbuf_raw = obj.declare_function("lumen_strbuf_raw", Linkage::Import, &sb_raw_sig).unwrap();
+
+        let mut sb_str_sig = obj.make_signature();
+        sb_str_sig.params.push(AbiParam::new(PTR));
+        sb_str_sig.params.push(AbiParam::new(PTR));
+        let strbuf_str = obj.declare_function("lumen_strbuf_str", Linkage::Import, &sb_str_sig).unwrap();
+
+        let mut sb_i32_sig = obj.make_signature();
+        sb_i32_sig.params.push(AbiParam::new(PTR));
+        sb_i32_sig.params.push(AbiParam::new(cl_types::I32));
+        let strbuf_i32 = obj.declare_function("lumen_strbuf_i32", Linkage::Import, &sb_i32_sig).unwrap();
+
+        let mut sb_i64_sig = obj.make_signature();
+        sb_i64_sig.params.push(AbiParam::new(PTR));
+        sb_i64_sig.params.push(AbiParam::new(cl_types::I64));
+        let strbuf_i64 = obj.declare_function("lumen_strbuf_i64", Linkage::Import, &sb_i64_sig).unwrap();
+
+        let mut sb_f64_sig = obj.make_signature();
+        sb_f64_sig.params.push(AbiParam::new(PTR));
+        sb_f64_sig.params.push(AbiParam::new(cl_types::F64));
+        let strbuf_f64 = obj.declare_function("lumen_strbuf_f64", Linkage::Import, &sb_f64_sig).unwrap();
+
+        let mut sb_bool_sig = obj.make_signature();
+        sb_bool_sig.params.push(AbiParam::new(PTR));
+        sb_bool_sig.params.push(AbiParam::new(cl_types::I32));
+        let strbuf_bool = obj.declare_function("lumen_strbuf_bool", Linkage::Import, &sb_bool_sig).unwrap();
+
         let dinit_sig = obj.make_signature();
         let debug_init = obj.declare_function("lumen_debug_init", Linkage::Import, &dinit_sig).unwrap();
 
@@ -414,6 +469,14 @@ impl<'a> NativeCodegen<'a> {
             io_str,
             io_raw,
             io_newline,
+            strbuf_new,
+            strbuf_finish,
+            strbuf_raw,
+            strbuf_str,
+            strbuf_i32,
+            strbuf_i64,
+            strbuf_f64,
+            strbuf_bool,
             debug_init,
             debug_push,
             debug_pop,
@@ -1627,6 +1690,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
                 Ok(self.builder.ins().func_addr(PTR, func_ref))
             }
+            ExprKind::Interpolated(parts) => self.compile_interpolated(parts),
             _ => Err(NativeError {
                 span: expr.span,
                 message: "expression not supported in native backend".into(),
@@ -2254,6 +2318,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 bool: self.cg.debug_bool,
                 str: self.cg.debug_str,
                 raw: self.cg.debug_raw,
+                leading: None,
             },
             PrintTarget::Stdout => FmtFuncs {
                 i32: self.cg.io_i32,
@@ -2262,11 +2327,33 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 bool: self.cg.io_bool,
                 str: self.cg.io_str,
                 raw: self.cg.io_raw,
+                leading: None,
+            },
+            PrintTarget::StrBuf(buf) => FmtFuncs {
+                i32: self.cg.strbuf_i32,
+                i64: self.cg.strbuf_i64,
+                f64: self.cg.strbuf_f64,
+                bool: self.cg.strbuf_bool,
+                str: self.cg.strbuf_str,
+                raw: self.cg.strbuf_raw,
+                leading: Some(buf),
             },
         }
     }
 
-    /// Emit a raw string literal to the given stream.
+    fn fmt_call(&mut self, fid: FuncId, leading: Option<Value>, args: &[Value]) {
+        let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
+        if let Some(buf) = leading {
+            let mut all = Vec::with_capacity(args.len() + 1);
+            all.push(buf);
+            all.extend_from_slice(args);
+            self.builder.ins().call(func_ref, &all);
+        } else {
+            self.builder.ins().call(func_ref, args);
+        }
+    }
+
+    /// Emit a raw string literal to the given stream/buffer.
     fn emit_fmt_raw(&mut self, target: PrintTarget, s: &str) {
         let fns = self.fmt_funcs(target);
         let name = format!("__dbg_{}", self.cg.string_data.len() + self.cg.debug_data_counter);
@@ -2278,34 +2365,18 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let gv = self.cg.obj.declare_data_in_func(data_id, self.builder.func);
         let ptr = self.builder.ins().global_value(PTR, gv);
         let len = self.builder.ins().iconst(cl_types::I32, s.len() as i64);
-        let func_ref = self.cg.obj.declare_func_in_func(fns.raw, self.builder.func);
-        self.builder.ins().call(func_ref, &[ptr, len]);
+        self.fmt_call(fns.raw, fns.leading, &[ptr, len]);
     }
 
-    /// Emit code to print a value of the given type to the given stream.
+    /// Emit code to print a value of the given type to the given stream/buffer.
     fn emit_fmt_value(&mut self, target: PrintTarget, val: Value, ty: &Ty) -> Result<(), NativeError> {
         let fns = self.fmt_funcs(target);
         match ty {
-            Ty::I32 | Ty::U32 => {
-                let f = self.cg.obj.declare_func_in_func(fns.i32, self.builder.func);
-                self.builder.ins().call(f, &[val]);
-            }
-            Ty::I64 | Ty::U64 => {
-                let f = self.cg.obj.declare_func_in_func(fns.i64, self.builder.func);
-                self.builder.ins().call(f, &[val]);
-            }
-            Ty::F64 => {
-                let f = self.cg.obj.declare_func_in_func(fns.f64, self.builder.func);
-                self.builder.ins().call(f, &[val]);
-            }
-            Ty::Bool => {
-                let f = self.cg.obj.declare_func_in_func(fns.bool, self.builder.func);
-                self.builder.ins().call(f, &[val]);
-            }
-            Ty::String | Ty::Bytes => {
-                let f = self.cg.obj.declare_func_in_func(fns.str, self.builder.func);
-                self.builder.ins().call(f, &[val]);
-            }
+            Ty::I32 | Ty::U32 => self.fmt_call(fns.i32, fns.leading, &[val]),
+            Ty::I64 | Ty::U64 => self.fmt_call(fns.i64, fns.leading, &[val]),
+            Ty::F64 => self.fmt_call(fns.f64, fns.leading, &[val]),
+            Ty::Bool => self.fmt_call(fns.bool, fns.leading, &[val]),
+            Ty::String | Ty::Bytes => self.fmt_call(fns.str, fns.leading, &[val]),
             Ty::Unit => {
                 self.emit_fmt_raw(target, "unit");
             }
@@ -2389,15 +2460,39 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(())
     }
 
+    /// Lower a `"hello \{x}"` interpolation: allocate a strbuf, append each
+    /// piece (literal text or formatted expression value) into it, then call
+    /// strbuf_finish to produce a fresh Lumen string (rc=1).
+    fn compile_interpolated(&mut self, parts: &[ast::InterpPiece]) -> Result<Value, NativeError> {
+        let new_ref = self.cg.obj.declare_func_in_func(self.cg.strbuf_new, self.builder.func);
+        let new_call = self.builder.ins().call(new_ref, &[]);
+        let buf = self.builder.inst_results(new_call)[0];
+        let target = PrintTarget::StrBuf(buf);
+        for piece in parts {
+            match piece {
+                ast::InterpPiece::Lit(s) => self.emit_fmt_raw(target, s),
+                ast::InterpPiece::Expr(e) => {
+                    let val = self.compile_expr(e)?;
+                    let ty = self.infer_ty(e)?;
+                    self.emit_fmt_value(target, val, &ty)?;
+                }
+            }
+        }
+        let finish_ref = self.cg.obj.declare_func_in_func(self.cg.strbuf_finish, self.builder.func);
+        let finish_call = self.builder.ins().call(finish_ref, &[buf]);
+        Ok(self.builder.inst_results(finish_call)[0])
+    }
+
     /// Print a value that is nested inside a struct/list/tuple.
-    /// For io.println, strings nested inside containers are still quoted
-    /// (so `[\"a\", \"b\"]` is unambiguous), but top-level strings are not.
+    /// For non-stderr targets (which print strings as raw content), nested
+    /// strings still get quoted so `[\"a\", \"b\"]` stays unambiguous.
     fn emit_struct_field_fmt(&mut self, target: PrintTarget, val: Value, ty: &Ty) -> Result<(), NativeError> {
-        if matches!(target, PrintTarget::Stdout) && matches!(ty, Ty::String | Ty::Bytes) {
-            // Quote the string for readability in container output.
+        let needs_quotes = !matches!(target, PrintTarget::Stderr)
+            && matches!(ty, Ty::String | Ty::Bytes);
+        if needs_quotes {
+            let fns = self.fmt_funcs(target);
             self.emit_fmt_raw(target, "\"");
-            let f = self.cg.obj.declare_func_in_func(self.cg.io_str, self.builder.func);
-            self.builder.ins().call(f, &[val]);
+            self.fmt_call(fns.str, fns.leading, &[val]);
             self.emit_fmt_raw(target, "\"");
             return Ok(());
         }
@@ -2997,6 +3092,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::UnitLit => Ty::Unit,
             ExprKind::StringLit(_) => Ty::String,
+            ExprKind::Interpolated(_) => Ty::String,
             ExprKind::Ident(name) => {
                 if let Some(ty) = self.name_types.get(name) {
                     return Ok(ty.clone());
@@ -3527,6 +3623,13 @@ fn collect_lambdas_expr(expr: &Expr, acc: &mut Vec<LambdaInfo>) {
             collect_lambdas_expr(scrutinee, acc);
             for arm in arms { collect_lambdas_expr(&arm.body, acc); }
         }
+        ExprKind::Interpolated(parts) => {
+            for p in parts {
+                if let ast::InterpPiece::Expr(e) = p {
+                    collect_lambdas_expr(e, acc);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3624,6 +3727,13 @@ fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
             }
         }
         ExprKind::Lambda { body, .. } => collect_strings_block(body, acc),
+        ExprKind::Interpolated(parts) => {
+            for p in parts {
+                if let ast::InterpPiece::Expr(e) = p {
+                    collect_strings_expr(e, acc);
+                }
+            }
+        }
         _ => {}
     }
 }

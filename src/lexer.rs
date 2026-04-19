@@ -58,6 +58,10 @@ pub enum TokenKind {
     FloatLit(f64),
     /// Decoded string — escape sequences have been resolved.
     StringLit(String),
+    /// Interpolated string with at least one `\{expr}` placeholder.
+    /// Each part is either a literal chunk or the raw source text of an
+    /// embedded expression (the parser re-lexes & parses each Expr).
+    InterpolatedString(Vec<InterpPart>),
 
     // --- Punctuation ------------------------------------------------------
     LBrace,
@@ -96,6 +100,21 @@ pub enum TokenKind {
     Percent,
 
     Eof,
+}
+
+/// One piece of an interpolated string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InterpPart {
+    /// Literal chunk — escapes are already resolved.
+    Lit(String),
+    /// Raw source text of a `\{...}` expression, plus the source location
+    /// of the first character inside the braces (so error messages from
+    /// the re-parsed expression point at the right place).
+    Expr {
+        source: String,
+        line: u32,
+        col: u32,
+    },
 }
 
 /// Explicit numeric suffix on an integer literal.
@@ -469,6 +488,83 @@ impl<'a> Lexer<'a> {
         Some(suf)
     }
 
+    /// Read the source text of a `\{...}` interpolation, starting just
+    /// after the opening `{`. Tracks brace depth (so struct literals or
+    /// nested blocks parse correctly) and skips over nested string
+    /// literals so a `}` inside `"..."` doesn't terminate the interpolation.
+    /// On success leaves the lexer positioned just after the matching `}`.
+    fn collect_interp_expr(&mut self, str_start: u32, str_line: u32, str_col: u32)
+        -> Result<String, LexError>
+    {
+        let mut src = String::new();
+        let mut depth: i32 = 1;
+        loop {
+            match self.peek() {
+                None => return Err(LexError {
+                    span: self.span_from(str_start, str_line, str_col),
+                    message: "unterminated string interpolation".into(),
+                }),
+                Some(b'{') => { depth += 1; src.push('{'); self.bump(); }
+                Some(b'}') => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 { return Ok(src); }
+                    src.push('}');
+                }
+                Some(b'"') => {
+                    src.push('"'); self.bump();
+                    loop {
+                        match self.peek() {
+                            None => return Err(LexError {
+                                span: self.span_from(str_start, str_line, str_col),
+                                message: "unterminated string inside interpolation".into(),
+                            }),
+                            Some(b'"') => { src.push('"'); self.bump(); break; }
+                            Some(b'\\') => {
+                                src.push('\\'); self.bump();
+                                if let Some(c) = self.peek() {
+                                    let cl = utf8_char_len(c);
+                                    let end = self.pos + cl;
+                                    if end <= self.src.len() {
+                                        if let Ok(s) = std::str::from_utf8(&self.src[self.pos..end]) {
+                                            src.push_str(s);
+                                        }
+                                    }
+                                    self.pos = end;
+                                    self.col += 1;
+                                }
+                            }
+                            Some(b'\n') => { src.push('\n'); self.bump(); }
+                            Some(b) => {
+                                let cl = utf8_char_len(b);
+                                let end = self.pos + cl;
+                                if end <= self.src.len() {
+                                    if let Ok(s) = std::str::from_utf8(&self.src[self.pos..end]) {
+                                        src.push_str(s);
+                                    }
+                                }
+                                self.pos = end;
+                                self.col += 1;
+                            }
+                        }
+                    }
+                }
+                Some(b'\n') => { src.push('\n'); self.bump(); }
+                Some(b) => {
+                    let cl = utf8_char_len(b);
+                    let end = self.pos + cl;
+                    if end <= self.src.len() {
+                        if let Ok(s) = std::str::from_utf8(&self.src[self.pos..end]) {
+                            src.push_str(s);
+                        }
+                    }
+                    self.pos = end;
+                    self.col += 1;
+                }
+            }
+        }
+    }
+
     fn lex_string(&mut self, start: u32, line: u32, col: u32) -> Result<Token, LexError> {
         self.bump(); // opening "
 
@@ -476,6 +572,7 @@ impl<'a> Lexer<'a> {
         if self.peek() == Some(b'"') && self.peek_at(1) == Some(b'"') {
             self.bump(); // second "
             self.bump(); // third "
+            let mut parts: Vec<InterpPart> = Vec::new();
             let mut out = String::new();
             loop {
                 match self.peek() {
@@ -487,10 +584,28 @@ impl<'a> Lexer<'a> {
                     }
                     Some(b'"') if self.peek_at(1) == Some(b'"') && self.peek_at(2) == Some(b'"') => {
                         self.bump(); self.bump(); self.bump();
+                        if parts.is_empty() {
+                            return Ok(Token {
+                                kind: TokenKind::StringLit(out),
+                                span: self.span_from(start, line, col),
+                            });
+                        }
+                        if !out.is_empty() {
+                            parts.push(InterpPart::Lit(out));
+                        }
                         return Ok(Token {
-                            kind: TokenKind::StringLit(out),
+                            kind: TokenKind::InterpolatedString(parts),
                             span: self.span_from(start, line, col),
                         });
+                    }
+                    Some(b'\\') if self.peek_at(1) == Some(b'{') => {
+                        self.bump(); self.bump(); // \{
+                        let (_, expr_line, expr_col) = self.here();
+                        if !out.is_empty() {
+                            parts.push(InterpPart::Lit(std::mem::take(&mut out)));
+                        }
+                        let src = self.collect_interp_expr(start, line, col)?;
+                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col });
                     }
                     Some(b'\n') => {
                         self.bump();
@@ -511,6 +626,7 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        let mut parts: Vec<InterpPart> = Vec::new();
         let mut out = String::new();
         loop {
             let b = match self.peek() {
@@ -525,8 +641,17 @@ impl<'a> Lexer<'a> {
 
             if b == b'"' {
                 self.bump();
+                if parts.is_empty() {
+                    return Ok(Token {
+                        kind: TokenKind::StringLit(out),
+                        span: self.span_from(start, line, col),
+                    });
+                }
+                if !out.is_empty() {
+                    parts.push(InterpPart::Lit(out));
+                }
                 return Ok(Token {
-                    kind: TokenKind::StringLit(out),
+                    kind: TokenKind::InterpolatedString(parts),
                     span: self.span_from(start, line, col),
                 });
             }
@@ -541,6 +666,16 @@ impl<'a> Lexer<'a> {
             if b == b'\\' {
                 self.bump();
                 match self.peek() {
+                    Some(b'{') => {
+                        self.bump();
+                        let (_, expr_line, expr_col) = self.here();
+                        if !out.is_empty() {
+                            parts.push(InterpPart::Lit(std::mem::take(&mut out)));
+                        }
+                        let src = self.collect_interp_expr(start, line, col)?;
+                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col });
+                        continue;
+                    }
                     Some(b'n') => {
                         self.bump();
                         out.push('\n');
