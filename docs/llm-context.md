@@ -39,6 +39,26 @@ y = y + 1        // ok
 Type annotations are usually inferred; supply them when the RHS is
 ambiguous (e.g. `list.new()` returns `List<Error>` until pinned).
 
+### Module-level let / var
+
+`let` and `var` also work at the top level of a module. Visible
+inside every fn in that module; other modules read them via
+`mod_name.binding`. `var` lets any fn in the module mutate the
+shared state.
+
+```lumen
+// in std/counter.lm
+var count: i32 = 0
+fn tick(): unit { count = count + 1 }
+fn get(): i32 { return count }
+```
+
+MVP limits:
+- Must carry an explicit type annotation (no inference for top-level).
+- Initializer must be a constant scalar (literal int/float/bool/char/unit, optionally `-`-negated). No function calls, no heap allocations.
+- Cross-module reads only — assigning to another module's `var` from
+  outside is a type error.
+
 ## Integers
 
 Integer literals default to `i32`. Suffix with `_i64`, `_u32`, `_u64`

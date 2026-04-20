@@ -33,6 +33,23 @@ pub enum Item {
     ExternFn(ExternFnDecl),
     Actor(ActorDecl),
     MsgHandler(MsgHandlerDecl),
+    /// `let NAME[: TYPE] = VALUE` or `var NAME[: TYPE] = VALUE` at
+    /// module top level. Immutable with `let`, mutable with `var`.
+    /// The initializer must be a constant expression (literals and
+    /// arithmetic on literals) at MVP.
+    GlobalLet(GlobalLetDecl),
+}
+
+/// `let foo: i32 = 42` / `var pass_count: i32 = 0` at module top
+/// level. Shared across every fn in the declaring module.
+#[derive(Debug, Clone)]
+pub struct GlobalLetDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub mutable: bool,
+    pub span: Span,
 }
 
 /// `actor Counter { count: i32 }`

@@ -7,63 +7,69 @@
 //         return test.summary()
 //     }
 //
-// Pass/fail counters live in the C runtime (single-threaded singleton).
-// Summary prints a one-line report and returns the failure count so
+// Counter state is module-level (top-level `var`). Summary prints a
+// one-line report and returns the failure count so
 // `return test.summary()` from main gives the right exit code.
 
 import std/io
 
-extern fn _record_pass(): unit link "lumen_test_record_pass"
-extern fn _record_fail(): unit link "lumen_test_record_fail"
-extern fn _summary(): i32 link "lumen_test_summary"
+var pass_count: i32 = 0
+var fail_count: i32 = 0
 
 fn eq<T>(actual: T, expected: T, label: string): unit io {
     if actual == expected {
         io.println("  ok  ${label}")
-        _record_pass()
+        pass_count = pass_count + 1
     } else {
         io.println("  FAIL  ${label}: expected ${expected}, got ${actual}")
-        _record_fail()
+        fail_count = fail_count + 1
     }
 }
 
 fn ne<T>(actual: T, expected: T, label: string): unit io {
     if actual != expected {
         io.println("  ok  ${label}")
-        _record_pass()
+        pass_count = pass_count + 1
     } else {
         io.println("  FAIL  ${label}: both values = ${actual}")
-        _record_fail()
+        fail_count = fail_count + 1
     }
 }
 
 fn is_true(cond: bool, label: string): unit io {
     if cond {
         io.println("  ok  ${label}")
-        _record_pass()
+        pass_count = pass_count + 1
     } else {
         io.println("  FAIL  ${label}: expected true")
-        _record_fail()
+        fail_count = fail_count + 1
     }
 }
 
 fn is_false(cond: bool, label: string): unit io {
     if cond {
         io.println("  FAIL  ${label}: expected false")
-        _record_fail()
+        fail_count = fail_count + 1
     } else {
         io.println("  ok  ${label}")
-        _record_pass()
+        pass_count = pass_count + 1
     }
 }
 
 fn fail(label: string): unit io {
     io.println("  FAIL  ${label}")
-    _record_fail()
+    fail_count = fail_count + 1
 }
 
-// Prints a summary and returns the number of failures. Use as the
-// return value of main so the exit code reflects test results.
+// Prints a summary and returns the number of failures.
 fn summary(): i32 io {
-    return _summary()
+    let total = pass_count + fail_count
+    if fail_count == 0 {
+        io.println("")
+        io.println("${pass_count}/${total} passed")
+    } else {
+        io.println("")
+        io.println("${pass_count}/${total} passed, ${fail_count} failed")
+    }
+    return fail_count
 }

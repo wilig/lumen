@@ -285,11 +285,36 @@ impl Parser {
             TokenKind::Extern => self.parse_extern_fn_decl().map(Item::ExternFn),
             TokenKind::Actor => self.parse_actor_decl().map(Item::Actor),
             TokenKind::Msg => self.parse_msg_handler().map(Item::MsgHandler),
+            TokenKind::Let => self.parse_global_let(false).map(Item::GlobalLet),
+            TokenKind::Var => self.parse_global_let(true).map(Item::GlobalLet),
             other => Err(self.error_here(format!(
-                "expected `fn`, `type`, `extern`, `actor`, or `msg` at top level, found {}",
+                "expected `fn`, `type`, `extern`, `actor`, `msg`, `let`, or `var` at top level, found {}",
                 describe_token(other)
             ))),
         }
+    }
+
+    fn parse_global_let(&mut self, mutable: bool) -> Result<GlobalLetDecl, ParseError> {
+        let start = self.peek().span;
+        // Consume the `let` or `var`.
+        self.bump();
+        let (name, name_span) = self.expect_ident("binding name")?;
+        let ty = if self.eat(&TokenKind::Colon).is_some() {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Eq, "`=` in top-level binding")?;
+        let value = self.parse_expr(ExprCtx::normal())?;
+        let end = value.span;
+        Ok(GlobalLetDecl {
+            name,
+            name_span,
+            ty,
+            value,
+            mutable,
+            span: merge(start, end),
+        })
     }
 
     fn parse_extern_fn_decl(&mut self) -> Result<ExternFnDecl, ParseError> {

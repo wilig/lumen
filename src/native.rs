@@ -148,6 +148,11 @@ struct NativeCodegen<'a> {
 
     /// Interned string literals: content → DataId.
     string_data: HashMap<String, DataId>,
+    /// Top-level `let`/`var` bindings materialized as static data.
+    /// name → (data id, Ty). Keys include bindings from both the
+    /// user's module and imported modules; the user's ones are
+    /// defined (with initial value bytes), imported ones are Linkage::Import.
+    global_data: HashMap<String, (DataId, Ty)>,
 
     /// Lambda FuncIds keyed by source span (line, col).
     lambda_ids: HashMap<(u32, u32), FuncId>,
@@ -530,6 +535,7 @@ impl<'a> NativeCodegen<'a> {
             bump_ptr_data,
             frame_chain_data,
             string_data: HashMap::new(),
+            global_data: HashMap::new(),
             lambda_ids: HashMap::new(),
             lambda_sigs: HashMap::new(),
             module_fn_ids: HashMap::new(),
@@ -543,11 +549,101 @@ impl<'a> NativeCodegen<'a> {
         })
     }
 
+    /// Declare a DataId for every module-level let/var binding (user's
+    /// module + imports), define the user's with its initial-value
+    /// bytes, leave imports as Linkage::Import. Only scalar
+    /// initializers at MVP: i32/u32/i64/u64/f64/bool/char/unit.
+    fn declare_globals(
+        &mut self,
+        module: &ast::Module,
+        imported_modules: &[(&str, &ast::Module)],
+    ) -> Result<(), NativeError> {
+        // Process imports first so the user module's definitions can
+        // override (no actual override path today, but consistent
+        // ordering).
+        for &(mod_name, mod_ast) in imported_modules {
+            for item in &mod_ast.items {
+                if let Item::GlobalLet(gl) = item {
+                    let ty = match self.info.module_globals.get(mod_name)
+                        .and_then(|m| m.get(&gl.name))
+                    {
+                        Some((t, _)) => t.clone(),
+                        None => continue,
+                    };
+                    let symbol = global_symbol(mod_name, &gl.name);
+                    if self.global_data.contains_key(&gl.name) {
+                        continue;
+                    }
+                    let id = self.obj
+                        .declare_data(&symbol, Linkage::Export, gl.mutable, false)
+                        .map_err(|e| NativeError {
+                            span: gl.span,
+                            message: format!("declare global `{}`: {e}", gl.name),
+                        })?;
+                    let bytes = evaluate_const_initializer(&gl.value, &ty)
+                        .ok_or_else(|| NativeError {
+                            span: gl.value.span,
+                            message: "top-level let/var initializer must be a constant scalar (int/float/bool/char)".into(),
+                        })?;
+                    let mut desc = DataDescription::new();
+                    desc.define(bytes.into_boxed_slice());
+                    self.obj.define_data(id, &desc).map_err(|e| NativeError {
+                        span: gl.span,
+                        message: format!("define global `{}`: {e}", gl.name),
+                    })?;
+                    self.global_data.insert(gl.name.clone(), (id, ty));
+                }
+            }
+        }
+        for item in &module.items {
+            if let Item::GlobalLet(gl) = item {
+                let ty = match self.info.globals.get(&gl.name) {
+                    Some((t, _)) => t.clone(),
+                    None => continue,
+                };
+                if self.global_data.contains_key(&gl.name) {
+                    continue;
+                }
+                let symbol = global_symbol("user", &gl.name);
+                let id = self.obj
+                    .declare_data(&symbol, Linkage::Export, gl.mutable, false)
+                    .map_err(|e| NativeError {
+                        span: gl.span,
+                        message: format!("declare global `{}`: {e}", gl.name),
+                    })?;
+                let bytes = evaluate_const_initializer(&gl.value, &ty)
+                    .ok_or_else(|| NativeError {
+                        span: gl.value.span,
+                        message: "top-level let/var initializer must be a constant scalar (int/float/bool/char)".into(),
+                    })?;
+                let mut desc = DataDescription::new();
+                desc.define(bytes.into_boxed_slice());
+                self.obj.define_data(id, &desc).map_err(|e| NativeError {
+                    span: gl.span,
+                    message: format!("define global `{}`: {e}", gl.name),
+                })?;
+                self.global_data.insert(gl.name.clone(), (id, ty));
+            }
+        }
+        Ok(())
+    }
+
     fn compile_module(&mut self, module: &ast::Module, imported_modules: &[(&str, &ast::Module)]) -> Result<(), NativeError> {
         self.uses_io = module.imports.iter().any(|im| im.path == ["std", "io"]);
 
         // Intern string literals + frame messages.
         self.intern_all_strings(module);
+
+        // Materialize top-level let/var bindings as static data.
+        // User's module: defined here with initial bytes.
+        // Imported modules: declared as Import so they link to the
+        // user's definition. We define the combined set below; each
+        // binding's Lumen name is used as the symbol so Linkage::Import
+        // from one compilation and Linkage::Export from another would
+        // match if modules compiled separately — today we compile
+        // everything in one pass, so every binding is defined in the
+        // user module's object file and exported.
+        self.declare_globals(module, imported_modules)?;
 
         // Declare all user functions. Generic ones are stashed as templates
         // — they get monomorphized on demand from each call site.
@@ -1567,6 +1663,21 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
             }
             StmtKind::Assign { name, value } => {
+                // Assignment to a module-level `var`: compile the RHS
+                // and store into the static slot.
+                if !self.names.contains_key(name) {
+                    if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
+                        let val = self.compile_expr(value)?;
+                        let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
+                        let addr = self.builder.ins().global_value(PTR, gv);
+                        // Pointer-typed globals would need rc decr on the
+                        // old value and incr on the new — MVP is scalar
+                        // only, so skip.
+                        let _ = ty;
+                        self.builder.ins().store(MemFlags::new(), val, addr, 0);
+                        return Ok(());
+                    }
+                }
                 // Compile the new value FIRST, before decrementing the old.
                 // This prevents use-after-free when the RHS references the
                 // variable being assigned to (e.g. `x = update(x)`).
@@ -1712,6 +1823,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     // A function name used as a value — emit its address as a PTR.
                     let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
                     Ok(self.builder.ins().func_addr(PTR, func_ref))
+                } else if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
+                    // Module-level let/var binding: load from the static slot.
+                    let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
+                    let addr = self.builder.ins().global_value(PTR, gv);
+                    let cl_ty = lumen_to_cl(&ty);
+                    Ok(self.builder.ins().load(cl_ty, MemFlags::new(), addr, 0))
                 } else {
                     Err(NativeError {
                         span: expr.span,
@@ -1756,6 +1873,23 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 else_block,
             } => self.compile_if(cond, then_block, else_block, expr.span),
             ExprKind::Field { receiver, name } => {
+                // Cross-module global: `module.binding` — load from
+                // the imported module's static slot. We registered
+                // these under the same `global_data` keys as the
+                // user's own globals during declare_globals.
+                if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if self.cg.info.module_globals.get(mod_name)
+                        .map(|m| m.contains_key(name))
+                        .unwrap_or(false)
+                    {
+                        if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
+                            let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
+                            let addr = self.builder.ins().global_value(PTR, gv);
+                            let cl_ty = lumen_to_cl(&ty);
+                            return Ok(self.builder.ins().load(cl_ty, MemFlags::new(), addr, 0));
+                        }
+                    }
+                }
                 let ptr = self.compile_expr(receiver)?;
                 let recv_ty = self.infer_ty(receiver)?;
                 let type_name = match recv_ty {
@@ -3917,6 +4051,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     let params: Vec<Ty> = sig.params.iter().map(|(_, t)| t.clone()).collect();
                     return Ok(Ty::FnPtr { params, ret: Box::new(sig.ret.clone()) });
                 }
+                // Module-level let/var binding.
+                if let Some((_, ty)) = self.cg.global_data.get(name) {
+                    return Ok(ty.clone());
+                }
                 Ty::I32 // fallback
             }
             ExprKind::Paren(e) => self.infer_ty(e)?,
@@ -4244,6 +4382,14 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 Ty::User(resolved)
             }
             ExprKind::Field { receiver, name } => {
+                // Cross-module global read: `module.binding`.
+                if let ExprKind::Ident(mod_name) = &receiver.kind {
+                    if let Some(globals) = self.cg.info.module_globals.get(mod_name) {
+                        if let Some((ty, _)) = globals.get(name) {
+                            return Ok(ty.clone());
+                        }
+                    }
+                }
                 let recv_ty = self.infer_ty(receiver)?;
                 let type_name = if let Ty::User(tn) = recv_ty {
                     Some(tn)
@@ -4357,6 +4503,77 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 /// Returns true when the expression reads an existing reference rather than
 /// producing a fresh allocation. Used to decide whether `var = expr` needs
 /// rc_incr (copies need it, fresh values already have rc=1).
+/// Compute initial bytes for a top-level binding from its initializer
+/// expression. MVP: only scalar literals (optionally unary-negated).
+/// Returns None if the initializer isn't reducible to a constant at
+/// compile time, which the caller reports as an error.
+fn evaluate_const_initializer(e: &Expr, ty: &Ty) -> Option<Vec<u8>> {
+    let (magnitude_u64, negative) = extract_int_literal(e);
+    if let Some(v) = magnitude_u64 {
+        return Some(encode_int(v, negative, ty));
+    }
+    match &e.kind {
+        ExprKind::FloatLit(v) => {
+            if matches!(ty, Ty::F64) {
+                Some(v.to_le_bytes().to_vec())
+            } else { None }
+        }
+        ExprKind::BoolLit(b) => {
+            if matches!(ty, Ty::Bool) {
+                Some(vec![if *b { 1 } else { 0 }, 0, 0, 0])
+            } else { None }
+        }
+        ExprKind::CharLit(c) => {
+            if matches!(ty, Ty::Char) {
+                Some(c.to_le_bytes().to_vec())
+            } else { None }
+        }
+        ExprKind::UnitLit => {
+            if matches!(ty, Ty::Unit) {
+                Some(vec![0, 0, 0, 0])
+            } else { None }
+        }
+        ExprKind::Paren(inner) => evaluate_const_initializer(inner, ty),
+        _ => None,
+    }
+}
+
+/// Unwrap `-literal` / `literal` into a (magnitude, negative) pair so
+/// the caller can encode against the declared type's width.
+fn extract_int_literal(e: &Expr) -> (Option<u64>, bool) {
+    match &e.kind {
+        ExprKind::IntLit { value, .. } => (Some(*value), false),
+        ExprKind::Unary { op: UnaryOp::Neg, rhs } => {
+            if let ExprKind::IntLit { value, .. } = &rhs.kind {
+                return (Some(*value), true);
+            }
+            (None, false)
+        }
+        ExprKind::Paren(inner) => extract_int_literal(inner),
+        _ => (None, false),
+    }
+}
+
+fn encode_int(magnitude: u64, negative: bool, ty: &Ty) -> Vec<u8> {
+    match ty {
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::Char => {
+            let v: i32 = if negative { -(magnitude as i64) as i32 } else { magnitude as i32 };
+            v.to_le_bytes().to_vec()
+        }
+        Ty::I64 | Ty::U64 => {
+            let v: i64 = if negative { -(magnitude as i64) } else { magnitude as i64 };
+            v.to_le_bytes().to_vec()
+        }
+        _ => vec![0, 0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+/// Symbol name for a top-level binding. Namespaced by module so two
+/// different modules can have the same Lumen-level binding name.
+fn global_symbol(module: &str, name: &str) -> String {
+    format!("lumen_global_{}_{}", module.replace('/', "_"), name)
+}
+
 fn is_borrowing_expr(kind: &ExprKind) -> bool {
     matches!(
         kind,

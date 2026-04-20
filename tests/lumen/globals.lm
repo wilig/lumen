@@ -1,0 +1,38 @@
+// Module-level `let` / `var`. let is immutable, var is mutable from
+// any fn in the module.
+import std/test
+
+let limit: i32 = 100
+let pi: f64 = 3.14
+let active: bool = true
+let first_char: char = 'A'
+
+var counter: i32 = 0
+var total: i64 = 0i64
+
+fn bump(): unit {
+    counter = counter + 1
+}
+
+fn add(n: i64): unit {
+    total = total + n
+}
+
+fn main(): i32 io {
+    test.eq(limit, 100, "let i32")
+    test.eq(pi, 3.14, "let f64")
+    test.is_true(active, "let bool")
+    test.eq(first_char, 'A', "let char")
+
+    test.eq(counter, 0, "var initial")
+    bump()
+    bump()
+    bump()
+    test.eq(counter, 3, "var after bumps")
+
+    add(10i64)
+    add(32i64)
+    test.eq(total, 42i64, "i64 accumulator")
+
+    return test.summary()
+}
