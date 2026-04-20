@@ -1,0 +1,11 @@
+a=A smile=😀
+byte=65
+match
+not A
+len bytes=6
+char count=5
+s[0]=h
+s[1]=é
+s[2]=l
+s[4]=o
+from_char: ♥

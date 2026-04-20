@@ -44,6 +44,41 @@ ambiguous (e.g. `list.new()` returns `List<Error>` until pinned).
 Integer literals default to `i32`. Suffix with `_i64`, `_u32`, `_u64`
 when needed. `list.len` / `string.len` return `i32`.
 
+## Characters
+
+`char` is one Unicode scalar value (what Rust calls `char`, Go calls
+`rune`). Literals: `'A'`, `'\n'`, `'\t'`, `'\r'`, `'\\'`, `'\''`,
+`'\0'`, `'\u{1F600}'`.
+
+`char` and `i32` are distinct — no implicit coercion either way.
+
+```lumen
+let c: char = 'A'
+if c == 'Z' { ... }               // compare with char literals
+io.println(c)                      // prints the char as UTF-8 bytes
+io.println(string.from_char(c))    // 1-char string "A"
+```
+
+`b'x'` is a **byte** literal — sugar for the byte's numeric i32 value,
+ASCII only. Use when you want a raw byte for buffer work:
+
+```lumen
+if bytes.get(buf, 0) == b'{' { ... }
+```
+
+### String indexing
+
+`string.char_at(s, i)` returns the i-th *character* (not byte),
+walking UTF-8 from the start — O(n). `string.len(s)` is the **byte**
+length. `string.char_count(s)` is the character count (also O(n)).
+
+```lumen
+let s = "héllo"
+string.len(s)          // 6 bytes
+string.char_count(s)   // 5 chars
+string.char_at(s, 1)   // 'é'  (not a raw continuation byte)
+```
+
 ## Calls: no method dispatch on ordinary values
 
 Ordinary values don't have methods. All stdlib calls are module-qualified.

@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, Type as CLType, Value};
+use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlags, StackSlotData, StackSlotKind, Type as CLType, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
@@ -98,6 +98,7 @@ struct NativeCodegen<'a> {
     libc_free: FuncId,
     helper_concat: FuncId,
     helper_println: FuncId,
+    helper_utf8_encode: FuncId,
     helper_assert: FuncId,
     helper_print_frames: FuncId,
     helper_rc_alloc: FuncId,
@@ -281,6 +282,15 @@ impl<'a> NativeCodegen<'a> {
         println_sig.params.push(AbiParam::new(PTR));
         let helper_println = obj
             .declare_function("lumen_println", Linkage::Import, &println_sig)
+            .unwrap();
+
+        // lumen_utf8_encode(cp: i32, out: ptr) -> i32 bytes_written
+        let mut utf8_enc_sig = obj.make_signature();
+        utf8_enc_sig.params.push(AbiParam::new(cl_types::I32));
+        utf8_enc_sig.params.push(AbiParam::new(PTR));
+        utf8_enc_sig.returns.push(AbiParam::new(cl_types::I32));
+        let helper_utf8_encode = obj
+            .declare_function("lumen_utf8_encode", Linkage::Import, &utf8_enc_sig)
             .unwrap();
 
         // lumen_assert(cond: i32, msg: ptr, file: ptr, line: i32, col: i32, debug: i32)
@@ -479,6 +489,7 @@ impl<'a> NativeCodegen<'a> {
             libc_free,
             helper_concat,
             helper_println,
+            helper_utf8_encode,
             helper_assert,
             helper_print_frames,
             helper_rc_alloc,
@@ -1677,6 +1688,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 Ok(self.builder.ins().iconst(ty, val))
             }
             ExprKind::FloatLit(v) => Ok(self.builder.ins().f64const(*v)),
+            ExprKind::CharLit(v) => Ok(self.builder.ins().iconst(cl_types::I32, *v as i64)),
             ExprKind::BoolLit(b) => {
                 Ok(self.builder.ins().iconst(cl_types::I32, if *b { 1 } else { 0 }))
             }
@@ -2963,6 +2975,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             Ty::F64 => self.fmt_call(fns.f64, fns.leading, &[val]),
             Ty::Bool => self.fmt_call(fns.bool, fns.leading, &[val]),
             Ty::String | Ty::Bytes => self.fmt_call(fns.str, fns.leading, &[val]),
+            Ty::Char => {
+                // Encode the scalar into UTF-8 bytes on the stack, then
+                // emit as a raw byte sequence (no len prefix — char fmt
+                // is 1..=4 bytes inline).
+                let slot = self.builder.create_sized_stack_slot(
+                    StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 0),
+                );
+                let ptr = self.builder.ins().stack_addr(PTR, slot, 0);
+                let enc_ref = self.cg.obj
+                    .declare_func_in_func(self.cg.helper_utf8_encode, self.builder.func);
+                let enc_call = self.builder.ins().call(enc_ref, &[val, ptr]);
+                let n = self.builder.inst_results(enc_call)[0];
+                self.fmt_call(fns.raw, fns.leading, &[ptr, n]);
+            }
             Ty::Unit => {
                 self.emit_fmt_raw(target, "unit");
             }
@@ -3683,6 +3709,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 _ => Ty::I32,
             },
             ExprKind::FloatLit(_) => Ty::F64,
+            ExprKind::CharLit(_) => Ty::Char,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::UnitLit => Ty::Unit,
             ExprKind::StringLit(_) => Ty::String,
@@ -4135,7 +4162,7 @@ fn tuple_as_fields(elems: &[Ty]) -> Vec<(String, Ty)> {
 
 fn lumen_to_cl(ty: &Ty) -> CLType {
     match ty {
-        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => cl_types::I32,
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::Char => cl_types::I32,
         Ty::I64 | Ty::U64 => cl_types::I64,
         Ty::F64 => cl_types::F64,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => PTR,
@@ -4150,7 +4177,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
 fn is_scalar(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Bool | Ty::Unit
+        Ty::I32 | Ty::U32 | Ty::I64 | Ty::U64 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Char
         // Lists and maps are treated as scalar for RC purposes: they
         // manage their own memory via realloc inside set/push/remove. RC
         // decrementing one after realloc moved it would double-free.
@@ -4230,6 +4257,7 @@ fn mangle_ty(t: &Ty) -> String {
         Ty::F64 => "F64".into(),
         Ty::Bool => "Bool".into(),
         Ty::String => "Str".into(),
+        Ty::Char => "Char".into(),
         Ty::Bytes => "Bytes".into(),
         Ty::Unit => "Unit".into(),
         Ty::List(inner) => format!("L{}", mangle_ty(inner)),
@@ -4264,7 +4292,7 @@ fn ty_more_specific(annot: &Ty, inferred: &Ty) -> bool {
 
 fn native_sizeof(ty: &Ty) -> i32 {
     match ty {
-        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit => 4,
+        Ty::I32 | Ty::U32 | Ty::Bool | Ty::Unit | Ty::Char => 4,
         Ty::I64 | Ty::U64 | Ty::F64 => 8,
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
         Ty::Generic(_) => 8, // see comment in lumen_to_cl

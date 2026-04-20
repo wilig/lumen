@@ -58,6 +58,10 @@ pub enum TokenKind {
     FloatLit(f64),
     /// Decoded string — escape sequences have been resolved.
     StringLit(String),
+    /// `'x'` / `'\n'` / `'\u{1F600}'` — one Unicode scalar value,
+    /// stored as u32. Runtime representation is i32 (held in
+    /// `Ty::Char`).
+    CharLit(u32),
     /// Interpolated string with at least one `\{expr}` placeholder.
     /// Each part is either a literal chunk or the raw source text of an
     /// embedded expression (the parser re-lexes & parses each Expr).
@@ -264,6 +268,11 @@ impl<'a> Lexer<'a> {
             });
         };
 
+        // Byte literal `b'x'` must beat the ident/keyword rule below.
+        // `b` followed by `'` is unambiguously a byte literal.
+        if b == b'b' && self.peek_at(1) == Some(b'\'') {
+            return self.lex_byte(start, line, col);
+        }
         if b.is_ascii_alphabetic() || b == b'_' {
             return Ok(self.lex_ident_or_keyword(start, line, col));
         }
@@ -272,6 +281,9 @@ impl<'a> Lexer<'a> {
         }
         if b == b'"' {
             return self.lex_string(start, line, col);
+        }
+        if b == b'\'' {
+            return self.lex_char(start, line, col);
         }
 
         // Single- and two-char punctuation/operators.
@@ -568,6 +580,198 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+    }
+
+    /// Lex a `'x'`-form character literal into a `CharLit(u32)` token.
+    /// Accepts one Unicode scalar value: a single character, a simple
+    /// escape (`\n \r \t \\ \' \0`), or a `\u{HHHH}` hex escape.
+    fn lex_char(&mut self, start: u32, line: u32, col: u32) -> Result<Token, LexError> {
+        self.bump(); // opening '
+        let value: u32 = match self.peek() {
+            None => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "unterminated character literal".into(),
+            }),
+            Some(b'\'') => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "empty character literal".into(),
+            }),
+            Some(b'\\') => self.lex_char_escape(start, line, col)?,
+            Some(b'\n') => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "unterminated character literal (newline)".into(),
+            }),
+            Some(b) => {
+                let char_len = utf8_char_len(b);
+                let end = self.pos + char_len;
+                if end > self.src.len() {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "invalid UTF-8 in character literal".into(),
+                    });
+                }
+                let slice = &self.src[self.pos..end];
+                let s = std::str::from_utf8(slice).map_err(|_| LexError {
+                    span: self.span_from(start, line, col),
+                    message: "invalid UTF-8 in character literal".into(),
+                })?;
+                let c = s.chars().next().ok_or_else(|| LexError {
+                    span: self.span_from(start, line, col),
+                    message: "empty character literal".into(),
+                })?;
+                self.pos = end;
+                self.col += 1;
+                c as u32
+            }
+        };
+        match self.peek() {
+            Some(b'\'') => { self.bump(); }
+            _ => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "character literal contains more than one character".into(),
+            }),
+        }
+        Ok(Token {
+            kind: TokenKind::CharLit(value),
+            span: self.span_from(start, line, col),
+        })
+    }
+
+    /// Byte literal `b'x'` / `b'\n'`. ASCII only; rejects non-ASCII
+    /// bytes and non-ASCII escapes. Emits an IntLit — byte literals
+    /// are just syntactic sugar for writing the byte's numeric value
+    /// directly.
+    fn lex_byte(&mut self, start: u32, line: u32, col: u32) -> Result<Token, LexError> {
+        self.bump(); // b
+        self.bump(); // opening '
+        let value: u8 = match self.peek() {
+            None => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "unterminated byte literal".into(),
+            }),
+            Some(b'\'') => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "empty byte literal".into(),
+            }),
+            Some(b'\\') => {
+                let v = self.lex_char_escape(start, line, col)?;
+                if v > 0x7f {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "byte literal must be ASCII; use a char literal for non-ASCII".into(),
+                    });
+                }
+                v as u8
+            }
+            Some(b'\n') => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "unterminated byte literal (newline)".into(),
+            }),
+            Some(b) => {
+                if !b.is_ascii() {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "byte literal must be ASCII; use a char literal for non-ASCII".into(),
+                    });
+                }
+                self.bump();
+                b
+            }
+        };
+        match self.peek() {
+            Some(b'\'') => { self.bump(); }
+            _ => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "byte literal contains more than one byte".into(),
+            }),
+        }
+        Ok(Token {
+            kind: TokenKind::IntLit { value: value as u64, suffix: None },
+            span: self.span_from(start, line, col),
+        })
+    }
+
+    /// Decode an escape sequence starting at `\` (pos points at `\`)
+    /// into its Unicode scalar value. Advances past the entire escape.
+    /// Shared between char literals, byte literals, and (future) string
+    /// literal escape handling.
+    fn lex_char_escape(&mut self, start: u32, line: u32, col: u32) -> Result<u32, LexError> {
+        self.bump(); // consume '\'
+        let v: u32 = match self.peek() {
+            Some(b'n') => { self.bump(); '\n' as u32 }
+            Some(b't') => { self.bump(); '\t' as u32 }
+            Some(b'r') => { self.bump(); '\r' as u32 }
+            Some(b'\\') => { self.bump(); '\\' as u32 }
+            Some(b'\'') => { self.bump(); '\'' as u32 }
+            Some(b'"') => { self.bump(); '"' as u32 }
+            Some(b'0') => { self.bump(); 0 }
+            Some(b'u') => {
+                self.bump();
+                if self.peek() != Some(b'{') {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "expected `{` after `\\u` in escape".into(),
+                    });
+                }
+                self.bump();
+                let mut n: u32 = 0;
+                let mut digits = 0;
+                while let Some(c) = self.peek() {
+                    let d = match c {
+                        b'0'..=b'9' => c - b'0',
+                        b'a'..=b'f' => c - b'a' + 10,
+                        b'A'..=b'F' => c - b'A' + 10,
+                        b'}' => break,
+                        _ => return Err(LexError {
+                            span: self.span_from(start, line, col),
+                            message: "expected hex digit or `}` in `\\u{...}`".into(),
+                        }),
+                    };
+                    n = (n << 4) | d as u32;
+                    digits += 1;
+                    if digits > 6 {
+                        return Err(LexError {
+                            span: self.span_from(start, line, col),
+                            message: "`\\u{...}` accepts at most 6 hex digits".into(),
+                        });
+                    }
+                    self.bump();
+                }
+                if self.peek() != Some(b'}') {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "unterminated `\\u{...}`".into(),
+                    });
+                }
+                self.bump();
+                if digits == 0 {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: "empty `\\u{}` escape".into(),
+                    });
+                }
+                if char::from_u32(n).is_none() {
+                    return Err(LexError {
+                        span: self.span_from(start, line, col),
+                        message: format!("\\u{{{:X}}} is not a valid Unicode scalar value", n),
+                    });
+                }
+                n
+            }
+            Some(c) => {
+                let (s, l, co) = self.here();
+                self.bump();
+                return Err(LexError {
+                    span: Span::new(s, self.pos as u32, l, co),
+                    message: format!("unknown escape sequence `\\{}`", escape_byte(c)),
+                });
+            }
+            None => return Err(LexError {
+                span: self.span_from(start, line, col),
+                message: "unterminated escape sequence".into(),
+            }),
+        };
+        Ok(v)
     }
 
     fn lex_string(&mut self, start: u32, line: u32, col: u32) -> Result<Token, LexError> {

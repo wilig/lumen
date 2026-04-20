@@ -1,0 +1,34 @@
+// char literals, byte literals, string<->char operations, UTF-8.
+import std/io
+import std/string
+
+fn main(): i32 io {
+    // literals + interpolation
+    let a: char = 'A'
+    let nl: char = '\n'
+    let smile: char = '\u{1F600}'
+    io.println("a=\{a} smile=\{smile}")
+
+    // byte literal is sugar for the byte's numeric value (i32)
+    let b: i32 = b'A'
+    io.println("byte=\{b}")
+
+    // char comparisons use char literals
+    let c: char = 'Z'
+    if c == 'Z' { io.println("match") }
+    if c != 'A' { io.println("not A") }
+
+    // char_at walks UTF-8 — indexed by char, not byte
+    let s: string = "héllo"
+    io.println("len bytes=\{string.len(s)}")
+    io.println("char count=\{string.char_count(s)}")
+    io.println("s[0]=\{string.char_at(s, 0)}")
+    io.println("s[1]=\{string.char_at(s, 1)}")  // é — 2 UTF-8 bytes
+    io.println("s[2]=\{string.char_at(s, 2)}")
+    io.println("s[4]=\{string.char_at(s, 4)}")
+
+    // from_char: scalar → one-char string
+    io.println("from_char: \{string.from_char('♥')}")
+
+    return 0
+}

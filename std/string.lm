@@ -7,9 +7,16 @@ extern fn from_bytes(b: bytes): string link "lumen_string_from_bytes"
 extern fn len(s: string): i32 link "lumen_bytes_len"
 extern fn eq(a: string, b: string): i32 link "lumen_string_eq"
 
-fn char_at(s: string, i: i32): i32 {
-    return bytes.get(bytes.from_string(s), i)
-}
+// Returns the i-th character (by char index, not byte index) as a
+// Unicode scalar value. Returns -1 cast to char if i is out of range.
+extern fn char_at(s: string, i: i32): char link "lumen_string_char_at"
+
+// Number of Unicode scalar values in the string. O(n) — walks the
+// UTF-8 encoding.
+extern fn char_count(s: string): i32 link "lumen_string_char_count"
+
+// Make a one-character string from a Unicode scalar value.
+extern fn from_char(c: char): string link "lumen_string_from_char"
 
 fn substring(s: string, start: i32, count: i32): string {
     return from_bytes(bytes.slice(bytes.from_string(s), start, count))
@@ -54,11 +61,23 @@ fn index_of(haystack: string, needle: string): i32 {
     return 0 - 1
 }
 
-fn is_space(c: i32): i32 {
-    if c == 32 { return 1 }
-    if c == 9 { return 1 }
-    if c == 10 { return 1 }
-    if c == 13 { return 1 }
+fn is_space(c: char): i32 {
+    if c == ' ' { return 1 }
+    if c == '\t' { return 1 }
+    if c == '\n' { return 1 }
+    if c == '\r' { return 1 }
+    return 0
+}
+
+// Byte-level whitespace check, used internally by trim. ASCII whitespace
+// bytes (0x09, 0x0A, 0x0D, 0x20) never appear as UTF-8 continuation
+// bytes (which are 0x80..0xBF), so a byte-level scan is correct even
+// for non-ASCII input.
+fn is_space_byte(b: i32): i32 {
+    if b == 32 { return 1 }
+    if b == 9 { return 1 }
+    if b == 10 { return 1 }
+    if b == 13 { return 1 }
     return 0
 }
 
@@ -66,16 +85,14 @@ fn trim(s: string): string {
     let slen = len(s)
     var start = 0
     var end = slen
-    // Skip leading whitespace.
     for _ in range(0, slen) {
         if start < slen {
-            if is_space(char_at(s, start)) == 1 { start += 1 }
+            if is_space_byte(bytes.get(bytes.from_string(s), start)) == 1 { start += 1 }
         }
     }
-    // Skip trailing whitespace.
     for _ in range(0, slen) {
         if end > start {
-            if is_space(char_at(s, end - 1)) == 1 { end -= 1 }
+            if is_space_byte(bytes.get(bytes.from_string(s), end - 1)) == 1 { end -= 1 }
         }
     }
     return substring(s, start, end - start)

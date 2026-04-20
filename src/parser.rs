@@ -1280,6 +1280,13 @@ impl Parser {
                     span: tok.span,
                 })
             }
+            TokenKind::CharLit(v) => {
+                self.bump();
+                Ok(Expr {
+                    kind: ExprKind::CharLit(v),
+                    span: tok.span,
+                })
+            }
             TokenKind::InterpolatedString(parts) => {
                 self.bump();
                 let mut pieces = Vec::with_capacity(parts.len());
@@ -1677,6 +1684,7 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::Slash => "`/`".into(),
         TokenKind::Percent => "`%`".into(),
         TokenKind::Eof => "end of file".into(),
+        TokenKind::CharLit(_) => "character literal".into(),
     }
 }
 

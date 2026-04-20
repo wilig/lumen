@@ -246,6 +246,8 @@ pub enum ExprKind {
     },
     FloatLit(f64),
     StringLit(String),
+    /// `'x'` / `'\u{1F600}'` — one Unicode scalar value as u32.
+    CharLit(u32),
     BoolLit(bool),
     UnitLit,
 

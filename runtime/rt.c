@@ -141,6 +141,118 @@ int32_t lumen_bytes_get(int64_t bytes_ptr, int32_t index) {
     return (int32_t)(unsigned char)buf[4 + index];
 }
 
+// Encode a Unicode scalar value into UTF-8 bytes. `out` must have room
+// for at least 4 bytes. Returns the number of bytes written (1..=4).
+// Used by codegen for char formatting and by the std/char module.
+int32_t lumen_utf8_encode(int32_t cp_i32, char *out) {
+    uint32_t cp = (uint32_t)cp_i32;
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+// Decode one UTF-8 scalar starting at byte offset `byte_i` in `bytes_ptr`.
+// Returns the scalar value, or -1 if the byte position is invalid
+// (continuation byte, truncated sequence, bad leading byte).
+int32_t lumen_utf8_decode_at(int64_t bytes_ptr, int32_t byte_i) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    if (byte_i < 0 || byte_i >= len) return -1;
+    unsigned char *p = (unsigned char *)(buf + 4 + byte_i);
+    unsigned char b0 = p[0];
+    if (b0 < 0x80) return (int32_t)b0;
+    if ((b0 & 0xE0) == 0xC0) {
+        if (byte_i + 1 >= len) return -1;
+        return ((b0 & 0x1F) << 6) | (p[1] & 0x3F);
+    }
+    if ((b0 & 0xF0) == 0xE0) {
+        if (byte_i + 2 >= len) return -1;
+        return ((b0 & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    }
+    if ((b0 & 0xF8) == 0xF0) {
+        if (byte_i + 3 >= len) return -1;
+        return ((b0 & 0x07) << 18) | ((p[1] & 0x3F) << 12)
+             | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+    }
+    return -1;
+}
+
+// How many UTF-8 bytes does the scalar at `byte_i` occupy? 1..=4, or 0
+// on invalid position. Used to advance a byte-based iterator one char
+// forward.
+int32_t lumen_utf8_char_width(int64_t bytes_ptr, int32_t byte_i) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    if (byte_i < 0 || byte_i >= len) return 0;
+    unsigned char b0 = (unsigned char)buf[4 + byte_i];
+    if (b0 < 0x80) return 1;
+    if ((b0 & 0xE0) == 0xC0) return 2;
+    if ((b0 & 0xF0) == 0xE0) return 3;
+    if ((b0 & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+// Count scalar values in a UTF-8 byte buffer. O(n).
+int32_t lumen_string_char_count(int64_t bytes_ptr) {
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    int32_t count = 0;
+    int32_t i = 0;
+    while (i < len) {
+        int32_t w = lumen_utf8_char_width(bytes_ptr, i);
+        if (w == 0) return count; // bail on malformed tail
+        count++;
+        i += w;
+    }
+    return count;
+}
+
+// Walk the UTF-8 buffer returning the scalar at char index `char_i`,
+// or -1 if out of range. Matches the user expectation that
+// string.char_at(s, 2) gives the third character, not the third byte.
+int32_t lumen_string_char_at(int64_t bytes_ptr, int32_t char_i) {
+    if (char_i < 0) return -1;
+    char *buf = (char *)(uintptr_t)bytes_ptr;
+    int32_t len = *(int32_t *)buf;
+    int32_t byte_i = 0;
+    int32_t k = 0;
+    while (byte_i < len) {
+        if (k == char_i) return lumen_utf8_decode_at(bytes_ptr, byte_i);
+        int32_t w = lumen_utf8_char_width(bytes_ptr, byte_i);
+        if (w == 0) return -1;
+        byte_i += w;
+        k++;
+    }
+    return -1;
+}
+
+// Allocate a Lumen string containing the UTF-8 encoding of a single
+// scalar value. Used by string.from_char.
+int64_t lumen_string_from_char(int32_t cp) {
+    char tmp[4];
+    int32_t n = lumen_utf8_encode(cp, tmp);
+    char *payload = alloc_bytes(n);
+    memcpy(payload + 4, tmp, n);
+    return (int64_t)(uintptr_t)payload;
+}
+
 // Allocate a new zero-filled bytes buffer.
 int64_t lumen_bytes_new(int32_t size) {
     char *payload = alloc_bytes(size);

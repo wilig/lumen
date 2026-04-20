@@ -46,6 +46,11 @@ pub enum Ty {
     F64,
     Bool,
     String,
+    /// One Unicode scalar value (0..=0x10FFFF, excluding surrogates).
+    /// Runtime layout: i32 holding the scalar. Distinct from I32 — no
+    /// implicit coercion in either direction; use `char.to_i32(c)` or
+    /// `char.from_i32(n)` to cross the boundary.
+    Char,
     Unit,
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
@@ -84,6 +89,7 @@ impl Ty {
             Ty::F64 => "f64".into(),
             Ty::Bool => "bool".into(),
             Ty::String => "string".into(),
+            Ty::Char => "char".into(),
             Ty::Bytes => "bytes".into(),
             Ty::Tuple(elems) => {
                 let inner: Vec<String> = elems.iter().map(|t| t.display()).collect();
@@ -656,6 +662,7 @@ pub fn resolve_type_with_params(
             "f64" if args.is_empty() => Ok(Ty::F64),
             "bool" if args.is_empty() => Ok(Ty::Bool),
             "string" if args.is_empty() => Ok(Ty::String),
+            "char" if args.is_empty() => Ok(Ty::Char),
             "bytes" if args.is_empty() => Ok(Ty::Bytes),
             "unit" if args.is_empty() => Ok(Ty::Unit),
             "Option" if args.len() == 1 => {
@@ -889,6 +896,7 @@ fn mangle_ty_for_type_inst(t: &Ty) -> String {
         Ty::F64 => "F64".into(),
         Ty::Bool => "Bool".into(),
         Ty::String => "Str".into(),
+        Ty::Char => "Char".into(),
         Ty::Bytes => "Bytes".into(),
         Ty::Unit => "Unit".into(),
         Ty::List(inner) => format!("L{}", mangle_ty_for_type_inst(inner)),
@@ -1593,6 +1601,7 @@ impl<'a> FnChecker<'a> {
             },
             ExprKind::FloatLit(_) => Ty::F64,
             ExprKind::StringLit(_) => Ty::String,
+            ExprKind::CharLit(_) => Ty::Char,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::UnitLit => Ty::Unit,
 
