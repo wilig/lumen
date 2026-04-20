@@ -1515,7 +1515,7 @@ impl<'a> FnChecker<'a> {
                 if let Some(sig) = sig {
                     if !sig.type_params.is_empty() {
                         self.check_effect(sig.effect, expr.span);
-                        self.check_args_against_params(&sig.params, args, expr.span);
+                        self.check_generic_call(&sig, args, expr.span);
                         let mut subs: HashMap<String, Ty> = HashMap::new();
                         // Seed from arg types.
                         let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
@@ -2111,22 +2111,32 @@ impl<'a> FnChecker<'a> {
                 type_params: s.type_params.clone(),
             }) {
                 self.check_effect(sig.effect, whole_span);
-                self.check_args_against_params(&sig.params, args, whole_span);
-                // Generic callee: infer subs from arg types, substitute
-                // and concretize the return type so the call site sees
-                // the concrete instantiation (e.g. Pair$I32_I32) instead
-                // of the deferred form (e.g. Pair$GT_I32).
                 if !sig.type_params.is_empty() {
+                    // Generic callee: unify-then-check. Doing the eager
+                    // check_args_against_params here would compare the
+                    // raw param type (e.g. Maybe<T> = Maybe$GT) against a
+                    // monomorphized arg type (e.g. Maybe$I32) which the
+                    // plain compatibility check can't bridge.
+                    self.check_generic_call(&sig, args, whole_span);
                     let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
                     let mut subs: HashMap<String, Ty> = HashMap::new();
                     for (i, (_, pty)) in sig.params.iter().enumerate() {
                         if let Some(at) = arg_tys.get(i) {
-                            unify_for_subs(pty, at, &mut subs);
+                            self.unify_with_template_args(pty, at, &mut subs);
                         }
+                    }
+                    // Record the resolved type args so the codegen can
+                    // use them (its own unify doesn't bridge user-types).
+                    if sig.type_params.iter().all(|p| subs.contains_key(p)) {
+                        let type_args: Vec<Ty> = sig.type_params.iter()
+                            .map(|p| subs.get(p).cloned().unwrap())
+                            .collect();
+                        self.call_resolutions.insert(whole_span.start, type_args);
                     }
                     let subbed = substitute_generic(sig.ret.clone(), &subs);
                     return self.concretize_ty(&subbed, &subs);
                 }
+                self.check_args_against_params(&sig.params, args, whole_span);
                 return sig.ret;
             }
 
@@ -2181,6 +2191,66 @@ impl<'a> FnChecker<'a> {
             message: "not a callable function or function pointer".into(),
         });
         Ty::Error
+    }
+
+    /// Arity + named-arg + per-arg type check for a generic callee.
+    /// Two-pass: first infer all arg types and seed the substitution
+    /// from each (param, arg) pair via template-aware unification, then
+    /// validate each arg against the substituted param type. This is
+    /// what lets `unwrap_or<T>(m: Maybe<T>, default: T)` accept
+    /// `(Maybe<i32>, i32)` — the first arg fixes T=I32, then the
+    /// second arg is checked against i32 instead of T.
+    fn check_generic_call(
+        &mut self,
+        sig: &FnSig,
+        args: &[Arg],
+        call_span: Span,
+    ) {
+        if args.len() != sig.params.len() {
+            self.errors.push(TypeError {
+                span: call_span,
+                message: format!(
+                    "expected {} arguments, found {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+            });
+            return;
+        }
+        let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+        let mut subs: HashMap<String, Ty> = HashMap::new();
+        for (i, (_, pty)) in sig.params.iter().enumerate() {
+            self.unify_with_template_args(pty, &arg_tys[i], &mut subs);
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let (pname, pty) = &sig.params[i];
+            if let Some(aname) = &arg.name {
+                if aname != pname {
+                    self.errors.push(TypeError {
+                        span: arg.span,
+                        message: format!(
+                            "named argument `{aname}` does not match parameter `{pname}`"
+                        ),
+                    });
+                }
+            }
+            // substitute_generic only swaps Ty::Generic leaves; we
+            // also need to re-mangle deferred user types like
+            // Maybe$GT → Maybe$I32 once T is bound. concretize_ty
+            // does both.
+            let subbed = substitute_generic(pty.clone(), &subs);
+            let expected = self.concretize_ty(&subbed, &subs);
+            if !compatible(&arg_tys[i], &expected) {
+                self.errors.push(TypeError {
+                    span: arg.span,
+                    message: format!(
+                        "type mismatch: expected {}, found {}",
+                        expected.display(),
+                        arg_tys[i].display()
+                    ),
+                });
+            }
+        }
     }
 
     fn check_args_against_params(
@@ -2721,6 +2791,34 @@ impl<'a> FnChecker<'a> {
         arm_ty.unwrap_or(Ty::Error)
     }
 
+    /// Declare every binding in `payload` as Ty::Error. Used when a
+    /// pattern can't be properly checked (scrutinee errored, variant
+    /// unknown, etc.) so downstream references to the bound names
+    /// don't cascade into "unknown identifier" errors.
+    fn declare_pattern_bindings_as_error(&mut self, payload: Option<&VariantPatPayload>) {
+        let Some(payload) = payload else { return };
+        match payload {
+            VariantPatPayload::Positional(pats) => {
+                for p in pats { self.declare_bindings_as_error(p); }
+            }
+            VariantPatPayload::Named(fields) => {
+                for f in fields { self.declare_bindings_as_error(&f.pattern); }
+            }
+        }
+    }
+
+    fn declare_bindings_as_error(&mut self, pat: &Pattern) {
+        match &pat.kind {
+            PatternKind::Binding(name) => {
+                self.declare(name, Ty::Error, false, pat.span);
+            }
+            PatternKind::Variant { payload, .. } => {
+                self.declare_pattern_bindings_as_error(payload.as_ref());
+            }
+            _ => {}
+        }
+    }
+
     fn check_pattern(&mut self, pat: &Pattern, expected: &Ty) {
         match &pat.kind {
             PatternKind::Wildcard => {}
@@ -2779,7 +2877,14 @@ impl<'a> FnChecker<'a> {
 
         let ty_name = match expected {
             Ty::User(n) => n.clone(),
-            Ty::Error => return,
+            Ty::Error => {
+                // Scrutinee already errored. Declare the pattern's
+                // bindings as Ty::Error so downstream code doesn't
+                // cascade into "unknown identifier `x`" errors on
+                // every use of the bound name.
+                self.declare_pattern_bindings_as_error(payload);
+                return;
+            }
             other => {
                 self.errors.push(TypeError {
                     span,
@@ -2788,6 +2893,7 @@ impl<'a> FnChecker<'a> {
                         other.display()
                     ),
                 });
+                self.declare_pattern_bindings_as_error(payload);
                 return;
             }
         };

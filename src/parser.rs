@@ -50,6 +50,84 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, ParseError> {
 /// Parse a single expression from a snippet of source — used to compile
 /// the body of a `\{...}` interpolation. Errors carry the surrounding
 /// string literal's span so the user sees a location they recognize.
+/// Shift every span in `e` by `offset` bytes. Used after parsing an
+/// interpolation's `\{...}` substring: spans emitted by the nested
+/// lexer/parser are relative to the substring, but downstream tables
+/// (call_resolutions, etc.) key off span.start and require global
+/// uniqueness across the whole source.
+fn shift_expr_spans(e: &mut Expr, offset: u32) {
+    e.span.start = e.span.start.saturating_add(offset);
+    e.span.end = e.span.end.saturating_add(offset);
+    match &mut e.kind {
+        ExprKind::Paren(i) | ExprKind::Unary { rhs: i, .. } | ExprKind::Try(i)
+        | ExprKind::Field { receiver: i, .. } => shift_expr_spans(i, offset),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            shift_expr_spans(lhs, offset);
+            shift_expr_spans(rhs, offset);
+        }
+        ExprKind::Call { callee, args } => {
+            shift_expr_spans(callee, offset);
+            for a in args { shift_expr_spans(&mut a.value, offset); }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            shift_expr_spans(receiver, offset);
+            for a in args { shift_expr_spans(&mut a.value, offset); }
+        }
+        ExprKind::StructLit { fields, spread, .. } => {
+            for f in fields { shift_expr_spans(&mut f.value, offset); }
+            if let Some(s) = spread { shift_expr_spans(s, offset); }
+        }
+        ExprKind::TupleLit(elems) => {
+            for e in elems { shift_expr_spans(e, offset); }
+        }
+        ExprKind::TupleField { receiver, .. } => shift_expr_spans(receiver, offset),
+        ExprKind::If { cond, then_block, else_block } => {
+            shift_expr_spans(cond, offset);
+            shift_block_spans(then_block, offset);
+            shift_block_spans(else_block, offset);
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            shift_expr_spans(scrutinee, offset);
+            for a in arms { shift_expr_spans(&mut a.body, offset); }
+        }
+        ExprKind::Block(b) => shift_block_spans(b, offset),
+        ExprKind::Lambda { body, .. } => shift_block_spans(body, offset),
+        ExprKind::Interpolated(parts) => {
+            for p in parts {
+                if let InterpPiece::Expr(e) = p { shift_expr_spans(e, offset); }
+            }
+        }
+        ExprKind::Cast { expr, .. } => shift_expr_spans(expr, offset),
+        ExprKind::Spawn { fields, .. } => {
+            for f in fields { shift_expr_spans(&mut f.value, offset); }
+        }
+        ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
+            shift_expr_spans(handle, offset);
+            for a in args { shift_expr_spans(&mut a.value, offset); }
+        }
+        _ => {}
+    }
+}
+
+fn shift_block_spans(b: &mut Block, offset: u32) {
+    for s in &mut b.stmts {
+        s.span.start = s.span.start.saturating_add(offset);
+        s.span.end = s.span.end.saturating_add(offset);
+        match &mut s.kind {
+            StmtKind::Let { value, .. } | StmtKind::Var { value, .. }
+            | StmtKind::Assign { value, .. } | StmtKind::Expr(value)
+            | StmtKind::Return(Some(value)) => shift_expr_spans(value, offset),
+            StmtKind::For { iter, body, .. } => {
+                shift_expr_spans(iter, offset);
+                shift_block_spans(body, offset);
+            }
+            StmtKind::LetTuple { value, .. } => shift_expr_spans(value, offset),
+            _ => {}
+        }
+    }
+    if let Some(tail) = &mut b.tail { shift_expr_spans(tail, offset); }
+}
+
 fn parse_interp_expr(source: &str, _line: u32, _col: u32, str_span: Span) -> Result<Expr, ParseError> {
     let tokens = crate::lexer::lex(source).map_err(|e| ParseError {
         span: str_span,
@@ -1210,8 +1288,12 @@ impl Parser {
                         crate::lexer::InterpPart::Lit(s) => {
                             pieces.push(crate::ast::InterpPiece::Lit(s));
                         }
-                        crate::lexer::InterpPart::Expr { source, line, col } => {
-                            let expr = parse_interp_expr(&source, line, col, tok.span)?;
+                        crate::lexer::InterpPart::Expr { source, line, col, byte_offset } => {
+                            let mut expr = parse_interp_expr(&source, line, col, tok.span)?;
+                            // Shift inner spans by the outer byte offset so
+                            // span.start is globally unique (call_resolutions
+                            // + other side tables key off it).
+                            shift_expr_spans(&mut expr, byte_offset);
                             pieces.push(crate::ast::InterpPiece::Expr(expr));
                         }
                     }

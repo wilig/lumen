@@ -34,12 +34,7 @@ fn main() {
     // keep the test surface visible (run with `--ignored`) while
     // letting `cargo test` stay green. Add an entry alongside the
     // .lm/.expected files; remove it once the underlying bug is fixed.
-    let known_failing: &[&str] = &[
-        // lumen-0i2: generic fn params Maybe<T>/Pair<A,B> don't unify
-        // with already-monomorphized argument types.
-        "generic_maybe",
-        "generic_pair",
-    ];
+    let known_failing: &[&str] = &[];
 
     let mut out = String::new();
     for name in &cases {

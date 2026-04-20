@@ -1522,7 +1522,16 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         // outside generic contexts.
                         let active_subs = self.active_subs.clone();
                         let annot_ty = self.concretize_ty(&annot_ty, &active_subs);
-                        if ty_more_specific(&annot_ty, &inferred_ty) { annot_ty } else { inferred_ty }
+                        // Prefer the annotation when the inferred type is a
+                        // deferred user-type instantiation (e.g. swap(p1)
+                        // infers Pair$GB_GA without call-site subs). The
+                        // annotation — Pair<string, i32> → Pair$Str_I32 —
+                        // carries the concrete instantiation.
+                        if ty_more_specific(&annot_ty, &inferred_ty) || self.is_deferred_user_ty(&inferred_ty) {
+                            annot_ty
+                        } else {
+                            inferred_ty
+                        }
                     }
                     None => inferred_ty,
                 };
@@ -1952,6 +1961,31 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     /// its stored generic args via `subs` to get concrete args, register
     /// the concrete instantiation if not already present, and replace
     /// the Ty::User name with the concrete mangled name.
+    /// True if `ty` is (or contains) a deferred generic-type instantiation —
+    /// i.e. a Ty::User registered in `generic_type_args` whose args still
+    /// mention Ty::Generic. These arise when infer_ty walks a generic
+    /// call site without access to the type-checker's call_resolutions
+    /// (e.g. swap(p1) infers Pair$GB_GA until the annotation refines it).
+    fn is_deferred_user_ty(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Generic(_) => true,
+            Ty::User(name) => {
+                self.cg.info.generic_type_args.get(name)
+                    .map(|(_, args)| args.iter().any(|a| self.is_deferred_user_ty(a)))
+                    .unwrap_or(false)
+            }
+            Ty::List(i) | Ty::Option(i) | Ty::Handle(i) => self.is_deferred_user_ty(i),
+            Ty::Map(k, v) => self.is_deferred_user_ty(k) || self.is_deferred_user_ty(v),
+            Ty::Result(o, e) => self.is_deferred_user_ty(o) || self.is_deferred_user_ty(e),
+            Ty::Tuple(elems) => elems.iter().any(|t| self.is_deferred_user_ty(t)),
+            Ty::FnPtr { params, ret } => {
+                params.iter().any(|p| self.is_deferred_user_ty(p))
+                    || self.is_deferred_user_ty(ret)
+            }
+            _ => false,
+        }
+    }
+
     fn concretize_ty(&mut self, ty: &Ty, subs: &HashMap<String, Ty>) -> Ty {
         match ty {
             Ty::User(name) => {
@@ -3711,15 +3745,30 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         _ => {}
                     }
                     if let Some(sig) = self.cg.info.fns.get(name).cloned() {
-                        // Generic callee: infer the substitution from
-                        // call-site arg types and apply to the return,
-                        // then concretize any deferred Ty::User names.
+                        // Generic callee: prefer the type-checker's
+                        // call_resolutions if available — it runs
+                        // template-aware unification (Pair$GA_GB vs
+                        // Pair$I32_Str). Fall back to our own unify,
+                        // which only bridges built-in type ctors.
                         if !sig.type_params.is_empty() {
                             let mut subs: HashMap<String, Ty> = HashMap::new();
-                            for (i, (_, pty)) in sig.params.iter().enumerate() {
-                                if let Some(arg) = args.get(i) {
-                                    let at = self.infer_ty(&arg.value)?;
-                                    unify_into(pty, &at, &mut subs);
+                            if let Some(type_args) = self.cg.info.call_resolutions.get(&expr.span.start).cloned() {
+                                // The recorded type args reference the
+                                // enclosing fn's type params (e.g. id(x)
+                                // inside id_twice<T> records [Generic("T")]).
+                                // Thread active_subs through so T → I32
+                                // when monomorphizing id_twice<I32>.
+                                let active = self.active_subs.clone();
+                                for (p, a) in sig.type_params.iter().zip(type_args.iter()) {
+                                    let resolved = substitute_ty(a.clone(), &active);
+                                    subs.insert(p.clone(), resolved);
+                                }
+                            } else {
+                                for (i, (_, pty)) in sig.params.iter().enumerate() {
+                                    if let Some(arg) = args.get(i) {
+                                        let at = self.infer_ty(&arg.value)?;
+                                        unify_into(pty, &at, &mut subs);
+                                    }
                                 }
                             }
                             let subbed = substitute_ty(sig.ret.clone(), &subs);

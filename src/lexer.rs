@@ -109,11 +109,16 @@ pub enum InterpPart {
     Lit(String),
     /// Raw source text of a `\{...}` expression, plus the source location
     /// of the first character inside the braces (so error messages from
-    /// the re-parsed expression point at the right place).
+    /// the re-parsed expression point at the right place). `byte_offset`
+    /// is the byte position in the outer source where the expression
+    /// starts — used to shift inner spans so span.start remains
+    /// globally unique (side tables like `call_resolutions` are keyed
+    /// by span.start).
     Expr {
         source: String,
         line: u32,
         col: u32,
+        byte_offset: u32,
     },
 }
 
@@ -600,12 +605,12 @@ impl<'a> Lexer<'a> {
                     }
                     Some(b'\\') if self.peek_at(1) == Some(b'{') => {
                         self.bump(); self.bump(); // \{
-                        let (_, expr_line, expr_col) = self.here();
+                        let (expr_off, expr_line, expr_col) = self.here();
                         if !out.is_empty() {
                             parts.push(InterpPart::Lit(std::mem::take(&mut out)));
                         }
                         let src = self.collect_interp_expr(start, line, col)?;
-                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col });
+                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col, byte_offset: expr_off });
                     }
                     Some(b'\n') => {
                         self.bump();
@@ -668,12 +673,12 @@ impl<'a> Lexer<'a> {
                 match self.peek() {
                     Some(b'{') => {
                         self.bump();
-                        let (_, expr_line, expr_col) = self.here();
+                        let (expr_off, expr_line, expr_col) = self.here();
                         if !out.is_empty() {
                             parts.push(InterpPart::Lit(std::mem::take(&mut out)));
                         }
                         let src = self.collect_interp_expr(start, line, col)?;
-                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col });
+                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col, byte_offset: expr_off });
                         continue;
                     }
                     Some(b'n') => {

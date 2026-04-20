@@ -1,0 +1,34 @@
+// Deeply nested match arms with bindings (block-bodied arms, bindings
+// visible inside nested `if`s and `for`s). Originally filed as
+// lumen-u2v "nested match drops bindings" — turned out to be a
+// cascading-error issue where an erroring scrutinee left pattern
+// bindings undeclared; this exercises that bindings DO work when
+// everything typechecks.
+import std/io
+
+fn parse(s: string): Result<i32, string> {
+    return if s == "bad" { Err("bad") } else { Ok(10) }
+}
+
+fn main(): i32 io {
+    match parse("ok") {
+        Ok(a) => {
+            match parse("ok") {
+                Ok(b) => {
+                    if a % 2 == 0 {
+                        if b > 0 {
+                            var sum: i32 = 0
+                            for i in range(0, 3) {
+                                sum = sum + a + b + i
+                            }
+                            io.println("sum=\{sum}")
+                        }
+                    }
+                },
+                Err(e) => io.println("inner err=\{e}"),
+            }
+        },
+        Err(e) => io.println("outer err=\{e}"),
+    }
+    return 0
+}
