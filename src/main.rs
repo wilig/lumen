@@ -103,6 +103,7 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
     // following transitive imports.
     let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut imported = Vec::new();
+    let mut module_paths: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Queue: (import_path_segments, registered_name).
     let mut queue: Vec<(Vec<String>, String)> = module.imports.iter()
@@ -135,6 +136,7 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
                 let dep_name = imp.alias.clone().unwrap_or_else(|| dep.clone());
                 if !loaded.contains(&dep_name) { queue.push((imp.path.clone(), dep_name)); }
             }
+            module_paths.insert(reg_name.clone(), mod_path.to_string_lossy().into_owned());
             imported.push(lumen::types::ParsedImport { name: reg_name, module: mod_ast });
         }
     }
@@ -149,7 +151,7 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
     let imported_refs: Vec<(&str, &lumen::ast::Module)> = imported.iter()
         .map(|i| (i.name.as_str(), &i.module))
         .collect();
-    let obj = lumen::native::compile_native(&module, &mut info, &imported_refs, debug, path)
+    let obj = lumen::native::compile_native(&module, &mut info, &imported_refs, &module_paths, debug, path)
         .map_err(|e| format_error(&src, path, "codegen error", e.span.line, e.span.col, e.span.end, &e.message))?;
     let stem = path.strip_suffix(".lm").unwrap_or(path);
     Ok((obj, stem.to_string(), imports))

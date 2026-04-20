@@ -31,6 +31,7 @@ pub fn compile_native(
     module: &ast::Module,
     info: &mut ModuleInfo,
     imported_modules: &[(&str, &ast::Module)],
+    module_paths: &HashMap<String, String>,
     debug: bool,
     source_path: &str,
 ) -> Result<Vec<u8>, NativeError> {
@@ -38,6 +39,9 @@ pub fn compile_native(
     cg.debug_mode = debug;
     cg.source_path = source_path.to_string();
     cg.dwarf = crate::dwarf::DwarfBuilder::new(source_path);
+    for (mod_name, path) in module_paths {
+        cg.dwarf.add_module_file(mod_name, path);
+    }
     cg.compile_module(module, imported_modules)?;
     Ok(cg.finish())
 }
@@ -1404,7 +1408,7 @@ impl<'a> NativeCodegen<'a> {
         // (sealed later)
 
         // Capture before current_module is moved into the FnEmitter.
-        let is_imported = current_module.is_some();
+        let current_module_name: Option<String> = current_module.clone();
 
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
@@ -1510,41 +1514,25 @@ impl<'a> NativeCodegen<'a> {
                 message: format!("define {}: {e}", f.name),
             })?;
 
-        // Record user-module fns only (main module, plus user-module
-        // monomorphizations — their decl_line points into the user
-        // source file). Imported-module fns are skipped so their line
-        // numbers don't get misattributed to the user's source.
-        let is_user_fn = !is_imported;
-        if is_user_fn {
-            if let Some(compiled) = ctx.compiled_code() {
-                let size = compiled.code_buffer().len() as u32;
-                if f.span.line > 0 {
-                    // Harvest cranelift's per-instruction source
-                    // locations (set via FunctionBuilder::set_srcloc)
-                    // and translate to DWARF line rows.
-                    let mut rows: Vec<crate::dwarf::LineRow> = Vec::new();
-                    let mut last: Option<(u32, u32)> = None;
-                    for sl in compiled.buffer.get_srclocs_sorted() {
-                        let packed = sl.loc.bits();
-                        // Cranelift's default SourceLoc is !0 (0xffffffff);
-                        // our "no info" sentinel is 0. Skip both.
-                        if packed == 0 || packed == !0 { continue; }
-                        let (line, col) = {
-                            let line = (packed >> 12) & 0x000F_FFFF;
-                            let col = packed & 0x0000_0FFF;
-                            (line, col)
-                        };
-                        // Dedupe consecutive rows with the same line+col.
-                        if last == Some((line, col)) { continue; }
-                        last = Some((line, col));
-                        rows.push(crate::dwarf::LineRow {
-                            offset: sl.start,
-                            line,
-                            col,
-                        });
-                    }
-                    self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows);
+        // Record every fn — imported-module fns get attributed to
+        // their own source file via the module_index lookup so their
+        // line numbers don't bleed into the user's main source.
+        if let Some(compiled) = ctx.compiled_code() {
+            let size = compiled.code_buffer().len() as u32;
+            if f.span.line > 0 {
+                let file_index = self.dwarf.module_file_index(current_module_name.as_deref());
+                let mut rows: Vec<crate::dwarf::LineRow> = Vec::new();
+                let mut last: Option<(u32, u32)> = None;
+                for sl in compiled.buffer.get_srclocs_sorted() {
+                    let packed = sl.loc.bits();
+                    if packed == 0 || packed == !0 { continue; }
+                    let line = (packed >> 12) & 0x000F_FFFF;
+                    let col = packed & 0x0000_0FFF;
+                    if last == Some((line, col)) { continue; }
+                    last = Some((line, col));
+                    rows.push(crate::dwarf::LineRow { offset: sl.start, line, col });
                 }
+                self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index);
             }
         }
 

@@ -67,11 +67,23 @@ struct FunctionEntry {
     size: u32,
     decl_line: u32,
     line_rows: Vec<LineRow>,
+    /// Index into DwarfBuilder::source_files. Default 0 = the user's
+    /// main source; higher indices reference imported modules.
+    file_index: usize,
+}
+
+struct SourceFile {
+    file_name: String,
+    dir: String,
 }
 
 pub struct DwarfBuilder {
-    source_file: String,
-    source_dir: String,
+    /// Index 0 is the main source file; indices 1+ are imported-module
+    /// source files registered via add_module_file.
+    source_files: Vec<SourceFile>,
+    /// Map of module name → index into source_files. User code has no
+    /// entry (it defaults to index 0).
+    module_index: HashMap<String, usize>,
     functions: Vec<FunctionEntry>,
     endian: RunTimeEndian,
     encoding: Encoding,
@@ -79,20 +91,6 @@ pub struct DwarfBuilder {
 
 impl DwarfBuilder {
     pub fn new(source_path: &str) -> Self {
-        let absolute = std::fs::canonicalize(source_path)
-            .unwrap_or_else(|_| source_path.into());
-        let source_file = absolute
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| source_path.to_string());
-        let source_dir = absolute
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // DWARF 4 is the sweet spot for gdb/lldb compatibility — newer
-        // enough for modern tooling, old enough that older gdb builds
-        // still parse it cleanly.
         let encoding = Encoding {
             format: Format::Dwarf32,
             version: 4,
@@ -100,12 +98,27 @@ impl DwarfBuilder {
         };
 
         Self {
-            source_file,
-            source_dir,
+            source_files: vec![split_path(source_path)],
+            module_index: HashMap::new(),
             functions: Vec::new(),
             endian: RunTimeEndian::Little,
             encoding,
         }
+    }
+
+    /// Register an imported module's source path so functions from it
+    /// can be attributed to their real file in the debug info.
+    pub fn add_module_file(&mut self, module_name: &str, source_path: &str) {
+        let idx = self.source_files.len();
+        self.source_files.push(split_path(source_path));
+        self.module_index.insert(module_name.to_string(), idx);
+    }
+
+    /// Look up a module's file index, defaulting to 0 (main source).
+    pub fn module_file_index(&self, module: Option<&str>) -> usize {
+        module
+            .and_then(|m| self.module_index.get(m).copied())
+            .unwrap_or(0)
     }
 
     pub fn record_function(
@@ -115,6 +128,7 @@ impl DwarfBuilder {
         size: u32,
         decl_line: u32,
         line_rows: Vec<LineRow>,
+        file_index: usize,
     ) {
         self.functions.push(FunctionEntry {
             name: name.to_string(),
@@ -122,6 +136,7 @@ impl DwarfBuilder {
             size,
             decl_line,
             line_rows,
+            file_index,
         });
     }
 
@@ -142,16 +157,17 @@ impl DwarfBuilder {
             });
         }
 
-        // Line program: one file, one sequence per function mapping
-        // its start address to the declaration line. Coarse but
-        // enough for `break file:line` at function boundaries.
-        let file_name = LineString::new(
-            self.source_file.as_bytes(),
+        // Line program: one file per source module. User main at
+        // file_id[0]; each imported module that registered a path
+        // gets a higher id. DW_AT_decl_file on subprograms and
+        // per-row file fields point to the right one.
+        let main_file_name = LineString::new(
+            self.source_files[0].file_name.as_bytes(),
             self.encoding,
             &mut dwarf.line_strings,
         );
         let comp_dir = LineString::new(
-            self.source_dir.as_bytes(),
+            self.source_files[0].dir.as_bytes(),
             self.encoding,
             &mut dwarf.line_strings,
         );
@@ -160,26 +176,31 @@ impl DwarfBuilder {
             LineEncoding::default(),
             comp_dir.clone(),
             None,
-            file_name.clone(),
+            main_file_name.clone(),
             None,
         );
         let default_dir = line_program.default_directory();
-        let default_file = line_program.add_file(file_name.clone(), default_dir, None);
+        let mut file_ids: Vec<gimli::write::FileId> = Vec::with_capacity(self.source_files.len());
+        file_ids.push(line_program.add_file(main_file_name, default_dir, None));
+        for sf in &self.source_files[1..] {
+            let dir_ls = LineString::new(sf.dir.as_bytes(), self.encoding, &mut dwarf.line_strings);
+            let dir_id = line_program.add_directory(dir_ls);
+            let name_ls = LineString::new(sf.file_name.as_bytes(), self.encoding, &mut dwarf.line_strings);
+            file_ids.push(line_program.add_file(name_ls, dir_id, None));
+        }
 
         for f in &self.functions {
+            let file_id = file_ids[f.file_index];
             line_program.begin_sequence(Some(address_for_func(f.func_id)));
             if f.line_rows.is_empty() {
-                // No per-statement info — emit one row at the decl
-                // line so `break funcname` still resolves. Coarse
-                // stepping is acceptable fallback.
-                line_program.row().file = default_file;
+                line_program.row().file = file_id;
                 line_program.row().line = f.decl_line as u64;
                 line_program.row().column = 0;
                 line_program.generate_row();
             } else {
                 for row in &f.line_rows {
                     line_program.row().address_offset = row.offset as u64;
-                    line_program.row().file = default_file;
+                    line_program.row().file = file_id;
                     line_program.row().line = row.line as u64;
                     line_program.row().column = row.col as u64;
                     line_program.row().is_statement = true;
@@ -189,10 +210,9 @@ impl DwarfBuilder {
             line_program.end_sequence(f.size as u64);
         }
 
-        // Compile unit root DIE.
         let range_list_id = dwarf.unit.ranges.add(unit_range);
-        let name_str = dwarf.strings.add(self.source_file.clone());
-        let dir_str = dwarf.strings.add(self.source_dir.clone());
+        let name_str = dwarf.strings.add(self.source_files[0].file_name.clone());
+        let dir_str = dwarf.strings.add(self.source_files[0].dir.clone());
         let producer_str = dwarf.strings.add("lumen".to_string());
 
         let root = dwarf.unit.root();
@@ -204,15 +224,17 @@ impl DwarfBuilder {
         root_die.set(gimli::DW_AT_ranges, AttributeValue::RangeListRef(range_list_id));
         root_die.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
 
-        // One DW_TAG_subprogram DIE per Lumen function.
+        // One DW_TAG_subprogram DIE per Lumen function, pointing at
+        // the source file its declaration lives in.
         for f in &self.functions {
+            let file_id = file_ids[f.file_index];
             let subp = dwarf.unit.add(root, gimli::DW_TAG_subprogram);
             let fname = dwarf.strings.add(f.name.clone());
             let die = dwarf.unit.get_mut(subp);
             die.set(gimli::DW_AT_name, AttributeValue::StringRef(fname));
             die.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(f.func_id)));
             die.set(gimli::DW_AT_high_pc, AttributeValue::Udata(f.size as u64));
-            die.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(default_file)));
+            die.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
             die.set(gimli::DW_AT_decl_line, AttributeValue::Udata(f.decl_line as u64));
             die.set(gimli::DW_AT_external, AttributeValue::Flag(true));
         }
@@ -470,6 +492,21 @@ fn add_debug_reloc(
         },
     )
     .unwrap();
+}
+
+/// Split a source path into (file_name, directory). Canonicalizes if
+/// possible so relative paths still give gdb an absolute dir to resolve.
+fn split_path(path: &str) -> SourceFile {
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    let file_name = absolute
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let dir = absolute
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    SourceFile { file_name, dir }
 }
 
 /// Encode a FuncId as the `symbol` payload of `Address::Symbol`. Matches
