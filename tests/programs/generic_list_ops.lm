@@ -1,0 +1,26 @@
+// List<T> with pointer-typed T (string). Guards rc accounting on
+// list.push / list.get / list.map paths.
+import std/io
+import std/list
+import std/string
+
+fn first<T>(xs: List<T>): T {
+    return list.get(xs, 0)
+}
+
+fn main(): i32 io {
+    var xs: List<string> = list.new()
+    xs = list.push(xs, "alpha")
+    xs = list.push(xs, "beta")
+    xs = list.push(xs, "gamma")
+    io.println("len=\{list.len(xs)}")
+    io.println("first=\{first(xs)}")
+
+    // Re-read several times — would expose double-free if rc was off.
+    let n = list.len(xs)
+    for i in range(0, n) {
+        let s = list.get(xs, i)
+        io.println("xs[\{i}]=\{s} (slen=\{string.len(s)})")
+    }
+    return 0
+}

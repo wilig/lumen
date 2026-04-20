@@ -1,0 +1,22 @@
+// Regression for lumen-358: string.split + per-element string.len
+// (length only — split returns untyped i64, so we can't print the
+// string elements directly until split is migrated to List<string>).
+import std/io
+import std/list
+import std/string
+
+fn main(): i32 io {
+    let csv = "alpha,beta,gamma,delta"
+    let parts = string.split(csv, ",")
+    io.println("count=\{list.len(parts)}")
+    let n = list.len(parts)
+    var total: i32 = 0
+    for i in range(0, n) {
+        let p = list.get(parts, i)
+        let plen = string.len(p)
+        io.println("p[\{i}] len=\{plen}")
+        total = total + plen
+    }
+    io.println("total=\{total}")
+    return 0
+}

@@ -1,0 +1,5 @@
+len=3
+first=alpha
+xs[0]=alpha (slen=5)
+xs[1]=beta (slen=4)
+xs[2]=gamma (slen=5)

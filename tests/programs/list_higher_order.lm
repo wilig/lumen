@@ -1,0 +1,17 @@
+// list.map / filter / fold with non-capturing fn references.
+import std/io
+import std/list
+
+fn dbl(n: i32): i32 { return n * 2 }
+fn odd(n: i32): bool { return n % 2 == 1 }
+fn add(a: i32, b: i32): i32 { return a + b }
+
+fn main(): i32 io {
+    var xs: List<i32> = list.new()
+    for i in range(1, 7) { xs = list.push(xs, i) }
+    io.println("xs=\{xs}")
+    io.println("dbl=\{list.map(xs, dbl)}")
+    io.println("odd=\{list.filter(xs, odd)}")
+    io.println("sum=\{list.fold(xs, 0, add)}")
+    return 0
+}

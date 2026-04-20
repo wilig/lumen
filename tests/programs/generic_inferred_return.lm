@@ -1,0 +1,20 @@
+// Generic fn whose T can only be derived from the expected return type
+// (no arg carries T). Tests context-driven inference end-to-end.
+import std/io
+
+type Maybe<T> = | Nothing | Just { value: T }
+
+fn nothing<T>(): Maybe<T> { return Nothing }
+fn just<T>(x: T): Maybe<T> { return Just { value: x } }
+
+fn main(): i32 io {
+    let a: Maybe<i32> = nothing()
+    let b: Maybe<string> = nothing()
+    let c: Maybe<i32> = just(7)
+    let d: Maybe<string> = just("hi")
+    match a { Nothing => io.println("a: nothing"), Just { value: v } => io.println(v) }
+    match b { Nothing => io.println("b: nothing"), Just { value: v } => io.println(v) }
+    match c { Nothing => io.println("c: nothing"), Just { value: v } => io.println(v) }
+    match d { Nothing => io.println("d: nothing"), Just { value: v } => io.println(v) }
+    return 0
+}

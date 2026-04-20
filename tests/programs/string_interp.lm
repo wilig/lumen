@@ -1,0 +1,18 @@
+// String interpolation across types (int, float, bool, struct, tuple)
+// and with embedded expressions.
+import std/io
+
+type Point = { x: i32, y: i32 }
+
+fn main(): i32 io {
+    let n: i32 = 7
+    let f: f64 = 1.5
+    let b: bool = true
+    let p: Point = Point { x: 3, y: 4 }
+    let t = (1, "two", 3.0)
+    io.println("n=\{n} f=\{f} b=\{b}")
+    io.println("p=\{p} t=\{t}")
+    io.println("expr: \{n * n} + \{1 + 2}")
+    io.println("escape: \\{n}")
+    return 0
+}

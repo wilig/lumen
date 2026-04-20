@@ -1,0 +1,15 @@
+// Generic fn that calls another generic fn — exercises monomorphization
+// inside a generic body (the inner call must be re-instantiated at each
+// outer T).
+import std/io
+
+fn id<T>(x: T): T { return x }
+fn id_twice<T>(x: T): T { return id(id(x)) }
+fn id_thrice<T>(x: T): T { return id_twice(id(x)) }
+
+fn main(): i32 io {
+    io.println(id_thrice(42))
+    io.println(id_thrice("ok"))
+    io.println(id_thrice(3.14))
+    return 0
+}

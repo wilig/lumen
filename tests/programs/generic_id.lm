@@ -1,0 +1,12 @@
+// Identity function instantiated at multiple types.
+import std/io
+
+fn id<T>(x: T): T { return x }
+
+fn main(): i32 io {
+    io.println(id(42))
+    io.println(id(3.14))
+    io.println(id("hello"))
+    io.println(id(true))
+    return 0
+}

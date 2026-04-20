@@ -1,0 +1,20 @@
+// Generic struct with two type parameters; mixes scalar/pointer payloads.
+import std/io
+
+type Pair<A, B> = { fst: A, snd: B }
+
+fn swap<A, B>(p: Pair<A, B>): Pair<B, A> {
+    return Pair { fst: p.snd, snd: p.fst }
+}
+
+fn main(): i32 io {
+    let p1: Pair<i32, string> = Pair { fst: 7, snd: "seven" }
+    let p2: Pair<string, i32> = swap(p1)
+    io.println("p1.fst=\{p1.fst} p1.snd=\{p1.snd}")
+    io.println("p2.fst=\{p2.fst} p2.snd=\{p2.snd}")
+
+    let pp: Pair<i32, i32> = Pair { fst: 1, snd: 2 }
+    let pp2 = swap(pp)
+    io.println("pp2.fst=\{pp2.fst} pp2.snd=\{pp2.snd}")
+    return 0
+}

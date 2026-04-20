@@ -1,0 +1,25 @@
+// Insertion-ordered map: get/set/remove/contains across pointer-keyed
+// entries. Guards rc accounting on map.get's Option<V> return path.
+import std/io
+import std/map
+
+fn main(): i32 io {
+    var m: Map<string, i32> = map.new()
+    m = map.set(m, "a", 1)
+    m = map.set(m, "b", 2)
+    m = map.set(m, "c", 3)
+    io.println("len=\{map.len(m)}")
+    match map.get(m, "b") {
+        Some(v) => io.println("b=\{v}"),
+        None => io.println("b: none"),
+    }
+    m = map.set(m, "b", 22)
+    match map.get(m, "b") {
+        Some(v) => io.println("b=\{v}"),
+        None => io.println("b: none"),
+    }
+    m = map.remove(m, "a")
+    io.println("has a? \{map.contains(m, "a")}")
+    io.println("has c? \{map.contains(m, "c")}")
+    return 0
+}
