@@ -69,10 +69,9 @@ fn is_space(c: char): i32 {
     return 0
 }
 
-// Byte-level whitespace check, used internally by trim. ASCII whitespace
+// Byte-level whitespace check used internally by trim. ASCII whitespace
 // bytes (0x09, 0x0A, 0x0D, 0x20) never appear as UTF-8 continuation
-// bytes (which are 0x80..0xBF), so a byte-level scan is correct even
-// for non-ASCII input.
+// bytes, so a byte-level scan is correct even for non-ASCII input.
 fn is_space_byte(b: i32): i32 {
     if b == 32 { return 1 }
     if b == 9 { return 1 }
@@ -85,6 +84,10 @@ fn trim(s: string): string {
     let slen = len(s)
     var start = 0
     var end = slen
+    // NOTE: A `let b = bytes.from_string(s)` hoist here would be
+    // clearer, but it triggers a latent codegen bug (lumen-y40) where
+    // the second for-loop's IR degrades in large programs. The inline
+    // re-conversion is a stable workaround until that's tracked down.
     for _ in range(0, slen) {
         if start < slen {
             if is_space_byte(bytes.get(bytes.from_string(s), start)) == 1 { start += 1 }
