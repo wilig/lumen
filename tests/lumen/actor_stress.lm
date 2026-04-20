@@ -1,0 +1,40 @@
+// Concurrency stress (lumen-cv1 mailbox design). Spawns three actors,
+// fires 500 ordered sends at each across all worker threads, and
+// asks for each final count. Under correct per-actor FIFO semantics
+// each counter must land on its exact expected value — any race on
+// mailbox ordering would produce a smaller count.
+import std/test
+
+actor Counter {
+    count: i32,
+}
+
+msg Counter.bump(self, n: i32): Counter {
+    return Counter { count: self.count + n }
+}
+
+msg Counter.get(self): i32 {
+    return self.count
+}
+
+fn main(): i32 io {
+    let a = spawn Counter { count: 0 }
+    let b = spawn Counter { count: 0 }
+    let c = spawn Counter { count: 0 }
+
+    for i in range(0, 500) {
+        send a.bump(1)
+        send b.bump(2)
+        send c.bump(3)
+    }
+
+    let ra: i32 = ask a.get()
+    let rb: i32 = ask b.get()
+    let rc: i32 = ask c.get()
+
+    test.eq(ra, 500, "actor a: 500 bumps of 1")
+    test.eq(rb, 1000, "actor b: 500 bumps of 2")
+    test.eq(rc, 1500, "actor c: 500 bumps of 3")
+
+    return test.summary()
+}

@@ -163,27 +163,266 @@ static void *lumen_realloc_raw(void *old_payload, int64_t old_size, int64_t new_
     return new_payload;
 }
 
-// --- Worker thread pool + actor scheduler --------------------------------
+// --- Multi-core actor scheduler (lumen-cv1) ------------------------------
 //
-// Worker pool is live (lumen-u53) but actor dispatch stays on the
-// caller's thread — either the main thread's cooperative scheduler
-// or an inline drain in lumen_rt_ask. The per-bucket-mutex approach
-// from the earlier cv1 attempt gave mutual exclusion but NOT FIFO
-// per actor: POSIX mutexes don't preserve wait order, so multiple
-// workers contending for the same bucket can dispatch messages out
-// of send order.
+// Per-actor mailbox design, Erlang/Scala-style:
 //
-// Correct multi-worker scheduling needs per-actor state (mailbox +
-// sequence counter). Tracked as lumen-cv1 (reopened).
+//   - Every actor (identified by its cell pointer) has a FIFO mailbox
+//     and a `running` bit. Messages are enqueued on the mailbox.
+//   - A global "ready queue" holds cell pointers for actors that have
+//     pending work AND aren't currently being processed.
+//   - Workers pop a cell from the ready queue, acquire its mailbox,
+//     drain messages one at a time (releasing the mailbox lock
+//     between messages so sends from other threads can enqueue),
+//     then clear `running` + exit when the mailbox empties.
+//
+// This preserves FIFO-per-actor because each mailbox is a FIFO list
+// and only one worker processes an actor at a time. Cross-actor
+// parallelism is unbounded (different mailboxes, different workers).
+//
+// Mailbox storage is a chained hash map keyed on cell pointer.
+// Entries are allocated lazily on first enqueue and never freed
+// (MVP — actor lifetimes line up with program lifetime). Mailboxes
+// grow via realloc if the ring fills.
+//
+// Self-ask handling: an ask whose target is the currently-dispatching
+// actor (per-thread `current_dispatch_cell`) runs inline instead of
+// enqueueing, avoiding the obvious deadlock.
 
 #include <pthread.h>
 
 #define LUMEN_MAX_WORKERS 64
 static pthread_t lumen_workers[LUMEN_MAX_WORKERS];
 static int32_t lumen_worker_count = 0;
-static pthread_mutex_t lumen_worker_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t lumen_worker_wake = PTHREAD_COND_INITIALIZER;
 static volatile int32_t lumen_worker_shutdown = 0;
+
+// ---- Mailbox ------------------------------------------------------------
+
+typedef struct {
+    void *target_cell;
+    void (*dispatch)(void *cell, int32_t kind, int64_t arg0, int64_t *reply);
+    int32_t msg_kind;
+    int64_t arg0;
+    int64_t *reply_slot;
+    int32_t *reply_ready_flag;
+    pthread_cond_t *reply_cond;
+} MsgEntry;
+
+typedef struct Mailbox {
+    MsgEntry *buf;
+    int32_t capacity;
+    int32_t head, tail;
+    int32_t count;
+    int32_t running;           // 1 if a worker is currently draining
+    pthread_mutex_t lock;
+} Mailbox;
+
+static void mailbox_init(Mailbox *mb) {
+    mb->capacity = 8;
+    mb->buf = (MsgEntry *)malloc(sizeof(MsgEntry) * (size_t)mb->capacity);
+    mb->head = 0;
+    mb->tail = 0;
+    mb->count = 0;
+    mb->running = 0;
+    pthread_mutex_init(&mb->lock, NULL);
+}
+
+// Mailbox lock MUST be held.
+static void mailbox_enqueue(Mailbox *mb, MsgEntry entry) {
+    if (mb->count == mb->capacity) {
+        int32_t new_cap = mb->capacity * 2;
+        MsgEntry *new_buf = (MsgEntry *)malloc(sizeof(MsgEntry) * (size_t)new_cap);
+        for (int32_t i = 0; i < mb->count; i++) {
+            new_buf[i] = mb->buf[(mb->head + i) % mb->capacity];
+        }
+        free(mb->buf);
+        mb->buf = new_buf;
+        mb->capacity = new_cap;
+        mb->head = 0;
+        mb->tail = mb->count;
+    }
+    mb->buf[mb->tail] = entry;
+    mb->tail = (mb->tail + 1) % mb->capacity;
+    mb->count++;
+}
+
+// Mailbox lock MUST be held. Returns 1 on success, 0 if empty.
+static int mailbox_dequeue(Mailbox *mb, MsgEntry *out) {
+    if (mb->count == 0) return 0;
+    *out = mb->buf[mb->head];
+    mb->head = (mb->head + 1) % mb->capacity;
+    mb->count--;
+    return 1;
+}
+
+// ---- Mailbox hash map: cell ptr → Mailbox* ------------------------------
+
+#define MAILBOX_MAP_BUCKETS 1024
+typedef struct MailboxEntry {
+    void *cell;
+    Mailbox *mailbox;
+    struct MailboxEntry *next;
+} MailboxEntry;
+
+static MailboxEntry *mailbox_map[MAILBOX_MAP_BUCKETS];
+static pthread_mutex_t mailbox_map_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t hash_cell(void *cell) {
+    uintptr_t h = (uintptr_t)cell;
+    h ^= h >> 32;
+    h *= 0x9e3779b97f4a7c15ULL;
+    return (uint32_t)(h & (MAILBOX_MAP_BUCKETS - 1));
+}
+
+static Mailbox *mailbox_for(void *cell) {
+    uint32_t h = hash_cell(cell);
+    pthread_mutex_lock(&mailbox_map_mu);
+    for (MailboxEntry *e = mailbox_map[h]; e; e = e->next) {
+        if (e->cell == cell) {
+            Mailbox *mb = e->mailbox;
+            pthread_mutex_unlock(&mailbox_map_mu);
+            return mb;
+        }
+    }
+    Mailbox *mb = (Mailbox *)malloc(sizeof(Mailbox));
+    mailbox_init(mb);
+    MailboxEntry *e = (MailboxEntry *)malloc(sizeof(MailboxEntry));
+    e->cell = cell;
+    e->mailbox = mb;
+    e->next = mailbox_map[h];
+    mailbox_map[h] = e;
+    pthread_mutex_unlock(&mailbox_map_mu);
+    return mb;
+}
+
+// ---- Ready queue of actors with pending work ---------------------------
+
+#define READY_QUEUE_CAP 65536
+static void *ready_queue[READY_QUEUE_CAP];
+static int32_t ready_head = 0, ready_tail = 0;
+static int32_t ready_in_flight = 0;  // actors popped but not yet drained
+static pthread_mutex_t ready_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ready_work = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t ready_idle = PTHREAD_COND_INITIALIZER;
+
+static int ready_empty(void) { return ready_head == ready_tail; }
+
+// ready_mu MUST be held.
+static void ready_push(void *cell) {
+    int32_t next = (ready_tail + 1) % READY_QUEUE_CAP;
+    if (next == ready_head) {
+        fprintf(stderr, "FATAL: actor ready queue full\n");
+        abort();
+    }
+    ready_queue[ready_tail] = cell;
+    ready_tail = next;
+    pthread_cond_signal(&ready_work);
+}
+
+// ready_mu MUST be held; returns NULL if empty.
+static void *ready_pop(void) {
+    if (ready_empty()) return NULL;
+    void *c = ready_queue[ready_head];
+    ready_head = (ready_head + 1) % READY_QUEUE_CAP;
+    return c;
+}
+
+// ---- Dispatch core + per-thread self-ask detection --------------------
+
+static __thread void *current_dispatch_cell = NULL;
+
+static void run_handler(MsgEntry *e) {
+    void *prev = current_dispatch_cell;
+    current_dispatch_cell = e->target_cell;
+    int64_t reply = 0;
+    e->dispatch(e->target_cell, e->msg_kind, e->arg0, &reply);
+    current_dispatch_cell = prev;
+
+    if (e->reply_slot) {
+        *e->reply_slot = reply;
+        if (e->reply_ready_flag) *e->reply_ready_flag = 1;
+        if (e->reply_cond) {
+            // The ask'er waits on this condvar guarded by ready_mu.
+            pthread_mutex_lock(&ready_mu);
+            pthread_cond_broadcast(e->reply_cond);
+            pthread_mutex_unlock(&ready_mu);
+        }
+    }
+}
+
+// Drain one actor's mailbox. The caller just popped `cell` from the
+// ready queue — we're the sole processor for this actor until
+// `running` is cleared.
+static void drain_actor(void *cell) {
+    Mailbox *mb = mailbox_for(cell);
+    for (;;) {
+        pthread_mutex_lock(&mb->lock);
+        MsgEntry e;
+        if (!mailbox_dequeue(mb, &e)) {
+            mb->running = 0;
+            pthread_mutex_unlock(&mb->lock);
+            break;
+        }
+        pthread_mutex_unlock(&mb->lock);
+        run_handler(&e);
+    }
+}
+
+// Enqueue a message; return 1 if caller should ALSO push this actor
+// onto the ready queue (actor wasn't already running).
+static int enqueue_for(void *cell,
+                       void (*dispatch)(void *, int32_t, int64_t, int64_t *),
+                       int32_t kind, int64_t arg0,
+                       int64_t *reply_slot,
+                       int32_t *ready_flag,
+                       pthread_cond_t *reply_cond) {
+    Mailbox *mb = mailbox_for(cell);
+    MsgEntry e = {
+        .target_cell = cell, .dispatch = dispatch, .msg_kind = kind,
+        .arg0 = arg0, .reply_slot = reply_slot,
+        .reply_ready_flag = ready_flag, .reply_cond = reply_cond,
+    };
+    pthread_mutex_lock(&mb->lock);
+    mailbox_enqueue(mb, e);
+    int should_schedule = !mb->running;
+    if (should_schedule) mb->running = 1;
+    pthread_mutex_unlock(&mb->lock);
+    return should_schedule;
+}
+
+static void schedule(void *cell) {
+    pthread_mutex_lock(&ready_mu);
+    ready_push(cell);
+    ready_in_flight++;
+    pthread_mutex_unlock(&ready_mu);
+}
+
+// ---- Worker loop + pool lifecycle -------------------------------------
+
+static void *lumen_worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&ready_mu);
+        while (ready_empty() && !lumen_worker_shutdown) {
+            pthread_cond_wait(&ready_work, &ready_mu);
+        }
+        if (lumen_worker_shutdown && ready_empty()) {
+            pthread_mutex_unlock(&ready_mu);
+            return NULL;
+        }
+        void *cell = ready_pop();
+        pthread_mutex_unlock(&ready_mu);
+
+        drain_actor(cell);
+
+        pthread_mutex_lock(&ready_mu);
+        ready_in_flight--;
+        if (ready_empty() && ready_in_flight == 0) {
+            pthread_cond_broadcast(&ready_idle);
+        }
+        pthread_mutex_unlock(&ready_mu);
+    }
+}
 
 static int32_t lumen_worker_count_from_env(void) {
     const char *env = getenv("LUMEN_THREADS");
@@ -195,16 +434,6 @@ static int32_t lumen_worker_count_from_env(void) {
     if (n <= 0) n = 4;
     if (n > LUMEN_MAX_WORKERS) n = LUMEN_MAX_WORKERS;
     return (int32_t)n;
-}
-
-static void *lumen_worker_main(void *arg) {
-    (void)arg;
-    pthread_mutex_lock(&lumen_worker_mu);
-    while (!lumen_worker_shutdown) {
-        pthread_cond_wait(&lumen_worker_wake, &lumen_worker_mu);
-    }
-    pthread_mutex_unlock(&lumen_worker_mu);
-    return NULL;
 }
 
 __attribute__((constructor))
@@ -220,83 +449,118 @@ static void lumen_worker_pool_start(void) {
 
 __attribute__((destructor))
 static void lumen_worker_pool_stop(void) {
-    pthread_mutex_lock(&lumen_worker_mu);
+    // Wait for all pending work before signalling shutdown.
+    pthread_mutex_lock(&ready_mu);
+    while (!ready_empty() || ready_in_flight > 0) {
+        pthread_cond_wait(&ready_idle, &ready_mu);
+    }
     lumen_worker_shutdown = 1;
-    pthread_cond_broadcast(&lumen_worker_wake);
-    pthread_mutex_unlock(&lumen_worker_mu);
+    pthread_cond_broadcast(&ready_work);
+    pthread_mutex_unlock(&ready_mu);
     for (int i = 0; i < lumen_worker_count; i++) {
         pthread_join(lumen_workers[i], NULL);
     }
 }
 
-// --- Message queue -------------------------------------------------------
-
-typedef struct {
-    void *target_cell;
-    void (*dispatch)(void *cell, int32_t kind, int64_t arg0, int64_t *reply);
-    int32_t msg_kind;
-    int64_t arg0;
-    int64_t *reply_slot;
-} QueueEntry;
-
-#define QUEUE_CAP 65536
-static QueueEntry queue[QUEUE_CAP];
-static int queue_head = 0;
-static int queue_tail = 0;
+// ---- Public API -------------------------------------------------------
 
 void lumen_rt_send(void *cell,
                    void (*dispatch)(void *, int32_t, int64_t, int64_t *),
                    int32_t kind, int64_t arg0) {
-    int next = (queue_tail + 1) % QUEUE_CAP;
-    if (next == queue_head) {
-        fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
-        return;
+    if (enqueue_for(cell, dispatch, kind, arg0, NULL, NULL, NULL)) {
+        schedule(cell);
     }
-    queue[queue_tail].target_cell = cell;
-    queue[queue_tail].dispatch = dispatch;
-    queue[queue_tail].msg_kind = kind;
-    queue[queue_tail].arg0 = arg0;
-    queue[queue_tail].reply_slot = NULL;
-    queue_tail = next;
 }
 
 int64_t lumen_rt_ask(void *cell,
                      void (*dispatch)(void *, int32_t, int64_t, int64_t *),
                      int32_t kind, int64_t arg0) {
     int64_t reply = 0;
-    int next = (queue_tail + 1) % QUEUE_CAP;
-    if (next == queue_head) {
-        fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
-        return 0;
+
+    // Self-ask from within a handler for `cell`: run inline, bypass
+    // the mailbox and running bit since we're already the sole
+    // dispatcher for this actor.
+    if (cell == current_dispatch_cell) {
+        void *prev = current_dispatch_cell;
+        current_dispatch_cell = cell;
+        dispatch(cell, kind, arg0, &reply);
+        current_dispatch_cell = prev;
+        return reply;
     }
-    queue[queue_tail].target_cell = cell;
-    queue[queue_tail].dispatch = dispatch;
-    queue[queue_tail].msg_kind = kind;
-    queue[queue_tail].arg0 = arg0;
-    queue[queue_tail].reply_slot = &reply;
-    queue_tail = next;
-    lumen_rt_drain();
+
+    int32_t ready = 0;
+    pthread_cond_t reply_cond = PTHREAD_COND_INITIALIZER;
+
+    int should_schedule = enqueue_for(cell, dispatch, kind, arg0,
+                                       &reply, &ready, &reply_cond);
+    if (should_schedule) schedule(cell);
+
+    pthread_mutex_lock(&ready_mu);
+    while (!ready) {
+        if (lumen_worker_count == 0) {
+            // Single-threaded: drain actors ourselves until our reply
+            // shows up. ready_in_flight was already incremented by
+            // schedule() for each actor on the queue, so popping +
+            // draining just needs the matching decrement on exit.
+            void *next = ready_pop();
+            if (!next) break;
+            pthread_mutex_unlock(&ready_mu);
+            drain_actor(next);
+            pthread_mutex_lock(&ready_mu);
+            ready_in_flight--;
+            if (ready_empty() && ready_in_flight == 0) {
+                pthread_cond_broadcast(&ready_idle);
+            }
+        } else {
+            pthread_cond_wait(&reply_cond, &ready_mu);
+        }
+    }
+    pthread_mutex_unlock(&ready_mu);
+    pthread_cond_destroy(&reply_cond);
     return reply;
 }
 
 int lumen_rt_step(void) {
-    if (queue_head == queue_tail) return 0;
-    QueueEntry *e = &queue[queue_head];
-    queue_head = (queue_head + 1) % QUEUE_CAP;
-    int64_t reply = 0;
-    e->dispatch(e->target_cell, e->msg_kind, e->arg0, &reply);
-    if (e->reply_slot) {
-        *e->reply_slot = reply;
+    pthread_mutex_lock(&ready_mu);
+    void *cell = ready_pop();
+    if (!cell) {
+        pthread_mutex_unlock(&ready_mu);
+        return 0;
     }
+    pthread_mutex_unlock(&ready_mu);
+
+    drain_actor(cell);
+
+    pthread_mutex_lock(&ready_mu);
+    ready_in_flight--;
+    if (ready_empty() && ready_in_flight == 0) {
+        pthread_cond_broadcast(&ready_idle);
+    }
+    pthread_mutex_unlock(&ready_mu);
     return 1;
 }
 
 void lumen_rt_drain(void) {
-    while (lumen_rt_step()) {}
+    pthread_mutex_lock(&ready_mu);
+    while (!ready_empty() || ready_in_flight > 0) {
+        if (lumen_worker_count == 0) {
+            void *cell = ready_pop();
+            if (cell) {
+                pthread_mutex_unlock(&ready_mu);
+                drain_actor(cell);
+                pthread_mutex_lock(&ready_mu);
+                ready_in_flight--;
+                continue;
+            }
+            break;
+        }
+        pthread_cond_wait(&ready_idle, &ready_mu);
+    }
+    pthread_mutex_unlock(&ready_mu);
 }
 
 void lumen_rt_yield(void) {
-    lumen_rt_step();
+    // Workers process in parallel; no manual cooperative step.
 }
 
 // --- TCP socket operations ------------------------------------------------
