@@ -84,6 +84,11 @@ fn wrap_some<T>(x: T): Maybe<T> {
     return Just { value: x }
 }
 
+// Generic fn whose T can only come from the expected return type.
+fn nothing<T>(): Maybe<T> {
+    return Nothing
+}
+
 fn pick_first<A, B>(a: A, b: B): A {
     return a
 }
@@ -182,6 +187,12 @@ fn main(): i32 io {
     match gm {
         Nothing => io.println("wrap_some: nothing"),
         Just { value: v } => io.println("wrap_some: just \{v}"),
+    }
+    // T inferred from expected return type — no arg to derive it from.
+    let gn: Maybe<string> = nothing()
+    match gn {
+        Nothing => io.println("nothing(): nothing"),
+        Just { value: s } => io.println("nothing(): just \{s}"),
     }
 
     // generic sum types

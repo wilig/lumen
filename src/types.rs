@@ -172,6 +172,14 @@ pub struct ModuleInfo {
     /// when `make<I32>` is monomorphized the codegen substitutes T → I32
     /// and registers the concrete `Pair$I32_I32`.
     pub generic_type_args: HashMap<String, (String, Vec<Ty>)>,
+    /// Generic call sites where the type checker fully resolved the
+    /// type-argument substitution from context (args + expected return),
+    /// keyed by call expr span.start. Lets the codegen use the
+    /// type-checker's resolution directly instead of re-inferring from
+    /// arg types alone — needed for cases like `fn nothing<T>(): Maybe<T>`
+    /// called as `let x: Maybe<i32> = nothing()`, where T can only be
+    /// derived from the let annotation.
+    pub call_resolutions: HashMap<u32, Vec<Ty>>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +259,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         generic_type_origins: HashMap::new(),
         variant_resolutions: HashMap::new(),
         generic_type_args: HashMap::new(),
+        call_resolutions: HashMap::new(),
     };
 
     // Register imported module APIs.
@@ -574,10 +583,14 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                 span: mh.span,
             };
             checker.check_fn(&synthetic);
-            let resolutions = std::mem::take(&mut checker.variant_resolutions);
+            let variant_res = std::mem::take(&mut checker.variant_resolutions);
+            let call_res = std::mem::take(&mut checker.call_resolutions);
             drop(checker);
-            for (k, v) in resolutions {
+            for (k, v) in variant_res {
                 info.variant_resolutions.insert(k, v);
+            }
+            for (k, v) in call_res {
+                info.call_resolutions.insert(k, v);
             }
         }
     }
@@ -588,14 +601,19 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             let Some(sig) = info.fns.get(&f.name).cloned() else {
                 continue;
             };
-            let mut resolutions;
+            let mut variant_res;
+            let mut call_res;
             {
                 let mut checker = FnChecker::new(&mut info, &sig, &mut errors);
                 checker.check_fn(f);
-                resolutions = std::mem::take(&mut checker.variant_resolutions);
+                variant_res = std::mem::take(&mut checker.variant_resolutions);
+                call_res = std::mem::take(&mut checker.call_resolutions);
             }
-            for (k, v) in resolutions.drain() {
+            for (k, v) in variant_res.drain() {
                 info.variant_resolutions.insert(k, v);
+            }
+            for (k, v) in call_res.drain() {
+                info.call_resolutions.insert(k, v);
             }
         }
     }
@@ -1090,6 +1108,10 @@ struct FnChecker<'a> {
     /// the codegen can see which generic-sum instantiation a bare
     /// `Empty` / `Cell { ... }` / `Cell(...)` belongs to.
     variant_resolutions: HashMap<u32, String>,
+    /// Generic call sites where this fn's body resolved the type
+    /// arguments from context (args + expected). Drained into
+    /// ModuleInfo.call_resolutions after check_fn.
+    call_resolutions: HashMap<u32, Vec<Ty>>,
 }
 
 #[derive(Default)]
@@ -1113,6 +1135,54 @@ impl<'a> FnChecker<'a> {
             errors,
             lambda_scope_floor: None,
             variant_resolutions: HashMap::new(),
+            call_resolutions: HashMap::new(),
+        }
+    }
+
+    /// Template-aware version of `unify_for_subs` — when both sides are
+    /// `Ty::User` instantiated from the same template (looked up via
+    /// `generic_type_args`), unify their args pairwise. Lets us derive
+    /// substitutions like `Maybe<T>` vs `Maybe<i32>` → T=I32, which the
+    /// plain `unify_for_subs` can't bridge across User names.
+    fn unify_with_template_args(&self, generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty>) {
+        match (generic, concrete) {
+            (Ty::Generic(name), c) => {
+                subs.entry(name.clone()).or_insert_with(|| c.clone());
+            }
+            (Ty::List(g), Ty::List(c)) => self.unify_with_template_args(g, c, subs),
+            (Ty::Map(gk, gv), Ty::Map(ck, cv)) => {
+                self.unify_with_template_args(gk, ck, subs);
+                self.unify_with_template_args(gv, cv, subs);
+            }
+            (Ty::Option(g), Ty::Option(c)) => self.unify_with_template_args(g, c, subs),
+            (Ty::Result(go, ge), Ty::Result(co, ce)) => {
+                self.unify_with_template_args(go, co, subs);
+                self.unify_with_template_args(ge, ce, subs);
+            }
+            (Ty::Handle(g), Ty::Handle(c)) => self.unify_with_template_args(g, c, subs),
+            (Ty::Tuple(gs), Ty::Tuple(cs)) if gs.len() == cs.len() => {
+                for (g, c) in gs.iter().zip(cs.iter()) {
+                    self.unify_with_template_args(g, c, subs);
+                }
+            }
+            (Ty::FnPtr { params: gp, ret: gr }, Ty::FnPtr { params: cp, ret: cr }) => {
+                for (g, c) in gp.iter().zip(cp.iter()) {
+                    self.unify_with_template_args(g, c, subs);
+                }
+                self.unify_with_template_args(gr, cr, subs);
+            }
+            (Ty::User(a), Ty::User(b)) => {
+                let ga = self.module.generic_type_args.get(a).cloned();
+                let gb = self.module.generic_type_args.get(b).cloned();
+                if let (Some((tmpl_a, args_a)), Some((tmpl_b, args_b))) = (ga, gb) {
+                    if tmpl_a == tmpl_b && args_a.len() == args_b.len() {
+                        for (a, b) in args_a.iter().zip(args_b.iter()) {
+                            self.unify_with_template_args(a, b, subs);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1433,6 +1503,41 @@ impl<'a> FnChecker<'a> {
                 if let Some(None) = self.find_variant_payload_in(mangled, name) {
                     self.variant_resolutions.insert(expr.span.start, mangled.clone());
                     return Ty::User(mangled.clone());
+                }
+            }
+        }
+        // Generic fn call — combine arg-driven and expected-driven
+        // inference. Lets `let x: Maybe<i32> = nothing()` derive T=I32
+        // even when there are no args to infer from.
+        if let ExprKind::Call { callee, args } = &expr.kind {
+            if let ExprKind::Ident(name) = &callee.kind {
+                let sig = self.module.fns.get(name).cloned();
+                if let Some(sig) = sig {
+                    if !sig.type_params.is_empty() {
+                        self.check_effect(sig.effect, expr.span);
+                        self.check_args_against_params(&sig.params, args, expr.span);
+                        let mut subs: HashMap<String, Ty> = HashMap::new();
+                        // Seed from arg types.
+                        let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+                        for (i, (_, pty)) in sig.params.iter().enumerate() {
+                            if let Some(at) = arg_tys.get(i) {
+                                self.unify_with_template_args(pty, at, &mut subs);
+                            }
+                        }
+                        // Seed from expected return type — this is the
+                        // new piece that handles arg-less generic fns.
+                        self.unify_with_template_args(&sig.ret, expected, &mut subs);
+                        // If we resolved every type param, record the
+                        // type args so the codegen can use them directly.
+                        if sig.type_params.iter().all(|p| subs.contains_key(p)) {
+                            let type_args: Vec<Ty> = sig.type_params.iter()
+                                .map(|p| subs.get(p).cloned().unwrap())
+                                .collect();
+                            self.call_resolutions.insert(expr.span.start, type_args);
+                        }
+                        let subbed = substitute_generic(sig.ret.clone(), &subs);
+                        return self.concretize_ty(&subbed, &subs);
+                    }
                 }
             }
         }

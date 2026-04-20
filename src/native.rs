@@ -1916,15 +1916,19 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     /// If `name` is a generic user fn, ensure a monomorphization exists for the
     /// given argument types and return (mangled_name, substituted_sig).
     /// Returns None for non-generic callees so the caller can use `name`
-    /// as-is.
+    /// as-is. `type_args_override` lets the caller supply explicit type
+    /// arguments (e.g. from the type checker's call_resolutions side
+    /// table) instead of inferring solely from arg types — needed for
+    /// fns like `nothing<T>(): Maybe<T>` where T can't come from args.
     fn monomorphize_if_generic(
         &mut self,
         name: &str,
         arg_tys: &[Ty],
+        type_args_override: Option<Vec<Ty>>,
     ) -> Option<(String, crate::types::FnSig)> {
         let sig = self.cg.info.fns.get(name)?.clone();
         // No module context for user-module fns.
-        self.do_monomorphize(name, name, &sig, arg_tys, None)
+        self.do_monomorphize(name, name, &sig, arg_tys, None, type_args_override)
     }
 
     /// Like monomorphize_if_generic, but for module-qualified calls
@@ -1935,10 +1939,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         module: &str,
         method: &str,
         arg_tys: &[Ty],
+        type_args_override: Option<Vec<Ty>>,
     ) -> Option<(String, crate::types::FnSig)> {
         let sig = self.cg.info.modules.get(module)?.get(method)?.clone();
         let qualified = format!("{module}.{method}");
-        self.do_monomorphize(&qualified, &qualified, &sig, arg_tys, Some(module.to_string()))
+        self.do_monomorphize(&qualified, &qualified, &sig, arg_tys, Some(module.to_string()), type_args_override)
     }
 
     /// Walk `ty`, finding deferred `Ty::User` names (registered by the
@@ -1996,22 +2001,45 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         sig: &crate::types::FnSig,
         arg_tys: &[Ty],
         module: Option<String>,
+        type_args_override: Option<Vec<Ty>>,
     ) -> Option<(String, crate::types::FnSig)> {
         if sig.type_params.is_empty() {
             return None;
         }
 
-        // Unify each generic param against the corresponding concrete arg.
-        let mut subs: HashMap<String, Ty> = HashMap::new();
-        for (i, (_, pty)) in sig.params.iter().enumerate() {
-            if let Some(at) = arg_tys.get(i) {
-                unify_into(pty, at, &mut subs);
+        // If the type checker resolved the type args from context (args
+        // + expected return), use those directly. Otherwise infer from
+        // arg types alone — works for the common case where T flows
+        // from a fn parameter.
+        //
+        // The override may contain Ty::Generic when the call appears
+        // inside a generic fn body (e.g. id(id(x)) inside id_twice<T>'s
+        // body, where the type checker recorded [Generic("T")]). Apply
+        // the current monomorphization's active_subs so we resolve to
+        // the concrete instantiation (id$I32) rather than a deferred
+        // one (id$GT) that nobody compiles.
+        let active_subs = self.active_subs.clone();
+        let type_args: Vec<Ty> = if let Some(args) = type_args_override {
+            args.into_iter()
+                .map(|a| substitute_ty(a, &active_subs))
+                .map(|a| self.concretize_ty(&a, &active_subs))
+                .collect()
+        } else {
+            let mut subs: HashMap<String, Ty> = HashMap::new();
+            for (i, (_, pty)) in sig.params.iter().enumerate() {
+                if let Some(at) = arg_tys.get(i) {
+                    unify_into(pty, at, &mut subs);
+                }
             }
-        }
-        // Order type args by the fn's declared type_params so the same
-        // instantiation always mangles to the same name.
-        let type_args: Vec<Ty> = sig.type_params.iter()
-            .map(|p| subs.get(p).cloned().unwrap_or(Ty::Error))
+            sig.type_params.iter()
+                .map(|p| subs.get(p).cloned().unwrap_or(Ty::Error))
+                .collect()
+        };
+        // Build subs map from type_args for the substitution + concretize
+        // step below.
+        let subs: HashMap<String, Ty> = sig.type_params.iter()
+            .zip(type_args.iter())
+            .map(|(p, a)| (p.clone(), a.clone()))
             .collect();
         let mangled = mangle_monomorph_name(qualified_name, &type_args);
 
@@ -2180,9 +2208,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         }
 
         // If the callee is generic, dispatch to a monomorphization (creating
-        // it on first sight). Otherwise call the original name.
+        // it on first sight). Otherwise call the original name. Pass any
+        // type-args the type checker resolved from context (for arg-less
+        // generic calls like `nothing<T>(): Maybe<T>`).
+        let type_args_override = self.cg.info.call_resolutions.get(&span.start).cloned();
         let (effective_name, effective_sig) =
-            match self.monomorphize_if_generic(&name, &arg_tys) {
+            match self.monomorphize_if_generic(&name, &arg_tys, type_args_override) {
                 Some(pair) => (pair.0, Some(pair.1)),
                 None => (name.clone(), self.cg.info.fns.get(&name).cloned()),
             };
@@ -2482,8 +2513,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     arg_vals.push(self.compile_expr(&a.value)?);
                     arg_tys.push(self.infer_ty(&a.value)?);
                 }
+                let type_args_override = self.cg.info.call_resolutions.get(&span.start).cloned();
                 if let Some((mangled, subbed_sig)) =
-                    self.monomorphize_module_method_if_generic(mod_name, method, &arg_tys)
+                    self.monomorphize_module_method_if_generic(mod_name, method, &arg_tys, type_args_override)
                 {
                     let func_id = *self.cg.fn_ids.get(&mangled).unwrap();
                     let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);

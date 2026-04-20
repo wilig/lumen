@@ -30,6 +30,7 @@ p2.fst = key, p2.snd = 42
 bi = 100, bs = boxed
 make_pair: inferred, 0
 wrap_some: just 99
+nothing(): nothing
 m1 = nothing
 m2 = just 42
 m3 = just boxed string
