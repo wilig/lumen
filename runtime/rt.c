@@ -163,129 +163,27 @@ static void *lumen_realloc_raw(void *old_payload, int64_t old_size, int64_t new_
     return new_payload;
 }
 
-// --- Multi-core actor scheduler (lumen-cv1) ------------------------------
+// --- Worker thread pool + actor scheduler --------------------------------
 //
-// Approach A: per-actor lock + shared MPMC queue.
+// Worker pool is live (lumen-u53) but actor dispatch stays on the
+// caller's thread — either the main thread's cooperative scheduler
+// or an inline drain in lumen_rt_ask. The per-bucket-mutex approach
+// from the earlier cv1 attempt gave mutual exclusion but NOT FIFO
+// per actor: POSIX mutexes don't preserve wait order, so multiple
+// workers contending for the same bucket can dispatch messages out
+// of send order.
 //
-// Messages go on a single mutex-guarded FIFO; workers dequeue and
-// dispatch concurrently. Per-actor mutual exclusion ('one message at
-// a time per actor') is enforced via a small hash-bucket table of
-// mutexes keyed on the cell pointer. Dispatch acquires the bucket
-// mutex before calling the handler and releases afterward.
-//
-// Trade-offs accepted:
-//   - 64 buckets means different actors may share a bucket and
-//     serialize against each other. If profiling shows contention,
-//     graduate to a real per-cell lock (header on the allocation) or
-//     migrate to pin+steal.
-//   - ask-to-self would deadlock (the ask'er's bucket is locked when
-//     the callee tries to acquire it). Document as caveat.
-//   - In-flight counter + idle condvar gate lumen_rt_drain so the
-//     main thread waits for the queue to empty AND every dispatch
-//     to finish before returning.
-//
-// Self-ask detection + release-during-wait is a follow-up refinement.
+// Correct multi-worker scheduling needs per-actor state (mailbox +
+// sequence counter). Tracked as lumen-cv1 (reopened).
 
 #include <pthread.h>
 
 #define LUMEN_MAX_WORKERS 64
 static pthread_t lumen_workers[LUMEN_MAX_WORKERS];
 static int32_t lumen_worker_count = 0;
-// 0 = running, 1 = shutdown requested.
+static pthread_mutex_t lumen_worker_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lumen_worker_wake = PTHREAD_COND_INITIALIZER;
 static volatile int32_t lumen_worker_shutdown = 0;
-
-// ---- Message queue
-typedef struct {
-    void *target_cell;
-    void (*dispatch)(void *cell, int32_t kind, int64_t arg0, int64_t *reply);
-    int32_t msg_kind;
-    int64_t arg0;
-    int64_t *reply_slot;        // NULL for send
-    int32_t *reply_ready_flag;  // for ask: 1 once reply is filled
-    pthread_cond_t *reply_cond; // for ask: signaled once reply_ready_flag flips
-} QueueEntry;
-
-#define QUEUE_CAP 65536
-static QueueEntry queue[QUEUE_CAP];
-static int queue_head = 0;
-static int queue_tail = 0;
-static int32_t in_flight = 0;
-
-static pthread_mutex_t queue_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t queue_work = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t queue_idle = PTHREAD_COND_INITIALIZER;
-
-// ---- Per-actor lock buckets
-#define ACTOR_LOCK_BUCKETS 64
-static pthread_mutex_t actor_locks[ACTOR_LOCK_BUCKETS];
-static int32_t actor_locks_initialized = 0;
-
-static void lumen_init_actor_locks_once(void) {
-    if (actor_locks_initialized) return;
-    for (int i = 0; i < ACTOR_LOCK_BUCKETS; i++) {
-        pthread_mutex_init(&actor_locks[i], NULL);
-    }
-    actor_locks_initialized = 1;
-}
-
-static pthread_mutex_t *actor_lock_for(void *cell) {
-    // Fibonacci hash — spreads pointer-aligned allocations across buckets.
-    uintptr_t h = (uintptr_t)cell;
-    h ^= h >> 32;
-    h *= 0x9e3779b97f4a7c15ULL;
-    return &actor_locks[h % ACTOR_LOCK_BUCKETS];
-}
-
-static int queue_empty(void) {
-    return queue_head == queue_tail;
-}
-
-// Run one dispatched message. Queue_mu must NOT be held. The per-actor
-// bucket mutex is acquired/released inside.
-static void dispatch_entry(QueueEntry *e) {
-    pthread_mutex_t *al = actor_lock_for(e->target_cell);
-    pthread_mutex_lock(al);
-    int64_t reply = 0;
-    e->dispatch(e->target_cell, e->msg_kind, e->arg0, &reply);
-    pthread_mutex_unlock(al);
-
-    if (e->reply_slot) {
-        *e->reply_slot = reply;
-        if (e->reply_ready_flag) *e->reply_ready_flag = 1;
-        if (e->reply_cond) {
-            pthread_mutex_lock(&queue_mu);
-            pthread_cond_broadcast(e->reply_cond);
-            pthread_mutex_unlock(&queue_mu);
-        }
-    }
-}
-
-// Worker main loop: take from queue; dispatch; repeat.
-static void *lumen_worker_main(void *arg) {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&queue_mu);
-        while (queue_empty() && !lumen_worker_shutdown) {
-            pthread_cond_wait(&queue_work, &queue_mu);
-        }
-        if (lumen_worker_shutdown && queue_empty()) {
-            pthread_mutex_unlock(&queue_mu);
-            return NULL;
-        }
-        QueueEntry entry = queue[queue_head];
-        queue_head = (queue_head + 1) % QUEUE_CAP;
-        pthread_mutex_unlock(&queue_mu);
-
-        dispatch_entry(&entry);
-
-        pthread_mutex_lock(&queue_mu);
-        in_flight--;
-        if (in_flight == 0 && queue_empty()) {
-            pthread_cond_broadcast(&queue_idle);
-        }
-        pthread_mutex_unlock(&queue_mu);
-    }
-}
 
 static int32_t lumen_worker_count_from_env(void) {
     const char *env = getenv("LUMEN_THREADS");
@@ -299,9 +197,18 @@ static int32_t lumen_worker_count_from_env(void) {
     return (int32_t)n;
 }
 
+static void *lumen_worker_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&lumen_worker_mu);
+    while (!lumen_worker_shutdown) {
+        pthread_cond_wait(&lumen_worker_wake, &lumen_worker_mu);
+    }
+    pthread_mutex_unlock(&lumen_worker_mu);
+    return NULL;
+}
+
 __attribute__((constructor))
 static void lumen_worker_pool_start(void) {
-    lumen_init_actor_locks_once();
     lumen_worker_count = lumen_worker_count_from_env();
     for (int i = 0; i < lumen_worker_count; i++) {
         if (pthread_create(&lumen_workers[i], NULL, lumen_worker_main, NULL) != 0) {
@@ -313,137 +220,83 @@ static void lumen_worker_pool_start(void) {
 
 __attribute__((destructor))
 static void lumen_worker_pool_stop(void) {
-    // Drain any remaining work before letting workers exit. The main
-    // thread signals shutdown; workers finish their current item and
-    // then exit if the queue is empty.
-    pthread_mutex_lock(&queue_mu);
-    while (!queue_empty() || in_flight > 0) {
-        pthread_cond_wait(&queue_idle, &queue_mu);
-    }
+    pthread_mutex_lock(&lumen_worker_mu);
     lumen_worker_shutdown = 1;
-    pthread_cond_broadcast(&queue_work);
-    pthread_mutex_unlock(&queue_mu);
-
+    pthread_cond_broadcast(&lumen_worker_wake);
+    pthread_mutex_unlock(&lumen_worker_mu);
     for (int i = 0; i < lumen_worker_count; i++) {
         pthread_join(lumen_workers[i], NULL);
     }
 }
 
-// Push a message onto the queue. Safe from any thread.
-static void enqueue_locked(void *cell,
-                           void (*dispatch)(void *, int32_t, int64_t, int64_t *),
-                           int32_t kind, int64_t arg0,
-                           int64_t *reply_slot,
-                           int32_t *ready_flag,
-                           pthread_cond_t *reply_cond) {
+// --- Message queue -------------------------------------------------------
+
+typedef struct {
+    void *target_cell;
+    void (*dispatch)(void *cell, int32_t kind, int64_t arg0, int64_t *reply);
+    int32_t msg_kind;
+    int64_t arg0;
+    int64_t *reply_slot;
+} QueueEntry;
+
+#define QUEUE_CAP 65536
+static QueueEntry queue[QUEUE_CAP];
+static int queue_head = 0;
+static int queue_tail = 0;
+
+void lumen_rt_send(void *cell,
+                   void (*dispatch)(void *, int32_t, int64_t, int64_t *),
+                   int32_t kind, int64_t arg0) {
     int next = (queue_tail + 1) % QUEUE_CAP;
     if (next == queue_head) {
         fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
-        abort();
+        return;
     }
     queue[queue_tail].target_cell = cell;
     queue[queue_tail].dispatch = dispatch;
     queue[queue_tail].msg_kind = kind;
     queue[queue_tail].arg0 = arg0;
-    queue[queue_tail].reply_slot = reply_slot;
-    queue[queue_tail].reply_ready_flag = ready_flag;
-    queue[queue_tail].reply_cond = reply_cond;
+    queue[queue_tail].reply_slot = NULL;
     queue_tail = next;
-    in_flight++;
-    pthread_cond_signal(&queue_work);
-}
-
-void lumen_rt_send(void *cell,
-                   void (*dispatch)(void *, int32_t, int64_t, int64_t *),
-                   int32_t kind, int64_t arg0) {
-    pthread_mutex_lock(&queue_mu);
-    enqueue_locked(cell, dispatch, kind, arg0, NULL, NULL, NULL);
-    pthread_mutex_unlock(&queue_mu);
 }
 
 int64_t lumen_rt_ask(void *cell,
                      void (*dispatch)(void *, int32_t, int64_t, int64_t *),
                      int32_t kind, int64_t arg0) {
     int64_t reply = 0;
-    int32_t ready = 0;
-    pthread_cond_t reply_cond = PTHREAD_COND_INITIALIZER;
-
-    pthread_mutex_lock(&queue_mu);
-    enqueue_locked(cell, dispatch, kind, arg0, &reply, &ready, &reply_cond);
-    // If we're the main thread and no workers exist, drain inline.
-    while (!ready) {
-        if (lumen_worker_count == 0) {
-            // Cooperative single-threaded path: pop + dispatch here.
-            if (!queue_empty()) {
-                QueueEntry e = queue[queue_head];
-                queue_head = (queue_head + 1) % QUEUE_CAP;
-                pthread_mutex_unlock(&queue_mu);
-                dispatch_entry(&e);
-                pthread_mutex_lock(&queue_mu);
-                in_flight--;
-                if (in_flight == 0 && queue_empty()) {
-                    pthread_cond_broadcast(&queue_idle);
-                }
-            } else {
-                // No workers and no work but ready isn't set — shouldn't
-                // happen if dispatch_entry actually ran our message.
-                break;
-            }
-        } else {
-            pthread_cond_wait(&reply_cond, &queue_mu);
-        }
+    int next = (queue_tail + 1) % QUEUE_CAP;
+    if (next == queue_head) {
+        fprintf(stderr, "FATAL: actor message queue full (%d messages)\n", QUEUE_CAP);
+        return 0;
     }
-    pthread_mutex_unlock(&queue_mu);
-    pthread_cond_destroy(&reply_cond);
+    queue[queue_tail].target_cell = cell;
+    queue[queue_tail].dispatch = dispatch;
+    queue[queue_tail].msg_kind = kind;
+    queue[queue_tail].arg0 = arg0;
+    queue[queue_tail].reply_slot = &reply;
+    queue_tail = next;
+    lumen_rt_drain();
     return reply;
 }
 
 int lumen_rt_step(void) {
-    // Pop one message on this thread and dispatch it. Used by
-    // cooperative yield / drain paths when no workers are running;
-    // safe to call from workers too.
-    pthread_mutex_lock(&queue_mu);
-    if (queue_empty()) {
-        pthread_mutex_unlock(&queue_mu);
-        return 0;
-    }
-    QueueEntry e = queue[queue_head];
+    if (queue_head == queue_tail) return 0;
+    QueueEntry *e = &queue[queue_head];
     queue_head = (queue_head + 1) % QUEUE_CAP;
-    pthread_mutex_unlock(&queue_mu);
-
-    dispatch_entry(&e);
-
-    pthread_mutex_lock(&queue_mu);
-    in_flight--;
-    if (in_flight == 0 && queue_empty()) {
-        pthread_cond_broadcast(&queue_idle);
+    int64_t reply = 0;
+    e->dispatch(e->target_cell, e->msg_kind, e->arg0, &reply);
+    if (e->reply_slot) {
+        *e->reply_slot = reply;
     }
-    pthread_mutex_unlock(&queue_mu);
     return 1;
 }
 
 void lumen_rt_drain(void) {
-    pthread_mutex_lock(&queue_mu);
-    while (!queue_empty() || in_flight > 0) {
-        if (lumen_worker_count == 0) {
-            // No workers: drain inline on this thread.
-            if (queue_empty()) break;
-            QueueEntry e = queue[queue_head];
-            queue_head = (queue_head + 1) % QUEUE_CAP;
-            pthread_mutex_unlock(&queue_mu);
-            dispatch_entry(&e);
-            pthread_mutex_lock(&queue_mu);
-            in_flight--;
-            continue;
-        }
-        pthread_cond_wait(&queue_idle, &queue_mu);
-    }
-    pthread_mutex_unlock(&queue_mu);
+    while (lumen_rt_step()) {}
 }
 
 void lumen_rt_yield(void) {
-    // No-op for cooperative back-compat — workers already process in
-    // parallel; there's no need for the caller to manually step.
+    lumen_rt_step();
 }
 
 // --- TCP socket operations ------------------------------------------------
