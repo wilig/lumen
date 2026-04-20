@@ -8,7 +8,7 @@
 //   m = map.set(m, "alice", 30)
 //   m = map.set(m, "bob", 25)
 //   match map.get(m, "alice") {
-//       Some(age) => io.println("age = \{age}"),
+//       Some(age) => io.println("age = ${age}"),
 //       None => io.println("not found"),
 //   }
 //

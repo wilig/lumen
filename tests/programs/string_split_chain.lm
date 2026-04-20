@@ -8,15 +8,15 @@ import std/string
 fn main(): i32 io {
     let csv = "alpha,beta,gamma,delta"
     let parts = string.split(csv, ",")
-    io.println("count=\{list.len(parts)}")
+    io.println("count=${list.len(parts)}")
     let n = list.len(parts)
     var total: i32 = 0
     for i in range(0, n) {
         let p = list.get(parts, i)
         let plen = string.len(p)
-        io.println("p[\{i}] len=\{plen}")
+        io.println("p[${i}] len=${plen}")
         total = total + plen
     }
-    io.println("total=\{total}")
+    io.println("total=${total}")
     return 0
 }

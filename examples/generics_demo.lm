@@ -27,20 +27,20 @@ fn id_twice<T>(x: T): T {
 
 fn main(): i32 io {
     // id<i32>, id<string>, id<f64> — three monomorphizations of `id`.
-    io.println("id ints:    \{id(42)}")
-    io.println("id string:  \{id("hello")}")
-    io.println("id float:   \{id(3.14)}")
+    io.println("id ints:    ${id(42)}")
+    io.println("id string:  ${id("hello")}")
+    io.println("id float:   ${id(3.14)}")
 
     // pick_first<i32, string> and pick_first<string, i32>.
-    io.println("pick first: \{pick_first(7, "ignored")}")
-    io.println("pick first: \{pick_first("kept", 99)}")
+    io.println("pick first: ${pick_first(7, "ignored")}")
+    io.println("pick first: ${pick_first("kept", 99)}")
 
     // head over List<i32> and List<string>.
     var ints: List<i32> = list.new()
     ints = list.push(ints, 10)
     ints = list.push(ints, 20)
     match head(ints) {
-        Some(n) => io.println("head ints:  \{n}"),
+        Some(n) => io.println("head ints:  ${n}"),
         None => io.println("(empty)"),
     }
 
@@ -48,7 +48,7 @@ fn main(): i32 io {
     strs = list.push(strs, "alpha")
     strs = list.push(strs, "beta")
     match head(strs) {
-        Some(s) => io.println("head strs:  \{s}"),
+        Some(s) => io.println("head strs:  ${s}"),
         None => io.println("(empty)"),
     }
 
@@ -59,8 +59,8 @@ fn main(): i32 io {
     }
 
     // Generic-of-generic.
-    io.println("id_twice:   \{id_twice(123)}")
-    io.println("id_twice:   \{id_twice("nested")}")
+    io.println("id_twice:   ${id_twice(123)}")
+    io.println("id_twice:   ${id_twice("nested")}")
 
     return 0
 }

@@ -1,4 +1,4 @@
 n=7 f=1.5 b=true
 p=Point { x: 3, y: 4 } t=(1, "two", 3)
 expr: 49 + 3
-escape: \{n}
+escape: ${n}

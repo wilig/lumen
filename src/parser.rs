@@ -48,10 +48,10 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, ParseError> {
 }
 
 /// Parse a single expression from a snippet of source — used to compile
-/// the body of a `\{...}` interpolation. Errors carry the surrounding
+/// the body of a `${...}` interpolation. Errors carry the surrounding
 /// string literal's span so the user sees a location they recognize.
 /// Shift every span in `e` by `offset` bytes. Used after parsing an
-/// interpolation's `\{...}` substring: spans emitted by the nested
+/// interpolation's `${...}` substring: spans emitted by the nested
 /// lexer/parser are relative to the substring, but downstream tables
 /// (call_resolutions, etc.) key off span.start and require global
 /// uniqueness across the whole source.

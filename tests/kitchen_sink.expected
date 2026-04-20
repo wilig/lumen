@@ -64,7 +64,7 @@ Point { x: 10.5, y: 20.25 }
 Hello, Alice!
 Alice is 30 years old
 sum = 6, product = 42
-not interpolated: \{name}
+not interpolated: ${name}
 
 === string utilities ===
 parts: 3

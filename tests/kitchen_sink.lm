@@ -120,7 +120,7 @@ fn add_pair(a: i32, b: i32): i32 {
 // Section divider
 fn section(title: string): unit io {
     io.println("")
-    io.println("=== \{title} ===")
+    io.println("=== ${title} ===")
 }
 
 fn main(): i32 io {
@@ -130,14 +130,14 @@ fn main(): i32 io {
 
     // sum_of_squares
     section("sum of squares")
-    io.println("1..10 = \{sum_of_squares(10)}")
+    io.println("1..10 = ${sum_of_squares(10)}")
 
     // match_demo
     section("match")
     let c: Shape = Circle { radius: 5 }
     let r: Shape = Rectangle { width: 4, height: 6 }
-    io.println("circle area ~ \{approx_area(c)}")
-    io.println("rect area   = \{approx_area(r)}")
+    io.println("circle area ~ ${approx_area(c)}")
+    io.println("rect area   = ${approx_area(r)}")
 
     // assert_demo (only the passing path — a failing assert would abort
     // the whole test).
@@ -150,49 +150,49 @@ fn main(): i32 io {
     // error_chain
     section("error chain")
     match compute() {
-        Ok(n) => io.println("got \{n}"),
-        Err(e) => io.println("err: \{e}"),
+        Ok(n) => io.println("got ${n}"),
+        Err(e) => io.println("err: ${e}"),
     }
 
     // generics_demo
     section("generics")
-    io.println("id i32:     \{id(42)}")
-    io.println("id string:  \{id("hello")}")
-    io.println("id float:   \{id(3.14)}")
-    io.println("pick first: \{pick_first(7, "ignored")}")
-    io.println("pick first: \{pick_first("kept", 99)}")
+    io.println("id i32:     ${id(42)}")
+    io.println("id string:  ${id("hello")}")
+    io.println("id float:   ${id(3.14)}")
+    io.println("pick first: ${pick_first(7, "ignored")}")
+    io.println("pick first: ${pick_first("kept", 99)}")
     var ints: List<i32> = list.new()
     ints = list.push(ints, 10)
     ints = list.push(ints, 20)
     match head(ints) {
-        Some(n) => io.println("head ints:  \{n}"),
+        Some(n) => io.println("head ints:  ${n}"),
         None => io.println("(empty)"),
     }
-    io.println("id_twice:   \{id_twice(7)}")
+    io.println("id_twice:   ${id_twice(7)}")
 
     // type generics (struct templates)
     section("type generics")
     let p1: Pair<i32, string> = Pair { fst: 7, snd: "hello" }
     let p2: Pair<string, i32> = Pair { fst: "key", snd: 42 }
-    io.println("p1.fst = \{p1.fst}, p1.snd = \{p1.snd}")
-    io.println("p2.fst = \{p2.fst}, p2.snd = \{p2.snd}")
+    io.println("p1.fst = ${p1.fst}, p1.snd = ${p1.snd}")
+    io.println("p2.fst = ${p2.fst}, p2.snd = ${p2.snd}")
     let bi: Box<i32> = Box { val: 100 }
     let bs: Box<string> = Box { val: "boxed" }
-    io.println("bi = \{bi.val}, bs = \{bs.val}")
+    io.println("bi = ${bi.val}, bs = ${bs.val}")
 
     // generic types referenced inside generic fn bodies
     let gp: Pair<string, i32> = make_pair("inferred")
-    io.println("make_pair: \{gp.fst}, \{gp.snd}")
+    io.println("make_pair: ${gp.fst}, ${gp.snd}")
     let gm: Maybe<i32> = wrap_some(99)
     match gm {
         Nothing => io.println("wrap_some: nothing"),
-        Just { value: v } => io.println("wrap_some: just \{v}"),
+        Just { value: v } => io.println("wrap_some: just ${v}"),
     }
     // T inferred from expected return type — no arg to derive it from.
     let gn: Maybe<string> = nothing()
     match gn {
         Nothing => io.println("nothing(): nothing"),
-        Just { value: s } => io.println("nothing(): just \{s}"),
+        Just { value: s } => io.println("nothing(): just ${s}"),
     }
 
     // generic sum types
@@ -201,15 +201,15 @@ fn main(): i32 io {
     let m3: Maybe<string> = Just { value: "boxed string" }
     match m1 {
         Nothing => io.println("m1 = nothing"),
-        Just { value: v } => io.println("m1 = just \{v}"),
+        Just { value: v } => io.println("m1 = just ${v}"),
     }
     match m2 {
         Nothing => io.println("m2 = nothing"),
-        Just { value: v } => io.println("m2 = just \{v}"),
+        Just { value: v } => io.println("m2 = just ${v}"),
     }
     match m3 {
         Nothing => io.println("m3 = nothing"),
-        Just { value: s } => io.println("m3 = just \{s}"),
+        Just { value: s } => io.println("m3 = just ${s}"),
     }
 
     // list_utils
@@ -220,15 +220,15 @@ fn main(): i32 io {
     nums = list.push(nums, 3)
     nums = list.push(nums, 4)
     nums = list.push(nums, 5)
-    io.println("nums:       \{nums}")
-    io.println("doubled:    \{list.map(nums, double_n)}")
-    io.println("evens:      \{list.filter(nums, is_even)}")
-    io.println("any even:   \{list.any(nums, is_even)}")
-    io.println("count even: \{list.count(nums, is_even)}")
-    io.println("sum:        \{list.fold(nums, 0, add_pair)}")
-    io.println("reverse:    \{list.reverse(nums)}")
-    io.println("take 3:     \{list.take(nums, 3)}")
-    io.println("drop 3:     \{list.drop(nums, 3)}")
+    io.println("nums:       ${nums}")
+    io.println("doubled:    ${list.map(nums, double_n)}")
+    io.println("evens:      ${list.filter(nums, is_even)}")
+    io.println("any even:   ${list.any(nums, is_even)}")
+    io.println("count even: ${list.count(nums, is_even)}")
+    io.println("sum:        ${list.fold(nums, 0, add_pair)}")
+    io.println("reverse:    ${list.reverse(nums)}")
+    io.println("take 3:     ${list.take(nums, 3)}")
+    io.println("drop 3:     ${list.drop(nums, 3)}")
 
     // map_demo
     section("map")
@@ -236,18 +236,18 @@ fn main(): i32 io {
     ages = map.set(ages, "alice", 30)
     ages = map.set(ages, "bob", 25)
     ages = map.set(ages, "carol", 42)
-    io.println("size = \{map.len(ages)}")
+    io.println("size = ${map.len(ages)}")
     match map.get(ages, "alice") {
-        Some(age) => io.println("alice -> \{age}"),
+        Some(age) => io.println("alice -> ${age}"),
         None => io.println("alice: not found"),
     }
     match map.get(ages, "doug") {
-        Some(age) => io.println("doug -> \{age}"),
+        Some(age) => io.println("doug -> ${age}"),
         None => io.println("doug: not found"),
     }
-    io.println("has bob? \{map.contains(ages, "bob")}")
+    io.println("has bob? ${map.contains(ages, "bob")}")
     ages = map.remove(ages, "bob")
-    io.println("after remove, has bob? \{map.contains(ages, "bob")}")
+    io.println("after remove, has bob? ${map.contains(ages, "bob")}")
 
     // println_universal
     section("universal print")
@@ -262,19 +262,19 @@ fn main(): i32 io {
     section("interpolation")
     let name: string = "Alice"
     let age: i32 = 30
-    io.println("Hello, \{name}!")
-    io.println("\{name} is \{age} years old")
-    io.println("sum = \{1 + 2 + 3}, product = \{2 * 21}")
-    io.println("not interpolated: \\{name}")
+    io.println("Hello, ${name}!")
+    io.println("${name} is ${age} years old")
+    io.println("sum = ${1 + 2 + 3}, product = ${2 * 21}")
+    io.println("not interpolated: \${name}")
 
     // string utilities — guards lumen-358 (rc-incr inside imported
     // module bodies so callee scope-exit doesn't free caller pointers).
     section("string utilities")
     let csv: string = "alpha,beta,gamma"
     let parts: i64 = string.split(csv, ",")
-    io.println("parts: \{list.len(parts)}")
-    io.println("trim: '\{string.trim("  hi  ")}'")
-    io.println("contains: \{string.contains("hello world", "world")}")
+    io.println("parts: ${list.len(parts)}")
+    io.println("trim: '${string.trim("  hi  ")}'")
+    io.println("contains: ${string.contains("hello world", "world")}")
 
     // file_io (writes to a deterministic /tmp path; cleaned up by
     // the integration test wrapper before the next run)
@@ -283,15 +283,15 @@ fn main(): i32 io {
     let body: bytes = bytes.from_string("hello from kitchen sink\n")
     match fs.write_file(path, body) {
         Ok(_) => io.println("wrote ok"),
-        Err(e) => io.println("write failed: \{e}"),
+        Err(e) => io.println("write failed: ${e}"),
     }
     match fs.read_file(path) {
-        Ok(b) => io.println("read back: \{string.from_bytes(b)}"),
-        Err(e) => io.println("read failed: \{e}"),
+        Ok(b) => io.println("read back: ${string.from_bytes(b)}"),
+        Err(e) => io.println("read failed: ${e}"),
     }
     match fs.read_file("/no/such/file") {
         Ok(_) => io.println("unexpected"),
-        Err(e) => io.println("expected ENOENT: errno=\{e}"),
+        Err(e) => io.println("expected ENOENT: errno=${e}"),
     }
 
     // actors
@@ -299,7 +299,7 @@ fn main(): i32 io {
     let acc = spawn Counter { count: 0 }
     send acc.add(10)
     send acc.add(5)
-    io.println("counter = \{ask acc.get()}")
+    io.println("counter = ${ask acc.get()}")
 
     // multi_actor
     section("multi actor")
@@ -309,8 +309,8 @@ fn main(): i32 io {
     send b.add(20)
     send a.add(5)
     send b.add(30)
-    io.println("a = \{ask a.get()}")
-    io.println("b = \{ask b.get()}")
+    io.println("a = ${ask a.get()}")
+    io.println("b = ${ask b.get()}")
 
     return 0
 }

@@ -105,11 +105,13 @@ work. `send`/`ask`/`debug` are language forms with their own syntax.
 
 ## String interpolation
 
-`"hello \{name}"` — note the backslash. `${name}` and bare `{name}`
-don't parse. Escape literal `\{` with `\\{`.
+`"hello ${name}"` — matches JS/TS/Kotlin/Swift. A bare `$` not
+followed by `{` is just a literal dollar sign. To emit a literal
+`${...}` sequence, escape the `$` with `\$`.
 
 ```lumen
-io.println("n=\{n} sum=\{1 + 2 + 3}")
+io.println("n=${n} sum=${1 + 2 + 3}")
+io.println("literal: \${name}")   // prints: literal: ${name}
 ```
 
 Interpolated expressions can use any type: `io.println` and the
@@ -271,8 +273,8 @@ An `msg` handler receives `self` plus arguments; return the new state
   the binding, not the usage.
 - Expected a method, used a method: `xs.map(f)` compiles only in your
   head.
-- Interpolation: `${name}` silently parses as a literal `${` followed
-  by a name.
+- Interpolation: `${name}` is correct. `\{name}` (older Lumen) and
+  bare `{name}` don't parse as interpolations — they're literals.
 - Bare variant assumed generic: `let m = Just { value: 7 }` without
   an annotation can confuse inference for generic sum types —
   annotate `let m: Maybe<i32> = ...`.

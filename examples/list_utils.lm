@@ -21,45 +21,45 @@ fn main(): i32 io {
     xs = list.push(xs, 4)
     xs = list.push(xs, 5)
 
-    io.println("xs           = \{xs}")
-    io.println("len          = \{list.len(xs)}")
-    io.println("is_empty     = \{list.is_empty(xs)}")
+    io.println("xs           = ${xs}")
+    io.println("len          = ${list.len(xs)}")
+    io.println("is_empty     = ${list.is_empty(xs)}")
 
     match list.first(xs) {
-        Some(n) => io.println("first        = \{n}"),
+        Some(n) => io.println("first        = ${n}"),
         None => io.println("first        = (empty)"),
     }
     match list.last(xs) {
-        Some(n) => io.println("last         = \{n}"),
+        Some(n) => io.println("last         = ${n}"),
         None => io.println("last         = (empty)"),
     }
 
     let doubled: List<i32> = list.map(xs, double)
-    io.println("map double   = \{doubled}")
+    io.println("map double   = ${doubled}")
 
     let evens: List<i32> = list.filter(xs, is_even)
-    io.println("filter even  = \{evens}")
+    io.println("filter even  = ${evens}")
 
     match list.find(xs, is_even) {
-        Some(n) => io.println("find even    = \{n}"),
+        Some(n) => io.println("find even    = ${n}"),
         None => io.println("find even    = (none)"),
     }
 
-    io.println("any even     = \{list.any(xs, is_even)}")
-    io.println("all even     = \{list.all(xs, is_even)}")
-    io.println("count even   = \{list.count(xs, is_even)}")
-    io.println("sum (fold)   = \{list.fold(xs, 0, add)}")
+    io.println("any even     = ${list.any(xs, is_even)}")
+    io.println("all even     = ${list.all(xs, is_even)}")
+    io.println("count even   = ${list.count(xs, is_even)}")
+    io.println("sum (fold)   = ${list.fold(xs, 0, add)}")
 
     let rev: List<i32> = list.reverse(xs)
-    io.println("reverse      = \{rev}")
+    io.println("reverse      = ${rev}")
 
     let head3: List<i32> = list.take(xs, 3)
     let tail2: List<i32> = list.drop(xs, 3)
-    io.println("take 3       = \{head3}")
-    io.println("drop 3       = \{tail2}")
+    io.println("take 3       = ${head3}")
+    io.println("drop 3       = ${tail2}")
 
     let combined: List<i32> = list.concat(head3, tail2)
-    io.println("concat       = \{combined}")
+    io.println("concat       = ${combined}")
 
     // Works for non-scalar element types too.
     var words: List<string> = list.new()
@@ -67,7 +67,7 @@ fn main(): i32 io {
     words = list.push(words, "world")
     words = list.push(words, "foo")
     let rev_words: List<string> = list.reverse(words)
-    io.println("reverse strs = \{rev_words}")
+    io.println("reverse strs = ${rev_words}")
 
     return 0
 }

@@ -7,36 +7,36 @@ fn main(): i32 io {
     ages = map.set(ages, "bob", 25)
     ages = map.set(ages, "carol", 42)
 
-    io.println("size = \{map.len(ages)}")
+    io.println("size = ${map.len(ages)}")
 
     match map.get(ages, "alice") {
-        Some(age) => io.println("alice -> \{age}"),
+        Some(age) => io.println("alice -> ${age}"),
         None => io.println("alice: not found"),
     }
     match map.get(ages, "doug") {
-        Some(age) => io.println("doug -> \{age}"),
+        Some(age) => io.println("doug -> ${age}"),
         None => io.println("doug: not found"),
     }
 
     // Update an existing key.
     ages = map.set(ages, "alice", 31)
     match map.get(ages, "alice") {
-        Some(age) => io.println("after update, alice -> \{age}"),
+        Some(age) => io.println("after update, alice -> ${age}"),
         None => io.println("?"),
     }
 
     // contains + remove.
-    io.println("has bob? \{map.contains(ages, "bob")}")
+    io.println("has bob? ${map.contains(ages, "bob")}")
     ages = map.remove(ages, "bob")
-    io.println("has bob after remove? \{map.contains(ages, "bob")}")
-    io.println("size = \{map.len(ages)}")
+    io.println("has bob after remove? ${map.contains(ages, "bob")}")
+    io.println("size = ${map.len(ages)}")
 
     // String values too.
     var greetings: Map<string, string> = map.new()
     greetings = map.set(greetings, "en", "hello")
     greetings = map.set(greetings, "fr", "bonjour")
     match map.get(greetings, "fr") {
-        Some(g) => io.println("fr -> \{g}"),
+        Some(g) => io.println("fr -> ${g}"),
         None => io.println("?"),
     }
 

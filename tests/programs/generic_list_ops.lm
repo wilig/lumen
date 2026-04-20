@@ -13,14 +13,14 @@ fn main(): i32 io {
     xs = list.push(xs, "alpha")
     xs = list.push(xs, "beta")
     xs = list.push(xs, "gamma")
-    io.println("len=\{list.len(xs)}")
-    io.println("first=\{first(xs)}")
+    io.println("len=${list.len(xs)}")
+    io.println("first=${first(xs)}")
 
     // Re-read several times — would expose double-free if rc was off.
     let n = list.len(xs)
     for i in range(0, n) {
         let s = list.get(xs, i)
-        io.println("xs[\{i}]=\{s} (slen=\{string.len(s)})")
+        io.println("xs[${i}]=${s} (slen=${string.len(s)})")
     }
     return 0
 }

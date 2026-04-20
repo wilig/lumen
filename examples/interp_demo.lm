@@ -9,19 +9,19 @@ fn main(): i32 io {
     let ok: bool = true
     let p: Point = Point { x: 1.5, y: 2.5 }
 
-    io.println("Hello, \{name}!")
-    io.println("\{name} is \{age} years old")
-    io.println("pi ≈ \{pi}")
-    io.println("ok = \{ok}")
-    io.println("point: \{p}")
-    io.println("sum = \{1 + 2 + 3}, product = \{2 * 21}")
+    io.println("Hello, ${name}!")
+    io.println("${name} is ${age} years old")
+    io.println("pi ≈ ${pi}")
+    io.println("ok = ${ok}")
+    io.println("point: ${p}")
+    io.println("sum = ${1 + 2 + 3}, product = ${2 * 21}")
 
     // Interpolations work in any string context.
-    let line: string = "user(\{name}, \{age})"
+    let line: string = "user(${name}, ${age})"
     io.println(line)
 
     // Literal backslash + brace: escape the backslash.
-    io.println("not interpolated: \\{name}")
+    io.println("not interpolated: \${name}")
 
     return 0
 }

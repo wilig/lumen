@@ -10,9 +10,9 @@ fn main(): i32 io {
     let b: bool = true
     let p: Point = Point { x: 3, y: 4 }
     let t = (1, "two", 3.0)
-    io.println("n=\{n} f=\{f} b=\{b}")
-    io.println("p=\{p} t=\{t}")
-    io.println("expr: \{n * n} + \{1 + 2}")
-    io.println("escape: \\{n}")
+    io.println("n=${n} f=${f} b=${b}")
+    io.println("p=${p} t=${t}")
+    io.println("expr: ${n * n} + ${1 + 2}")
+    io.println("escape: \${n}")
     return 0
 }

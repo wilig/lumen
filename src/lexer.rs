@@ -62,7 +62,7 @@ pub enum TokenKind {
     /// stored as u32. Runtime representation is i32 (held in
     /// `Ty::Char`).
     CharLit(u32),
-    /// Interpolated string with at least one `\{expr}` placeholder.
+    /// Interpolated string with at least one `${expr}` placeholder.
     /// Each part is either a literal chunk or the raw source text of an
     /// embedded expression (the parser re-lexes & parses each Expr).
     InterpolatedString(Vec<InterpPart>),
@@ -111,7 +111,7 @@ pub enum TokenKind {
 pub enum InterpPart {
     /// Literal chunk — escapes are already resolved.
     Lit(String),
-    /// Raw source text of a `\{...}` expression, plus the source location
+    /// Raw source text of a `${...}` expression, plus the source location
     /// of the first character inside the braces (so error messages from
     /// the re-parsed expression point at the right place). `byte_offset`
     /// is the byte position in the outer source where the expression
@@ -505,7 +505,7 @@ impl<'a> Lexer<'a> {
         Some(suf)
     }
 
-    /// Read the source text of a `\{...}` interpolation, starting just
+    /// Read the source text of a `${...}` interpolation, starting just
     /// after the opening `{`. Tracks brace depth (so struct literals or
     /// nested blocks parse correctly) and skips over nested string
     /// literals so a `}` inside `"..."` doesn't terminate the interpolation.
@@ -807,8 +807,8 @@ impl<'a> Lexer<'a> {
                             span: self.span_from(start, line, col),
                         });
                     }
-                    Some(b'\\') if self.peek_at(1) == Some(b'{') => {
-                        self.bump(); self.bump(); // \{
+                    Some(b'$') if self.peek_at(1) == Some(b'{') => {
+                        self.bump(); self.bump(); // ${
                         let (expr_off, expr_line, expr_col) = self.here();
                         if !out.is_empty() {
                             parts.push(InterpPart::Lit(std::mem::take(&mut out)));
@@ -872,19 +872,25 @@ impl<'a> Lexer<'a> {
                 });
             }
 
+            // `${expr}` — string interpolation. A bare `$` followed by
+            // anything else is a literal `$`. To include a literal
+            // `${` sequence in output, write `\$` which consumes the
+            // `$` as a literal; the following `{` has no special
+            // meaning.
+            if b == b'$' && self.peek_at(1) == Some(b'{') {
+                self.bump(); self.bump(); // ${
+                let (expr_off, expr_line, expr_col) = self.here();
+                if !out.is_empty() {
+                    parts.push(InterpPart::Lit(std::mem::take(&mut out)));
+                }
+                let src = self.collect_interp_expr(start, line, col)?;
+                parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col, byte_offset: expr_off });
+                continue;
+            }
+
             if b == b'\\' {
                 self.bump();
                 match self.peek() {
-                    Some(b'{') => {
-                        self.bump();
-                        let (expr_off, expr_line, expr_col) = self.here();
-                        if !out.is_empty() {
-                            parts.push(InterpPart::Lit(std::mem::take(&mut out)));
-                        }
-                        let src = self.collect_interp_expr(start, line, col)?;
-                        parts.push(InterpPart::Expr { source: src, line: expr_line, col: expr_col, byte_offset: expr_off });
-                        continue;
-                    }
                     Some(b'n') => {
                         self.bump();
                         out.push('\n');
@@ -904,6 +910,13 @@ impl<'a> Lexer<'a> {
                     Some(b'"') => {
                         self.bump();
                         out.push('"');
+                    }
+                    Some(b'$') => {
+                        // Escape for a literal `$` — mainly useful when
+                        // the next char is `{` (otherwise `$` is already
+                        // literal by default).
+                        self.bump();
+                        out.push('$');
                     }
                     Some(b'0') => {
                         self.bump();

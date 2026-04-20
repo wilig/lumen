@@ -13,16 +13,16 @@ fn pipeline(a: i32, b: i32, c: i32): Result<i32, string> {
 
 fn main(): i32 io {
     match pipeline(100, 5, 4) {
-        Ok(n) => io.println("ok=\{n}"),
-        Err(e) => io.println("err=\{e}"),
+        Ok(n) => io.println("ok=${n}"),
+        Err(e) => io.println("err=${e}"),
     }
     match pipeline(100, 0, 4) {
-        Ok(n) => io.println("ok=\{n}"),
-        Err(e) => io.println("err=\{e}"),
+        Ok(n) => io.println("ok=${n}"),
+        Err(e) => io.println("err=${e}"),
     }
     match pipeline(100, 5, 0) {
-        Ok(n) => io.println("ok=\{n}"),
-        Err(e) => io.println("err=\{e}"),
+        Ok(n) => io.println("ok=${n}"),
+        Err(e) => io.println("err=${e}"),
     }
     return 0
 }

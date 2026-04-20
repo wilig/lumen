@@ -21,14 +21,14 @@ fn main(): i32 io {
                             for i in range(0, 3) {
                                 sum = sum + a + b + i
                             }
-                            io.println("sum=\{sum}")
+                            io.println("sum=${sum}")
                         }
                     }
                 },
-                Err(e) => io.println("inner err=\{e}"),
+                Err(e) => io.println("inner err=${e}"),
             }
         },
-        Err(e) => io.println("outer err=\{e}"),
+        Err(e) => io.println("outer err=${e}"),
     }
     return 0
 }
