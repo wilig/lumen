@@ -1,0 +1,50 @@
+// Smoke test for std/test itself plus baseline language behavior.
+// Any failing assertion makes this binary exit non-zero, which is
+// what the tests/lumen harness checks.
+import std/test
+import std/list
+import std/map
+import std/string
+
+fn main(): i32 io {
+    // scalar equality
+    test.eq(1 + 1, 2, "i32 add")
+    test.eq(100i64 * 2i64, 200i64, "i64 mul")
+    test.eq(3.14, 3.14, "f64 eq")
+    test.eq(true, true, "bool eq")
+    test.eq('a', 'a', "char eq")
+    test.ne('a', 'b', "char ne")
+
+    // string eq/ne
+    test.eq("hello", "hello", "string eq")
+    test.ne("hello", "world", "string ne")
+
+    // boolean
+    test.is_true(1 < 2, "is_true")
+    test.is_false(1 > 2, "is_false")
+
+    // list
+    var xs: List<i32> = list.new()
+    xs = list.push(xs, 10)
+    xs = list.push(xs, 20)
+    test.eq(list.len(xs), 2, "list.len after two pushes")
+    test.eq(list.get(xs, 0), 10, "list.get[0]")
+    test.eq(list.get(xs, 1), 20, "list.get[1]")
+
+    // map
+    var m: Map<string, i32> = map.new()
+    m = map.set(m, "a", 1)
+    m = map.set(m, "b", 2)
+    test.eq(map.len(m), 2, "map.len")
+    test.eq(map.contains(m, "a"), 1, "map.contains a")
+    test.eq(map.contains(m, "nope"), 0, "map.contains nope")
+
+    // string utilities
+    test.eq(string.len("hello"), 5, "string.len ascii")
+    test.eq(string.char_count("héllo"), 5, "char_count non-ascii")
+    test.eq(string.trim("  hi  "), "hi", "trim ascii")
+    test.eq(string.trim("hi"), "hi", "trim noop")
+    test.eq(string.trim(""), "", "trim empty")
+
+    return test.summary()
+}

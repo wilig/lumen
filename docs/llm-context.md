@@ -228,6 +228,33 @@ match map.get(ages, "alice") {
 `list.push` / `map.set` return the updated container — reassign with
 `var`, don't mutate in place.
 
+## Writing tests
+
+`std/test` is the in-language testing module. Write assertions in
+`main`, return `test.summary()` so the exit code is the failure count.
+
+```lumen
+import std/test
+
+fn main(): i32 io {
+    test.eq(1 + 1, 2, "addition")
+    test.eq("hi", "hi", "string eq")
+    test.ne(5, 6, "ne different")
+    test.is_true(1 < 2, "trivially true")
+    test.is_false(1 > 2, "trivially false")
+    return test.summary()
+}
+```
+
+Available assertions: `test.eq<T>`, `test.ne<T>`, `test.is_true`,
+`test.is_false`, `test.fail(label)`, `test.summary()`. Generic `eq`
+/ `ne` work on any type where `==` / `!=` work — scalars, `char`,
+`string`. User structs/tuples don't have value equality yet.
+
+Test programs live under `tests/lumen/*.lm` in the repo. The
+`cargo test` harness compiles + runs each and asserts exit code 0
+— independent of the tests/programs snapshot harness.
+
 ## What doesn't exist
 
 - No traits / impl / interfaces. Pluggable behavior = fn-pointer arg.

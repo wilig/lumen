@@ -1377,3 +1377,30 @@ int32_t lumen_fs_write(int64_t path_ptr, int64_t content_ptr) {
     if (fclose(f) != 0) return errno;
     return 0;
 }
+
+// -- std/test counters ---------------------------------------------------
+//
+// Simple singleton state. Program is single-threaded at the test level
+// (actors don't participate — if you ask from inside an actor, the
+// count is still shared). Fine for MVP.
+
+static int32_t test_pass_count = 0;
+static int32_t test_fail_count = 0;
+
+void lumen_test_record_pass(void) { test_pass_count++; }
+void lumen_test_record_fail(void) { test_fail_count++; }
+
+// Print a one-line summary and return the failure count. A caller that
+// does `return test.summary()` from main exits non-zero iff anything
+// failed, which is the convention `cargo test` + `prove` both like.
+int32_t lumen_test_summary(void) {
+    int32_t total = test_pass_count + test_fail_count;
+    if (test_fail_count == 0) {
+        fprintf(stdout, "\n%d/%d passed\n", test_pass_count, total);
+    } else {
+        fprintf(stdout, "\n%d/%d passed, %d failed\n",
+                test_pass_count, total, test_fail_count);
+    }
+    fflush(stdout);
+    return test_fail_count;
+}

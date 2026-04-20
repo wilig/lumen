@@ -8,33 +8,51 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let programs_dir = PathBuf::from(&manifest).join("tests/programs");
-    println!("cargo:rerun-if-changed=tests/programs");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    let mut cases = Vec::new();
-    if programs_dir.is_dir() {
-        for entry in fs::read_dir(&programs_dir).expect("read tests/programs") {
+    generate_cases(
+        &PathBuf::from(&manifest).join("tests/programs"),
+        &out_dir.join("programs_cases.rs"),
+        "program_",
+        // Programs that document known-failing behavior. Listed here
+        // to keep the test surface visible (run with `--ignored`)
+        // while letting `cargo test` stay green.
+        &[],
+        "tests/programs",
+    );
+
+    generate_cases(
+        &PathBuf::from(&manifest).join("tests/lumen"),
+        &out_dir.join("lumen_cases.rs"),
+        "lumen_",
+        &[],
+        "tests/lumen",
+    );
+}
+
+fn generate_cases(
+    dir: &PathBuf,
+    dest: &PathBuf,
+    prefix: &str,
+    known_failing: &[&str],
+    rerun_path: &str,
+) {
+    println!("cargo:rerun-if-changed={rerun_path}");
+    let mut cases: Vec<String> = Vec::new();
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir).expect("read test dir") {
             let path = entry.expect("dir entry").path();
             if path.extension().and_then(|s| s.to_str()) != Some("lm") {
                 continue;
             }
             let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
-            // Filenames must be valid Rust identifiers.
             if !stem.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                panic!(
-                    "tests/programs/{stem}.lm — name must be alphanumeric/underscore",
-                );
+                panic!("{rerun_path}/{stem}.lm — name must be alphanumeric/underscore");
             }
             cases.push(stem);
         }
     }
     cases.sort();
-
-    // Programs that document known-failing behavior. Listed here to
-    // keep the test surface visible (run with `--ignored`) while
-    // letting `cargo test` stay green. Add an entry alongside the
-    // .lm/.expected files; remove it once the underlying bug is fixed.
-    let known_failing: &[&str] = &[];
 
     let mut out = String::new();
     for name in &cases {
@@ -44,11 +62,8 @@ fn main() {
             "#[test]\n"
         };
         out.push_str(&format!(
-            "{attrs}fn program_{name}() {{ run_case(\"{name}\"); }}\n",
+            "{attrs}fn {prefix}{name}() {{ run_case(\"{name}\"); }}\n",
         ));
     }
-
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let dest = PathBuf::from(out_dir).join("programs_cases.rs");
-    fs::write(&dest, out).expect("write programs_cases.rs");
+    fs::write(dest, out).expect("write cases file");
 }

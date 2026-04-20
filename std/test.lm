@@ -1,0 +1,69 @@
+// In-language testing. Import, assert, and call summary() from main:
+//
+//     import std/test
+//     fn main(): i32 io {
+//         test.eq(1 + 1, 2, "addition")
+//         test.is_true("hi" == "hi", "string eq")
+//         return test.summary()
+//     }
+//
+// Pass/fail counters live in the C runtime (single-threaded singleton).
+// Summary prints a one-line report and returns the failure count so
+// `return test.summary()` from main gives the right exit code.
+
+import std/io
+
+extern fn _record_pass(): unit link "lumen_test_record_pass"
+extern fn _record_fail(): unit link "lumen_test_record_fail"
+extern fn _summary(): i32 link "lumen_test_summary"
+
+fn eq<T>(actual: T, expected: T, label: string): unit io {
+    if actual == expected {
+        io.println("  ok  ${label}")
+        _record_pass()
+    } else {
+        io.println("  FAIL  ${label}: expected ${expected}, got ${actual}")
+        _record_fail()
+    }
+}
+
+fn ne<T>(actual: T, expected: T, label: string): unit io {
+    if actual != expected {
+        io.println("  ok  ${label}")
+        _record_pass()
+    } else {
+        io.println("  FAIL  ${label}: both values = ${actual}")
+        _record_fail()
+    }
+}
+
+fn is_true(cond: bool, label: string): unit io {
+    if cond {
+        io.println("  ok  ${label}")
+        _record_pass()
+    } else {
+        io.println("  FAIL  ${label}: expected true")
+        _record_fail()
+    }
+}
+
+fn is_false(cond: bool, label: string): unit io {
+    if cond {
+        io.println("  FAIL  ${label}: expected false")
+        _record_fail()
+    } else {
+        io.println("  ok  ${label}")
+        _record_pass()
+    }
+}
+
+fn fail(label: string): unit io {
+    io.println("  FAIL  ${label}")
+    _record_fail()
+}
+
+// Prints a summary and returns the number of failures. Use as the
+// return value of main so the exit code reflects test results.
+fn summary(): i32 io {
+    return _summary()
+}
