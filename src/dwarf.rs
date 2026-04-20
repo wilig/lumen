@@ -59,9 +59,9 @@ pub struct LineRow {
 }
 
 /// A resolved Lumen type, in the form we care about for DWARF. We
-/// only distinguish the shapes gdb needs to display values; everything
-/// that's a heap-allocated pointer at runtime collapses into
-/// `DwarfTy::Pointer` here.
+/// distinguish the shapes gdb needs to display values; most heap shapes
+/// collapse into `DwarfTy::Pointer`, but named user structs get their
+/// own variant so we can attach field layouts to them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DwarfTy {
     I32,
@@ -72,10 +72,24 @@ pub enum DwarfTy {
     Bool,
     Char,
     Unit,
-    /// Any heap-allocated value (strings, bytes, lists, structs,
-    /// sums, tuples, handles, fn ptrs — all one-word pointers in
-    /// Lumen's runtime representation).
+    /// Pointer to a registered user struct (see DwarfBuilder::add_struct).
+    /// Renders as `<Name> *` in gdb and `print *p` displays fields.
+    Struct(String),
+    /// Any heap-allocated value not otherwise classified (strings,
+    /// bytes, lists, maps, sums, tuples, handles, fn ptrs — all
+    /// one-word pointers in Lumen's runtime representation).
     Pointer,
+}
+
+/// A field inside a user struct layout.
+#[derive(Clone)]
+pub struct StructField {
+    pub name: String,
+    pub ty: DwarfTy,
+    /// Byte offset of this field from the start of the struct's
+    /// payload (the pointer gdb sees). Lumen's rc header (8 bytes) is
+    /// BEFORE the payload, so offsets are 0-based here.
+    pub offset: u32,
 }
 
 /// A parameter captured for a function, for DW_TAG_formal_parameter.
@@ -114,6 +128,9 @@ pub struct DwarfBuilder {
     /// entry (it defaults to index 0).
     module_index: HashMap<String, usize>,
     functions: Vec<FunctionEntry>,
+    /// Registered struct layouts keyed by struct name. Consumed at
+    /// emit-time to build DW_TAG_structure_type DIEs.
+    structs: HashMap<String, (Vec<StructField>, u32)>,
     endian: RunTimeEndian,
     encoding: Encoding,
 }
@@ -130,9 +147,17 @@ impl DwarfBuilder {
             source_files: vec![split_path(source_path)],
             module_index: HashMap::new(),
             functions: Vec::new(),
+            structs: HashMap::new(),
             endian: RunTimeEndian::Little,
             encoding,
         }
+    }
+
+    /// Register a user-struct layout. `byte_size` is the total payload
+    /// size; the rc header lives before the pointer we give gdb, so
+    /// offsets passed here are 0-based from the payload start.
+    pub fn add_struct(&mut self, name: &str, fields: Vec<StructField>, byte_size: u32) {
+        self.structs.insert(name.to_string(), (fields, byte_size));
     }
 
     /// Register an imported module's source path so functions from it
@@ -260,6 +285,15 @@ impl DwarfBuilder {
         // Type DIE cache: each distinct DwarfTy gets one DIE per CU.
         let mut type_cache: HashMap<DwarfTy, gimli::write::UnitEntryId> = HashMap::new();
 
+        // Eagerly emit DIEs for every registered struct so gdb can
+        // resolve them even if no fn param/return directly references
+        // the struct (the common case — most structs flow through
+        // generic Pointer-typed params).
+        let struct_names: Vec<String> = self.structs.keys().cloned().collect();
+        for name in struct_names {
+            get_or_build_type(&mut dwarf, root, &mut type_cache, &self.structs, &DwarfTy::Struct(name));
+        }
+
         // One DW_TAG_subprogram DIE per Lumen function. Attributes
         // reference the source file it came from and its parameter /
         // return types; nested DW_TAG_formal_parameter DIEs name
@@ -271,7 +305,7 @@ impl DwarfBuilder {
             let ret_ty_id = if f.ret == DwarfTy::Unit {
                 None
             } else {
-                Some(get_or_build_type(&mut dwarf, root, &mut type_cache, &f.ret))
+                Some(get_or_build_type(&mut dwarf, root, &mut type_cache, &self.structs, &f.ret))
             };
             let subp = dwarf.unit.add(root, gimli::DW_TAG_subprogram);
             let fname = dwarf.strings.add(f.name.clone());
@@ -293,7 +327,7 @@ impl DwarfBuilder {
             // gdb may show stale values after the fn moves registers
             // to stack slots (full range info is a follow-up).
             let param_ty_ids: Vec<_> = f.params.iter()
-                .map(|p| get_or_build_type(&mut dwarf, root, &mut type_cache, &p.ty))
+                .map(|p| get_or_build_type(&mut dwarf, root, &mut type_cache, &self.structs, &p.ty))
                 .collect();
             let mut int_slot: usize = 0;
             let mut float_slot: usize = 0;
@@ -585,13 +619,16 @@ fn add_debug_reloc(
 
 /// Look up or build a DIE for a Lumen type, caching per CU so each
 /// shape is defined exactly once. Base types go directly under the
-/// compile unit root; `DwarfTy::Pointer` becomes a DW_TAG_pointer_type
-/// over a DW_TAG_unspecified_type (opaque `void *` — good enough for
-/// MVP, individual struct layouts are a follow-up ticket).
+/// compile unit root. `DwarfTy::Struct(name)` emits a
+/// DW_TAG_structure_type with DW_TAG_member children (if the struct
+/// was registered via add_struct) and returns a pointer-to-struct DIE.
+/// `DwarfTy::Pointer` is a generic opaque `void *` for shapes whose
+/// layout we don't yet describe (sums, tuples, lists, maps).
 fn get_or_build_type(
     dwarf: &mut DwarfUnit,
     root: gimli::write::UnitEntryId,
     cache: &mut HashMap<DwarfTy, gimli::write::UnitEntryId>,
+    structs: &HashMap<String, (Vec<StructField>, u32)>,
     ty: &DwarfTy,
 ) -> gimli::write::UnitEntryId {
     if let Some(&id) = cache.get(ty) {
@@ -606,6 +643,7 @@ fn get_or_build_type(
         DwarfTy::Bool => build_base_type(dwarf, root, "bool", gimli::DW_ATE_boolean, 4),
         DwarfTy::Char => build_base_type(dwarf, root, "char", gimli::DW_ATE_UTF, 4),
         DwarfTy::Unit => build_base_type(dwarf, root, "unit", gimli::DW_ATE_unsigned, 4),
+        DwarfTy::Struct(name) => build_struct_pointer_type(dwarf, root, cache, structs, name),
         DwarfTy::Pointer => {
             let base = dwarf.unit.add(root, gimli::DW_TAG_unspecified_type);
             let bname = dwarf.strings.add("<lumen>".to_string());
@@ -618,6 +656,51 @@ fn get_or_build_type(
     };
     cache.insert(ty.clone(), id);
     id
+}
+
+/// Build a DW_TAG_structure_type for a registered user struct (with
+/// DW_TAG_member children for each field) and wrap it in a
+/// DW_TAG_pointer_type — Lumen hands gdb a payload pointer, so the
+/// type users see is a pointer-to-struct.
+fn build_struct_pointer_type(
+    dwarf: &mut DwarfUnit,
+    root: gimli::write::UnitEntryId,
+    cache: &mut HashMap<DwarfTy, gimli::write::UnitEntryId>,
+    structs: &HashMap<String, (Vec<StructField>, u32)>,
+    name: &str,
+) -> gimli::write::UnitEntryId {
+    // Build the structure body.
+    let struct_id = dwarf.unit.add(root, gimli::DW_TAG_structure_type);
+    let name_str = dwarf.strings.add(name.to_string());
+    {
+        let die = dwarf.unit.get_mut(struct_id);
+        die.set(gimli::DW_AT_name, AttributeValue::StringRef(name_str));
+    }
+    if let Some((fields, byte_size)) = structs.get(name) {
+        dwarf.unit.get_mut(struct_id).set(
+            gimli::DW_AT_byte_size,
+            AttributeValue::Udata(*byte_size as u64),
+        );
+        // Collect field types first so the recursive type build
+        // doesn't conflict with our mutable borrow of struct_id.
+        let field_types: Vec<_> = fields.iter()
+            .map(|f| (f.name.clone(), f.offset, get_or_build_type(dwarf, root, cache, structs, &f.ty)))
+            .collect();
+        for (fname, offset, fty_id) in field_types {
+            let mem = dwarf.unit.add(struct_id, gimli::DW_TAG_member);
+            let fname_str = dwarf.strings.add(fname);
+            let d = dwarf.unit.get_mut(mem);
+            d.set(gimli::DW_AT_name, AttributeValue::StringRef(fname_str));
+            d.set(gimli::DW_AT_type, AttributeValue::UnitRef(fty_id));
+            d.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(offset as u64));
+        }
+    }
+    // Wrap in a pointer so the param/local's declared type matches
+    // what the Lumen runtime actually hands gdb (a payload ptr).
+    let ptr_id = dwarf.unit.add(root, gimli::DW_TAG_pointer_type);
+    dwarf.unit.get_mut(ptr_id).set(gimli::DW_AT_byte_size, AttributeValue::Udata(8));
+    dwarf.unit.get_mut(ptr_id).set(gimli::DW_AT_type, AttributeValue::UnitRef(struct_id));
+    ptr_id
 }
 
 fn build_base_type(

@@ -676,11 +676,47 @@ impl<'a> NativeCodegen<'a> {
         Ok(())
     }
 
+    /// Walk info.types and register every struct layout with the
+    /// DwarfBuilder. Must run before functions are recorded — subsequent
+    /// param types reference these struct names and the emit step
+    /// expects their layouts to be available.
+    fn register_struct_layouts_for_dwarf(&mut self) {
+        let struct_names: Vec<String> = self.info.types.iter()
+            .filter_map(|(name, info)| match info {
+                crate::types::TypeInfo::Struct { .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        for name in struct_names {
+            let fields = match self.info.types.get(&name) {
+                Some(crate::types::TypeInfo::Struct { fields, .. }) => fields.clone(),
+                _ => continue,
+            };
+            let size = struct_size(&fields) as u32;
+            let mut layout: Vec<crate::dwarf::StructField> = Vec::with_capacity(fields.len());
+            for (fname, fty) in &fields {
+                let (offset, _) = field_offset(&fields, fname);
+                layout.push(crate::dwarf::StructField {
+                    name: fname.clone(),
+                    ty: ty_to_dwarf(fty, self.info),
+                    offset: offset as u32,
+                });
+            }
+            self.dwarf.add_struct(&name, layout, size);
+        }
+    }
+
     fn compile_module(&mut self, module: &ast::Module, imported_modules: &[(&str, &ast::Module)]) -> Result<(), NativeError> {
         self.uses_io = module.imports.iter().any(|im| im.path == ["std", "io"]);
 
         // Intern string literals + frame messages.
         self.intern_all_strings(module);
+
+        // Register struct layouts for DWARF. Walk info.types once —
+        // every user-declared struct (and every concrete generic
+        // instantiation) gets a DW_TAG_structure_type with member
+        // offsets so `print *p` displays fields.
+        self.register_struct_layouts_for_dwarf();
 
         // Materialize top-level let/var bindings as static data.
         // User's module: defined here with initial bytes.
@@ -1535,10 +1571,10 @@ impl<'a> NativeCodegen<'a> {
                 let params: Vec<crate::dwarf::Param> = sig.params.iter()
                     .map(|(n, ty)| crate::dwarf::Param {
                         name: n.clone(),
-                        ty: ty_to_dwarf(ty),
+                        ty: ty_to_dwarf(ty, self.info),
                     })
                     .collect();
-                let ret = ty_to_dwarf(&sig.ret);
+                let ret = ty_to_dwarf(&sig.ret, self.info);
                 self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index, params, ret);
             }
         }
@@ -4648,11 +4684,10 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
     }
 }
 
-/// Map Lumen's internal Ty into the smaller DWARF-facing enum. Every
-/// heap-allocated shape (strings, bytes, lists, structs, sums, tuples,
-/// handles, fn ptrs) collapses to `Pointer` — gdb sees them as opaque
-/// addresses until ax3's follow-up wires full struct layouts.
-fn ty_to_dwarf(ty: &Ty) -> crate::dwarf::DwarfTy {
+/// Map Lumen's internal Ty into the smaller DWARF-facing enum. Named
+/// user structs get their own `Struct(name)` variant so DWARF can
+/// carry their layout; every other heap shape collapses to `Pointer`.
+fn ty_to_dwarf(ty: &Ty, info: &ModuleInfo) -> crate::dwarf::DwarfTy {
     use crate::dwarf::DwarfTy;
     match ty {
         Ty::I32 => DwarfTy::I32,
@@ -4663,6 +4698,13 @@ fn ty_to_dwarf(ty: &Ty) -> crate::dwarf::DwarfTy {
         Ty::Bool => DwarfTy::Bool,
         Ty::Char => DwarfTy::Char,
         Ty::Unit => DwarfTy::Unit,
+        Ty::User(name) => {
+            if matches!(info.types.get(name), Some(crate::types::TypeInfo::Struct { .. })) {
+                DwarfTy::Struct(name.clone())
+            } else {
+                DwarfTy::Pointer
+            }
+        }
         _ => DwarfTy::Pointer,
     }
 }
