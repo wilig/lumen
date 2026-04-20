@@ -158,6 +158,18 @@ impl Server {
                 let result = self.on_hover(&params);
                 vec![respond(id, result)]
             }
+            "textDocument/definition" => {
+                let result = self.on_definition(&params);
+                vec![respond(id, result)]
+            }
+            "textDocument/references" => {
+                let result = self.on_references(&params);
+                vec![respond(id, result)]
+            }
+            "textDocument/rename" => {
+                let result = self.on_rename(&params);
+                vec![respond(id, result)]
+            }
             // Any request we don't handle gets a null result so the
             // client doesn't time out. Notifications we don't handle
             // are silently dropped.
@@ -213,6 +225,51 @@ impl Server {
         json!({
             "contents": { "kind": "markdown", "value": markdown }
         })
+    }
+
+    fn on_definition(&self, params: &Value) -> Value {
+        let Some(uri) = text_document_uri(params) else { return Value::Null; };
+        let Some(doc) = self.docs.get(uri) else { return Value::Null; };
+        let (line, col) = cursor(params);
+        let word = word_at_position(&doc.text, line, col);
+        if word.is_empty() { return Value::Null; }
+        let Some(module) = &doc.last_ast else { return Value::Null; };
+        let Some(span) = find_declaration_span(module, &word) else { return Value::Null; };
+        let range = span_to_range(&doc.text, &span, word.len() as u32);
+        json!({ "uri": uri, "range": range })
+    }
+
+    fn on_references(&self, params: &Value) -> Value {
+        let Some(uri) = text_document_uri(params) else { return Value::Null; };
+        let Some(doc) = self.docs.get(uri) else { return Value::Null; };
+        let (line, col) = cursor(params);
+        let word = word_at_position(&doc.text, line, col);
+        if word.is_empty() { return json!([]); }
+        let include_decl = params.pointer("/context/includeDeclaration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let locations = find_all_occurrences(&doc.text, &word, include_decl);
+        let result: Vec<Value> = locations.into_iter()
+            .map(|r| json!({ "uri": uri, "range": r }))
+            .collect();
+        Value::Array(result)
+    }
+
+    fn on_rename(&self, params: &Value) -> Value {
+        let Some(uri) = text_document_uri(params) else { return Value::Null; };
+        let Some(doc) = self.docs.get(uri) else { return Value::Null; };
+        let (line, col) = cursor(params);
+        let word = word_at_position(&doc.text, line, col);
+        if word.is_empty() { return Value::Null; }
+        let new_name = match params.pointer("/newName").and_then(|v| v.as_str()) {
+            Some(n) if is_valid_identifier(n) => n,
+            _ => return Value::Null,
+        };
+        let occurrences = find_all_occurrences(&doc.text, &word, true);
+        let edits: Vec<Value> = occurrences.into_iter()
+            .map(|range| json!({ "range": range, "newText": new_name }))
+            .collect();
+        json!({ "changes": { uri: edits } })
     }
 
     /// Re-run lex / parse / typecheck for the document, refresh the
@@ -276,6 +333,114 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 
 fn text_document_uri(params: &Value) -> Option<&str> {
     params.pointer("/textDocument/uri").and_then(|u| u.as_str())
+}
+
+fn cursor(params: &Value) -> (u32, u32) {
+    let line = params.pointer("/position/line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+    let col = params.pointer("/position/character").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+    (line, col)
+}
+
+/// Find the declaration span for `word` among top-level fn/type
+/// decls and (not yet) scoped params/locals. Returns the Span of the
+/// identifier in the source.
+fn find_declaration_span(module: &ast::Module, word: &str) -> Option<Span> {
+    use ast::Item;
+    for item in &module.items {
+        match item {
+            Item::Fn(f) if f.name == word => return Some(f.name_span),
+            Item::ExternFn(ef) if ef.name == word => return Some(ef.name_span),
+            Item::Type(td) if td.name == word => return Some(td.name_span),
+            Item::Actor(a) if a.name == word => return Some(a.name_span),
+            Item::GlobalLet(g) if g.name == word => return Some(g.name_span),
+            _ => {}
+        }
+    }
+    // Walk fn bodies for a matching param or let/var.
+    for item in &module.items {
+        if let Item::Fn(f) = item {
+            for p in &f.params {
+                if p.name == word {
+                    return Some(p.span);
+                }
+            }
+            if let Some(span) = find_binding_span_in_block(&f.body, word) {
+                return Some(span);
+            }
+        }
+    }
+    None
+}
+
+fn find_binding_span_in_block(block: &ast::Block, word: &str) -> Option<Span> {
+    use ast::StmtKind;
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::Let { name, .. } | StmtKind::Var { name, .. } if name == word => {
+                return Some(stmt.span);
+            }
+            StmtKind::For { binder, body, .. } => {
+                if binder == word { return Some(stmt.span); }
+                if let Some(s) = find_binding_span_in_block(body, word) { return Some(s); }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Scan the source text for every whole-word occurrence of `word`.
+/// This is a textual match — it doesn't distinguish scopes, but
+/// combined with the typechecker's guarantee that top-level names
+/// are unique it's good enough for the common refactor cases.
+/// Returns LSP ranges (0-based line + character).
+fn find_all_occurrences(src: &str, word: &str, _include_decl: bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (line_idx, line) in src.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut col = 0usize;
+        while col + word.len() <= bytes.len() {
+            if &bytes[col..col + word.len()] == word.as_bytes() {
+                let before_ok = col == 0 || !is_word_byte(bytes[col - 1]);
+                let after = col + word.len();
+                let after_ok = after == bytes.len() || !is_word_byte(bytes[after]);
+                if before_ok && after_ok {
+                    out.push(json!({
+                        "start": { "line": line_idx as u32, "character": col as u32 },
+                        "end":   { "line": line_idx as u32, "character": (col + word.len()) as u32 },
+                    }));
+                    col += word.len();
+                    continue;
+                }
+            }
+            col += 1;
+        }
+    }
+    out
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_valid_identifier(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() { return false; }
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') { return false; }
+    bytes[1..].iter().all(|&b| is_word_byte(b))
+}
+
+/// Convert a compiler `Span` (1-based line/col + byte offsets) into
+/// a one-token-wide LSP range. Uses the token length passed in —
+/// `span.end - span.start` would also work for simple identifiers.
+fn span_to_range(_src: &str, span: &Span, len: u32) -> Value {
+    let line = span.line.saturating_sub(1);
+    let start = span.col.saturating_sub(1);
+    json!({
+        "start": { "line": line, "character": start },
+        "end":   { "line": line, "character": start + len },
+    })
 }
 
 /// Find the identifier-like word around a (line, col) position.
@@ -475,6 +640,9 @@ fn initialize_result() -> Value {
                 "save": { "includeText": false },
             },
             "hoverProvider": true,
+            "definitionProvider": true,
+            "referencesProvider": true,
+            "renameProvider": true,
         },
         "serverInfo": {
             "name": "lumen-lsp",

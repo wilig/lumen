@@ -177,6 +177,61 @@ fn lsp_hover_shows_fn_signature() {
 }
 
 #[test]
+fn lsp_goto_def_and_references_and_rename() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen lsp");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin.write_all(frame(init).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+
+    // `double` is declared on line 0, called on line 3.
+    let src = r#"fn double(x: i32): i32 {\n    return x + x\n}\n\nfn main(): i32 {\n    return double(21)\n}"#;
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///g.lm","languageId":"lumen","version":1,"text":"{}"}}}}}}"#,
+        src,
+    );
+    stdin.write_all(frame(&did_open).as_bytes()).unwrap();
+    let _ = read_message(&mut reader); // diagnostics
+
+    // goto-definition on the call `double(21)` at line 5, char 11.
+    let def = r#"{"jsonrpc":"2.0","id":20,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///g.lm"},"position":{"line":5,"character":11}}}"#;
+    stdin.write_all(frame(def).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains(r#""line":0"#),
+        "goto-def should point to declaration on line 0, got:\n{resp}");
+
+    // find-references on the declaration: both decl (line 0) and call (line 5) should appear.
+    let refs = r#"{"jsonrpc":"2.0","id":21,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///g.lm"},"position":{"line":0,"character":3},"context":{"includeDeclaration":true}}}"#;
+    stdin.write_all(frame(refs).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains(r#""line":0"#) && resp.contains(r#""line":5"#),
+        "references should find decl + call, got:\n{resp}");
+
+    // rename `double` to `triple` — expect two edits.
+    let rename = r#"{"jsonrpc":"2.0","id":22,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///g.lm"},"position":{"line":0,"character":3},"newName":"triple"}}"#;
+    stdin.write_all(frame(rename).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains("triple") && resp.contains("newText"),
+        "rename should propose TextEdits with new name, got:\n{resp}");
+
+    let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+    stdin.write_all(frame(shutdown).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+    stdin.write_all(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#).as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn lsp_clean_document_has_empty_diagnostics() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .arg("lsp")
