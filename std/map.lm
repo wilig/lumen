@@ -17,23 +17,23 @@
 
 import std/list
 
-extern fn new(): i64 link "lumen_map_new"
-extern fn contains(m: i64, k: string): i32 link "lumen_map_contains"
+// new takes a `key_is_ptr` flag (synthesized by the codegen from K —
+// 1 for string/bytes, 0 for scalars). All the other map fns are
+// codegen specials too, so the extern-shaped signatures below are
+// intentionally raw (keys as i64) — Lumen user code never calls them
+// directly.
+extern fn _new(key_is_ptr: i32): i64 link "lumen_map_new"
+extern fn _contains(m: i64, k: i64): i32 link "lumen_map_contains"
 extern fn len(m: i64): i32 link "lumen_map_len"
 
-// set/remove take an extra value_is_ptr flag so the C side can rc_decr
-// displaced/removed pointer values. The user-facing arity (3 / 2) is
-// handled by the codegen, which fills in the flag based on V's type.
-extern fn set(m: i64, k: string, v: i64, value_is_ptr: i32): i64 link "lumen_map_set"
-extern fn remove(m: i64, k: string, value_is_ptr: i32): i64 link "lumen_map_remove"
+extern fn _set(m: i64, k: i64, v: i64, value_is_ptr: i32): i64 link "lumen_map_set"
+extern fn _remove(m: i64, k: i64, value_is_ptr: i32): i64 link "lumen_map_remove"
 
-// `get` is special-cased in the codegen so it returns Option<V> with V
-// inferred from the map's element type; the raw extern is internal.
-extern fn _get(m: i64, k: string): i64 link "lumen_map_get"
+extern fn _get(m: i64, k: i64): i64 link "lumen_map_get"
 extern fn _get_found(): i32 link "lumen_map_get_found"
 
 // Live-entry iterators. Skip tombstones so indices are 0..len(m).
-extern fn _live_key_at(m: i64, i: i32): string link "lumen_map_live_key_at"
+extern fn _live_key_at(m: i64, i: i32): i64 link "lumen_map_live_key_at"
 extern fn _live_value_at(m: i64, i: i32): i64 link "lumen_map_live_value_at"
 
 // merge/values/entries are special-cased in the codegen so they can
@@ -41,15 +41,9 @@ extern fn _live_value_at(m: i64, i: i32): i64 link "lumen_map_live_value_at"
 // The raw extern for merge is internal.
 extern fn _merge_raw(a: i64, b: i64, vptr: i32): i64 link "lumen_map_merge"
 
-// Collect keys in insertion order. Non-generic (keys are always string).
-fn keys(m: i64): List<string> {
-    var out: List<string> = list.new()
-    let n = len(m)
-    for i in range(0, n) {
-        out = list.push(out, _live_key_at(m, i))
-    }
-    return out
-}
+// map.keys(m): List<K> — codegen special (like map.values). Walks
+// live entries in insertion order, pushing each raw key into the
+// list. K-specific width/sign-extension is handled at codegen time.
 
 // map.get_or(m, k, default) is a codegen special — see compile_method_call
 // in src/native.rs. Uses the raw _get extern + _get_found check, then

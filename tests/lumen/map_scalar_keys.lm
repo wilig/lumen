@@ -1,0 +1,61 @@
+// Map with non-string keys (lumen-2er). Exercises i32/i64/char/bool
+// across set/get/contains/remove/keys/values/entries/merge.
+import std/test
+import std/map
+import std/list
+
+fn main(): i32 io {
+    // i32 keys
+    var i: Map<i32, string> = map.new()
+    i = map.set(i, 1, "one")
+    i = map.set(i, 2, "two")
+    i = map.set(i, 42, "forty-two")
+    test.eq(map.len(i), 3, "i32: len after 3 sets")
+    test.eq(map.get_or(i, 42, "?"), "forty-two", "i32: get_or present")
+    test.eq(map.get_or(i, 99, "?"), "?", "i32: get_or missing")
+    test.eq(map.contains(i, 1), 1, "i32: contains hit")
+    test.eq(map.contains(i, 99), 0, "i32: contains miss")
+    i = map.remove(i, 2)
+    test.eq(map.len(i), 2, "i32: len after remove")
+    test.eq(map.contains(i, 2), 0, "i32: removed is gone")
+
+    // i32 keys round-tripped through entries
+    let ies = map.entries(i)
+    test.eq(list.len(ies), 2, "i32: entries len")
+    let e0 = list.get(ies, 0)
+    test.eq(e0.0, 1, "i32: entries[0] key")
+    test.eq(e0.1, "one", "i32: entries[0] value")
+
+    // i64 keys
+    var l: Map<i64, string> = map.new()
+    l = map.set(l, 100i64, "hundred")
+    l = map.set(l, 1000i64, "thousand")
+    test.eq(map.get_or(l, 100i64, "?"), "hundred", "i64: get_or")
+    test.eq(map.get_or(l, 5i64, "?"), "?", "i64: miss")
+
+    // char keys
+    var c: Map<char, i32> = map.new()
+    c = map.set(c, 'a', 1)
+    c = map.set(c, 'b', 2)
+    c = map.set(c, 'z', 26)
+    test.eq(map.get_or(c, 'b', 0), 2, "char: get_or hit")
+    test.eq(map.get_or(c, '?', 0 - 1), 0 - 1, "char: get_or miss")
+
+    // bool keys (only 2 possible, but valid)
+    var f: Map<bool, i32> = map.new()
+    f = map.set(f, true, 1)
+    f = map.set(f, false, 0)
+    test.eq(map.get_or(f, true, 0 - 1), 1, "bool: true")
+    test.eq(map.get_or(f, false, 0 - 1), 0, "bool: false")
+
+    // Overwrite behavior
+    c = map.set(c, 'a', 100)
+    test.eq(map.get_or(c, 'a', 0), 100, "overwrite on same key")
+
+    // keys() returns List<K> with correct type
+    let iks = map.keys(i)
+    test.eq(list.len(iks), 2, "i32: keys len")
+    test.eq(list.get(iks, 0), 1, "i32: keys[0]")
+
+    return test.summary()
+}

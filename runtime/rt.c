@@ -1123,10 +1123,14 @@ extern void lumen_rc_decr(int64_t ptr);
 #define LUMEN_MAP_INDEX_TOMB  (-2)
 
 typedef struct {
-    int64_t key_ptr;   // Lumen string ptr; 0 = tombstoned
+    // For pointer keys: Lumen string/bytes ptr. For scalar keys: the
+    // key's 8-byte representation (i32 sign-extended to i64).
+    // Tombstone state is tracked by `alive` — key == 0 is a valid
+    // scalar key.
+    int64_t key;
     int64_t value;     // i64-shaped value
     uint32_t hash;
-    uint32_t _pad;
+    uint32_t alive;    // 0 = empty/tombstone, 1 = live
 } LumenMapEntry;
 
 typedef struct {
@@ -1134,7 +1138,11 @@ typedef struct {
     int32_t entry_count;    // total used in entries[] (incl tombstones)
     int32_t entry_cap;      // capacity of entries[]
     int32_t index_cap;      // capacity of index[] (power of 2)
-    int32_t _pad[4];        // pad to 32 bytes for alignment
+    // 1 when keys are pointer-shaped (string/bytes); 0 for scalar
+    // keys (i32/i64/char/bool). Set at map.new time and treated as
+    // immutable — mixing key kinds in one map is undefined.
+    int32_t key_is_ptr;
+    int32_t _pad[3];        // pad to 32 bytes for alignment
 } LumenMapHeader;
 
 #define LUMEN_MAP_ENTRIES(hdr) \
@@ -1145,14 +1153,35 @@ typedef struct {
 // Per-thread is overkill for cooperative green-threading; mirror lumen_fs_errno.
 static int32_t lumen_map_last_get_found = 0;
 
-// FNV-1a 32-bit. Cheap, decent distribution for short string keys.
-static uint32_t lumen_map_hash_str(const char *data, int32_t len) {
+// FNV-1a 32-bit. Cheap, decent distribution for short string keys and
+// for the 8 bytes of a scalar key.
+static uint32_t lumen_map_hash_bytes(const uint8_t *data, int32_t len) {
     uint32_t h = 2166136261u;
     for (int32_t i = 0; i < len; i++) {
-        h ^= (uint8_t)data[i];
+        h ^= data[i];
         h *= 16777619u;
     }
     return h;
+}
+
+static uint32_t lumen_map_hash_key(int64_t key, int32_t key_is_ptr) {
+    if (key_is_ptr) {
+        if (key == 0) return 0;
+        char *kbuf = (char *)(uintptr_t)key;
+        int32_t klen = *(int32_t *)kbuf;
+        return lumen_map_hash_bytes((const uint8_t *)(kbuf + 4), klen);
+    }
+    return lumen_map_hash_bytes((const uint8_t *)&key, 8);
+}
+
+static int lumen_map_keys_equal(int64_t a, int64_t b, int32_t key_is_ptr) {
+    if (!key_is_ptr) return a == b;
+    if (a == 0 || b == 0) return 0;
+    char *abuf = (char *)(uintptr_t)a;
+    char *bbuf = (char *)(uintptr_t)b;
+    int32_t alen = *(int32_t *)abuf;
+    int32_t blen = *(int32_t *)bbuf;
+    return alen == blen && memcmp(abuf + 4, bbuf + 4, (size_t)alen) == 0;
 }
 
 // Lookup: returns the index[] position for the key (existing or insertion
@@ -1160,13 +1189,11 @@ static uint32_t lumen_map_hash_str(const char *data, int32_t len) {
 // index_cap probes so a fully tombstoned table can't loop forever (the
 // resize logic in lumen_map_set normally prevents this, but a sequence of
 // removes without an intervening set could still saturate the index).
-static int32_t lumen_map_find_slot(LumenMapHeader *hdr, int64_t key_ptr,
+static int32_t lumen_map_find_slot(LumenMapHeader *hdr, int64_t key,
                                    uint32_t hash, int32_t *out_entry) {
     int32_t mask = hdr->index_cap - 1;
     int32_t pos = (int32_t)(hash & (uint32_t)mask);
     int32_t first_tomb = -1;
-    char *kbuf = (char *)(uintptr_t)key_ptr;
-    int32_t klen = *(int32_t *)kbuf;
     int32_t *index = LUMEN_MAP_INDEX(hdr);
     LumenMapEntry *entries = LUMEN_MAP_ENTRIES(hdr);
     for (int32_t probe = 0; probe < hdr->index_cap; probe++) {
@@ -1179,13 +1206,10 @@ static int32_t lumen_map_find_slot(LumenMapHeader *hdr, int64_t key_ptr,
             if (first_tomb < 0) first_tomb = pos;
         } else {
             LumenMapEntry *e = &entries[slot];
-            if (e->hash == hash && e->key_ptr != 0) {
-                char *ekey = (char *)(uintptr_t)e->key_ptr;
-                int32_t elen = *(int32_t *)ekey;
-                if (elen == klen && memcmp(ekey + 4, kbuf + 4, (size_t)klen) == 0) {
-                    *out_entry = slot;
-                    return pos;
-                }
+            if (e->alive && e->hash == hash
+                && lumen_map_keys_equal(e->key, key, hdr->key_is_ptr)) {
+                *out_entry = slot;
+                return pos;
             }
         }
         pos = (pos + 1) & mask;
@@ -1195,7 +1219,7 @@ static int32_t lumen_map_find_slot(LumenMapHeader *hdr, int64_t key_ptr,
     return first_tomb >= 0 ? first_tomb : 0;
 }
 
-int64_t lumen_map_new(void) {
+int64_t lumen_map_new(int32_t key_is_ptr) {
     int32_t entry_cap = 8;
     int32_t index_cap = 16;
     size_t total = sizeof(LumenMapHeader)
@@ -1209,6 +1233,10 @@ int64_t lumen_map_new(void) {
     hdr->entry_count = 0;
     hdr->entry_cap = entry_cap;
     hdr->index_cap = index_cap;
+    hdr->key_is_ptr = key_is_ptr;
+    hdr->_pad[0] = 0;
+    hdr->_pad[1] = 0;
+    hdr->_pad[2] = 0;
     int32_t *index = LUMEN_MAP_INDEX(hdr);
     for (int32_t i = 0; i < index_cap; i++) index[i] = LUMEN_MAP_INDEX_EMPTY;
     return (int64_t)(uintptr_t)hdr;
@@ -1240,7 +1268,7 @@ static int64_t lumen_map_grow(int64_t map_ptr, int32_t new_entry_cap, int32_t ne
     int32_t write_idx = 0;
     int32_t live = 0;
     for (int32_t i = 0; i < old_entry_count; i++) {
-        if (entries[i].key_ptr == 0) continue;  // tombstone
+        if (!entries[i].alive) continue;  // tombstone
         if (write_idx != i) entries[write_idx] = entries[i];
         uint32_t h = entries[write_idx].hash;
         int32_t pos = (int32_t)(h & (uint32_t)mask);
@@ -1254,18 +1282,14 @@ static int64_t lumen_map_grow(int64_t map_ptr, int32_t new_entry_cap, int32_t ne
     return (int64_t)(uintptr_t)hdr;
 }
 
-int64_t lumen_map_set(int64_t map_ptr, int64_t key_ptr, int64_t value, int32_t value_is_ptr) {
+int64_t lumen_map_set(int64_t map_ptr, int64_t key, int64_t value, int32_t value_is_ptr) {
     LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
-    if (key_ptr == 0) return map_ptr;
-    char *kbuf = (char *)(uintptr_t)key_ptr;
-    int32_t klen = *(int32_t *)kbuf;
-    uint32_t hash = lumen_map_hash_str(kbuf + 4, klen);
+    int32_t key_is_ptr = hdr->key_is_ptr;
+    // For pointer keys, 0 is the null pointer (no valid key). For
+    // scalar keys, 0 is a valid key value.
+    if (key_is_ptr && key == 0) return map_ptr;
+    uint32_t hash = lumen_map_hash_key(key, key_is_ptr);
 
-    // Resize if either capacity is tight. Index load factor target: 0.75.
-    // Tombstones in the index also occupy slots, so count entry_count
-    // (live + tombstones), not live_count alone — otherwise a long
-    // sequence of set+remove cycles can fill the index with tombstones
-    // and leave find_slot with no EMPTY slot to terminate on.
     int32_t need_index = ((hdr->entry_count + 1) * 4) >= (hdr->index_cap * 3);
     int32_t need_entry = hdr->entry_count >= hdr->entry_cap;
     if (need_index || need_entry) {
@@ -1276,41 +1300,40 @@ int64_t lumen_map_set(int64_t map_ptr, int64_t key_ptr, int64_t value, int32_t v
     }
 
     int32_t found_idx;
-    int32_t pos = lumen_map_find_slot(hdr, key_ptr, hash, &found_idx);
+    int32_t pos = lumen_map_find_slot(hdr, key, hash, &found_idx);
     if (found_idx >= 0) {
         // Overwrite: release the references the map held, install the new
-        // ones. The caller already rc_incr'd key_ptr and value_ptr, so the
-        // map's net refcount on each is +1.
+        // ones. The caller already rc_incr'd key and value (when each is
+        // pointer-typed), so the map's net refcount on each is +1.
         LumenMapEntry *e = &LUMEN_MAP_ENTRIES(hdr)[found_idx];
         if (value_is_ptr) lumen_rc_decr(e->value);
-        lumen_rc_decr(e->key_ptr);
-        e->key_ptr = key_ptr;
+        if (key_is_ptr) lumen_rc_decr(e->key);
+        e->key = key;
         e->value = value;
         return map_ptr;
     }
     int32_t new_slot = hdr->entry_count;
     LumenMapEntry *e = &LUMEN_MAP_ENTRIES(hdr)[new_slot];
-    e->key_ptr = key_ptr;
+    e->key = key;
     e->value = value;
     e->hash = hash;
-    e->_pad = 0;
+    e->alive = 1;
     LUMEN_MAP_INDEX(hdr)[pos] = new_slot;
     hdr->entry_count++;
     hdr->live_count++;
     return map_ptr;
 }
 
-int64_t lumen_map_get(int64_t map_ptr, int64_t key_ptr) {
+int64_t lumen_map_get(int64_t map_ptr, int64_t key) {
     LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
-    if (key_ptr == 0 || hdr->live_count == 0) {
+    int32_t key_is_ptr = hdr->key_is_ptr;
+    if ((key_is_ptr && key == 0) || hdr->live_count == 0) {
         lumen_map_last_get_found = 0;
         return 0;
     }
-    char *kbuf = (char *)(uintptr_t)key_ptr;
-    int32_t klen = *(int32_t *)kbuf;
-    uint32_t hash = lumen_map_hash_str(kbuf + 4, klen);
+    uint32_t hash = lumen_map_hash_key(key, key_is_ptr);
     int32_t found_idx;
-    lumen_map_find_slot(hdr, key_ptr, hash, &found_idx);
+    lumen_map_find_slot(hdr, key, hash, &found_idx);
     if (found_idx < 0) {
         lumen_map_last_get_found = 0;
         return 0;
@@ -1321,30 +1344,28 @@ int64_t lumen_map_get(int64_t map_ptr, int64_t key_ptr) {
 
 int32_t lumen_map_get_found(void) { return lumen_map_last_get_found; }
 
-int32_t lumen_map_contains(int64_t map_ptr, int64_t key_ptr) {
+int32_t lumen_map_contains(int64_t map_ptr, int64_t key) {
     LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
-    if (key_ptr == 0 || hdr->live_count == 0) return 0;
-    char *kbuf = (char *)(uintptr_t)key_ptr;
-    int32_t klen = *(int32_t *)kbuf;
-    uint32_t hash = lumen_map_hash_str(kbuf + 4, klen);
+    int32_t key_is_ptr = hdr->key_is_ptr;
+    if ((key_is_ptr && key == 0) || hdr->live_count == 0) return 0;
+    uint32_t hash = lumen_map_hash_key(key, key_is_ptr);
     int32_t found_idx;
-    lumen_map_find_slot(hdr, key_ptr, hash, &found_idx);
+    lumen_map_find_slot(hdr, key, hash, &found_idx);
     return found_idx >= 0 ? 1 : 0;
 }
 
-int64_t lumen_map_remove(int64_t map_ptr, int64_t key_ptr, int32_t value_is_ptr) {
+int64_t lumen_map_remove(int64_t map_ptr, int64_t key, int32_t value_is_ptr) {
     LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
-    if (key_ptr == 0 || hdr->live_count == 0) return map_ptr;
-    char *kbuf = (char *)(uintptr_t)key_ptr;
-    int32_t klen = *(int32_t *)kbuf;
-    uint32_t hash = lumen_map_hash_str(kbuf + 4, klen);
+    int32_t key_is_ptr = hdr->key_is_ptr;
+    if ((key_is_ptr && key == 0) || hdr->live_count == 0) return map_ptr;
+    uint32_t hash = lumen_map_hash_key(key, key_is_ptr);
     int32_t found_idx;
-    int32_t pos = lumen_map_find_slot(hdr, key_ptr, hash, &found_idx);
+    int32_t pos = lumen_map_find_slot(hdr, key, hash, &found_idx);
     if (found_idx < 0) return map_ptr;
     LumenMapEntry *e = &LUMEN_MAP_ENTRIES(hdr)[found_idx];
     if (value_is_ptr) lumen_rc_decr(e->value);
-    lumen_rc_decr(e->key_ptr);
-    e->key_ptr = 0;  // tombstone the entry
+    if (key_is_ptr) lumen_rc_decr(e->key);
+    e->alive = 0;  // tombstone
     LUMEN_MAP_INDEX(hdr)[pos] = LUMEN_MAP_INDEX_TOMB;
     hdr->live_count--;
     return map_ptr;
@@ -1365,8 +1386,8 @@ int64_t lumen_map_live_key_at(int64_t map_ptr, int32_t live_i) {
     LumenMapEntry *entries = LUMEN_MAP_ENTRIES(hdr);
     int32_t seen = 0;
     for (int32_t i = 0; i < hdr->entry_count; i++) {
-        if (entries[i].key_ptr == 0) continue;  // tombstone
-        if (seen == live_i) return entries[i].key_ptr;
+        if (!entries[i].alive) continue;  // tombstone
+        if (seen == live_i) return entries[i].key;
         seen++;
     }
     return 0;
@@ -1380,7 +1401,7 @@ int64_t lumen_map_live_value_at(int64_t map_ptr, int32_t live_i) {
     LumenMapEntry *entries = LUMEN_MAP_ENTRIES(hdr);
     int32_t seen = 0;
     for (int32_t i = 0; i < hdr->entry_count; i++) {
-        if (entries[i].key_ptr == 0) continue;
+        if (!entries[i].alive) continue;
         if (seen == live_i) return entries[i].value;
         seen++;
     }
@@ -1397,11 +1418,11 @@ int64_t lumen_map_merge(int64_t a_ptr, int64_t b_ptr, int32_t value_is_ptr) {
     LumenMapEntry *b_entries = LUMEN_MAP_ENTRIES(b_hdr);
     int64_t out = a_ptr;
     for (int32_t i = 0; i < b_hdr->entry_count; i++) {
-        if (b_entries[i].key_ptr == 0) continue;
+        if (!b_entries[i].alive) continue;
         // lumen_map_set rc_incrs the key and the value (when value_is_ptr).
         // That balances b's ref we're sharing (neither side owns
         // exclusively after the merge).
-        out = lumen_map_set(out, b_entries[i].key_ptr, b_entries[i].value, value_is_ptr);
+        out = lumen_map_set(out, b_entries[i].key, b_entries[i].value, value_is_ptr);
     }
     return out;
 }

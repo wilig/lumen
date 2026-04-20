@@ -230,7 +230,8 @@ don't wrap it away.
 ## List and Map
 
 `List<T>` is dynamic; it reallocates on `push`. `Map<K, V>` is
-insertion-ordered. `K` can only be `string` today.
+insertion-ordered. `K` can be `string`, `bytes`, `i32`, `i64`, `u32`,
+`u64`, `char`, or `bool`. User structs and tuples can't be keys yet.
 
 ```lumen
 var xs: List<i32> = list.new()

@@ -1579,6 +1579,24 @@ impl<'a> FnChecker<'a> {
                 }
             }
         }
+        // `map.new()` with an expected Map<K, V> annotation: record
+        // [K, V] in call_resolutions so the codegen can synthesize the
+        // `key_is_ptr` flag + the right K/V widths without re-walking
+        // the let-binding context.
+        if let ExprKind::MethodCall { receiver, method, args } = &expr.kind {
+            if let ExprKind::Ident(mod_name) = &receiver.kind {
+                if mod_name == "map" && method == "new" && args.is_empty() {
+                    if let Ty::Map(k, v) = expected {
+                        self.call_resolutions.insert(
+                            expr.span.start,
+                            vec![(**k).clone(), (**v).clone()],
+                        );
+                        return Ty::Map(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
         // Generic fn call — combine arg-driven and expected-driven
         // inference. Lets `let x: Maybe<i32> = nothing()` derive T=I32
         // even when there are no args to infer from.
@@ -2456,17 +2474,37 @@ impl<'a> FnChecker<'a> {
             }
             // --- map ---
             ("map", "new") => {
-                return Some(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                // Key and value types are refined from the let/var
+                // annotation (same pattern as list.new → List<Error>).
+                return Some(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
             }
             ("map", "set") => {
                 if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.set` expects 3 args".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
-                let val_ty = args.get(2).map(|a| self.infer_expr(&a.value));
-                return match (&map_ty, val_ty) {
-                    (Ty::Map(k, v), Some(vt)) if matches!(**v, Ty::Error) => {
-                        Some(Ty::Map(k.clone(), Box::new(vt)))
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let (key_ty, val_ty_expected) = match &map_ty {
+                    Ty::Map(k, v) => ((**k).clone(), (**v).clone()),
+                    _ => (Ty::Error, Ty::Error),
+                };
+                // Key: check against the map's K (unknown → infer from
+                // the arg, then refine the map's type below).
+                let k_actual = if matches!(key_ty, Ty::Error) {
+                    args.get(1).map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::Error)
+                } else {
+                    if let Some(a) = args.get(1) { self.check_expr(&a.value, &key_ty); }
+                    key_ty.clone()
+                };
+                let v_actual = if matches!(val_ty_expected, Ty::Error) {
+                    args.get(2).map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::Error)
+                } else {
+                    if let Some(a) = args.get(2) { self.check_expr(&a.value, &val_ty_expected); }
+                    val_ty_expected.clone()
+                };
+                return match &map_ty {
+                    Ty::Map(k, v) if matches!(**k, Ty::Error) || matches!(**v, Ty::Error) => {
+                        let new_k = if matches!(**k, Ty::Error) { k_actual } else { (**k).clone() };
+                        let new_v = if matches!(**v, Ty::Error) { v_actual } else { (**v).clone() };
+                        Some(Ty::Map(Box::new(new_k), Box::new(new_v)))
                     }
                     _ => Some(map_ty),
                 };
@@ -2474,25 +2512,37 @@ impl<'a> FnChecker<'a> {
             ("map", "get") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.get` expects 2 args".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
-                let value_ty = match map_ty {
-                    Ty::Map(_, v) => *v,
-                    _ => Ty::Error,
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let (key_ty, value_ty) = match map_ty {
+                    Ty::Map(k, v) => (*k, *v),
+                    _ => (Ty::Error, Ty::Error),
                 };
+                if let Some(a) = args.get(1) {
+                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
+                    else { self.infer_expr(&a.value); }
+                }
                 return Some(Ty::Option(Box::new(value_ty)));
             }
             ("map", "contains") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.contains` expects 2 args".into() }); }
-                if let Some(a) = args.first() { self.infer_expr(&a.value); }
-                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let key_ty = match map_ty { Ty::Map(k, _) => *k, _ => Ty::Error };
+                if let Some(a) = args.get(1) {
+                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
+                    else { self.infer_expr(&a.value); }
+                }
                 return Some(Ty::Bool);
             }
             ("map", "remove") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.remove` expects 2 args".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let key_ty = match &map_ty { Ty::Map(k, _) => (**k).clone(), _ => Ty::Error };
+                if let Some(a) = args.get(1) {
+                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
+                    else { self.infer_expr(&a.value); }
+                }
                 return Some(map_ty);
             }
             ("map", "len") => {
@@ -2500,34 +2550,47 @@ impl<'a> FnChecker<'a> {
                 if let Some(a) = args.first() { self.infer_expr(&a.value); }
                 return Some(Ty::I32);
             }
+            ("map", "keys") => {
+                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.keys` expects 1 arg".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let key_ty = match map_ty { Ty::Map(k, _) => *k, _ => Ty::Error };
+                return Some(Ty::List(Box::new(key_ty)));
+            }
             ("map", "values") => {
                 if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.values` expects 1 arg".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
                 let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
                 return Some(Ty::List(Box::new(val_ty)));
             }
             ("map", "entries") => {
                 if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.entries` expects 1 arg".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
-                return Some(Ty::List(Box::new(Ty::Tuple(vec![Ty::String, val_ty]))));
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let (key_ty, val_ty) = match map_ty {
+                    Ty::Map(k, v) => (*k, *v),
+                    _ => (Ty::Error, Ty::Error),
+                };
+                return Some(Ty::List(Box::new(Ty::Tuple(vec![key_ty, val_ty]))));
             }
             ("map", "merge") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.merge` expects 2 args".into() }); }
                 let a_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                // Second arg should be same Map type.
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
                 if let Some(b) = args.get(1) { self.check_expr(&b.value, &a_ty); }
                 return Some(a_ty);
             }
             ("map", "get_or") => {
                 if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.get_or` expects 3 args".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
-                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
+                let key_ty = match &map_ty { Ty::Map(k, _) => (**k).clone(), _ => Ty::Error };
                 let val_ty = match &map_ty { Ty::Map(_, v) => (**v).clone(), _ => Ty::Error };
+                if let Some(a) = args.get(1) {
+                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
+                    else { self.infer_expr(&a.value); }
+                }
                 if let Some(a) = args.get(2) { self.check_expr(&a.value, &val_ty); }
                 return Some(val_ty);
             }
