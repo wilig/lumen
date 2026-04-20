@@ -1,0 +1,61 @@
+// Cross-actor concurrency (lumen-0zv). A coordinator spawns a small
+// pool of counters and asks each to absorb a large share of bumps in
+// parallel — exercising the scheduler's ability to run multiple
+// actors concurrently across worker threads. If per-mailbox FIFO or
+// cross-actor mutual exclusion were broken, the counts wouldn't land
+// on their exact expected values.
+import std/test
+
+actor Counter {
+    count: i32,
+}
+
+msg Counter.bump(self, n: i32): Counter {
+    return Counter { count: self.count + n }
+}
+
+msg Counter.get(self): i32 {
+    return self.count
+}
+
+fn main(): i32 io {
+    // 10 counters, 200 bumps each, interleaved so each iteration
+    // dispatches one message to each counter. On multi-core that's
+    // genuine parallelism across all 10 mailboxes.
+    let a = spawn Counter { count: 0 }
+    let b = spawn Counter { count: 0 }
+    let c = spawn Counter { count: 0 }
+    let d = spawn Counter { count: 0 }
+    let e = spawn Counter { count: 0 }
+    let f = spawn Counter { count: 0 }
+    let g = spawn Counter { count: 0 }
+    let h = spawn Counter { count: 0 }
+    let i: Handle<Counter> = spawn Counter { count: 0 }
+    let j = spawn Counter { count: 0 }
+
+    for k in range(0, 200) {
+        send a.bump(1)
+        send b.bump(1)
+        send c.bump(1)
+        send d.bump(1)
+        send e.bump(1)
+        send f.bump(1)
+        send g.bump(1)
+        send h.bump(1)
+        send i.bump(1)
+        send j.bump(1)
+    }
+
+    test.eq(ask a.get(), 200, "a")
+    test.eq(ask b.get(), 200, "b")
+    test.eq(ask c.get(), 200, "c")
+    test.eq(ask d.get(), 200, "d")
+    test.eq(ask e.get(), 200, "e")
+    test.eq(ask f.get(), 200, "f")
+    test.eq(ask g.get(), 200, "g")
+    test.eq(ask h.get(), 200, "h")
+    test.eq(ask i.get(), 200, "i")
+    test.eq(ask j.get(), 200, "j")
+
+    return test.summary()
+}
