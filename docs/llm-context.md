@@ -44,9 +44,9 @@ ambiguous (e.g. `list.new()` returns `List<Error>` until pinned).
 Integer literals default to `i32`. Suffix with `_i64`, `_u32`, `_u64`
 when needed. `list.len` / `string.len` return `i32`.
 
-## Calls: no methods
+## Calls: no method dispatch on ordinary values
 
-Lumen has no methods on values. All stdlib calls are module-qualified.
+Ordinary values don't have methods. All stdlib calls are module-qualified.
 
 ```lumen
 list.map(xs, f)        // yes
@@ -55,8 +55,18 @@ string.len(s)          // yes
 s.len()                // no
 ```
 
-The exception is actor messages (`send h.method(...)`, `ask h.method(...)`)
-and debug (`debug.print`). Those are language forms, not method calls.
+The `.` token does appear in two non-call contexts that are easy to
+mistake for method calls:
+
+- **Actor messages** — `send h.method(args)` and `ask h.method(args)`
+  are concurrency operators, not calls. They queue a message across a
+  scheduling boundary (actors run on green threads) and have their own
+  keywords. The `.` here selects which message handler, not a method.
+- **Module-qualified calls** — `io.println(x)`, `list.map(xs, f)`.
+  Here `io` and `list` are modules, not values.
+
+So any time you're tempted to write `value.method(...)`, it won't
+work. `send`/`ask`/`debug` are language forms with their own syntax.
 
 ## String interpolation
 
