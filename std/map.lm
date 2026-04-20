@@ -1,12 +1,12 @@
 // Insertion-ordered hash map.
 //
-// Keys are strings (MVP). Values are any single-word type — i32, i64,
-// f64, bool, or pointer-shaped (string, bytes, struct, list, etc.).
+// Keys can be strings, bytes, or scalars (i32/i64/u32/u64/char/bool).
+// Values are any single-word type — i32, i64, f64, bool, or
+// pointer-shaped (string, bytes, struct, list, etc.).
 //
 // Usage:
 //   var m: Map<string, i32> = map.new()
 //   m = map.set(m, "alice", 30)
-//   m = map.set(m, "bob", 25)
 //   match map.get(m, "alice") {
 //       Some(age) => io.println("age = ${age}"),
 //       None => io.println("not found"),
@@ -17,34 +17,90 @@
 
 import std/list
 
-// new takes a `key_is_ptr` flag (synthesized by the codegen from K —
-// 1 for string/bytes, 0 for scalars). All the other map fns are
-// codegen specials too, so the extern-shaped signatures below are
-// intentionally raw (keys as i64) — Lumen user code never calls them
-// directly.
-extern fn _new(key_is_ptr: i32): i64 link "lumen_map_new"
-extern fn _contains(m: i64, k: i64): i32 link "lumen_map_contains"
-extern fn len(m: i64): i32 link "lumen_map_len"
+// --- Raw externs --------------------------------------------------------
+//
+// The generic-over-K,V externs share one C symbol each; monomorphization
+// happens in the Lumen type system. Scalar keys/values auto-widen to i64
+// at the FFI boundary and narrow back on return.
 
-extern fn _set(m: i64, k: i64, v: i64, value_is_ptr: i32): i64 link "lumen_map_set"
-extern fn _remove(m: i64, k: i64, value_is_ptr: i32): i64 link "lumen_map_remove"
+// map.new / map.remove / map.merge are codegen specials. These extern
+// decls exist so native.rs can look up the C symbols by their link
+// names; user code never calls them directly.
+extern fn _new_for_codegen(key_is_ptr: i32): i64 link "lumen_map_new"
+extern fn _remove_for_codegen(m: i64, k: i64, value_is_ptr: i32): i64 link "lumen_map_remove"
+extern fn _merge_for_codegen(a: i64, b: i64, value_is_ptr: i32): i64 link "lumen_map_merge"
 
-extern fn _get(m: i64, k: i64): i64 link "lumen_map_get"
+extern fn _set_raw<K, V>(m: Map<K, V>, k: K, v: V, value_is_ptr: i32): Map<K, V>
+    link "lumen_map_set"
+extern fn _get_raw<K, V>(m: Map<K, V>, k: K): V link "lumen_map_get"
 extern fn _get_found(): i32 link "lumen_map_get_found"
+extern fn _contains_raw<K, V>(m: Map<K, V>, k: K): i32 link "lumen_map_contains"
+extern fn _live_key_at<K, V>(m: Map<K, V>, i: i32): K link "lumen_map_live_key_at"
+extern fn _live_value_at<K, V>(m: Map<K, V>, i: i32): V link "lumen_map_live_value_at"
 
-// Live-entry iterators. Skip tombstones so indices are 0..len(m).
-extern fn _live_key_at(m: i64, i: i32): i64 link "lumen_map_live_key_at"
-extern fn _live_value_at(m: i64, i: i32): i64 link "lumen_map_live_value_at"
+extern fn len<K, V>(m: Map<K, V>): i32 link "lumen_map_len"
 
-// merge/values/entries are special-cased in the codegen so they can
-// handle V-dependent representation (value_is_ptr flag, i32 ireduce).
-// The raw extern for merge is internal.
-extern fn _merge_raw(a: i64, b: i64, vptr: i32): i64 link "lumen_map_merge"
+// map.new / map.remove / map.merge remain codegen specials — their
+// value_is_ptr / key_is_ptr flag has no natural witness value at the
+// call site. See compile_method_call in src/native.rs.
 
-// map.keys(m): List<K> — codegen special (like map.values). Walks
-// live entries in insertion order, pushing each raw key into the
-// list. K-specific width/sign-extension is handled at codegen time.
+// --- Public API --------------------------------------------------------
 
-// map.get_or(m, k, default) is a codegen special — see compile_method_call
-// in src/native.rs. Uses the raw _get extern + _get_found check, then
-// returns the value with proper i32 narrowing / pointer rc_incr.
+fn set<K, V>(m: Map<K, V>, k: K, v: V): Map<K, V> {
+    __rc_incr(k)
+    __rc_incr(v)
+    return _set_raw(m, k, v, __is_ptr(v))
+}
+
+fn contains<K, V>(m: Map<K, V>, k: K): i32 {
+    return _contains_raw(m, k)
+}
+
+fn get<K, V>(m: Map<K, V>, k: K): Option<V> {
+    let v: V = _get_raw(m, k)
+    if _get_found() == 1 {
+        return Some(v)
+    }
+    return None
+}
+
+fn get_or<K, V>(m: Map<K, V>, k: K, default: V): V {
+    let v: V = _get_raw(m, k)
+    if _get_found() == 1 {
+        __rc_incr(v)
+        return v
+    }
+    __rc_incr(default)
+    return default
+}
+
+fn keys<K, V>(m: Map<K, V>): List<K> {
+    var out: List<K> = list.new()
+    let n: i32 = len(m)
+    for i in range(0, n) {
+        let k: K = _live_key_at(m, i)
+        out = list.push(out, k)
+    }
+    return out
+}
+
+fn values<K, V>(m: Map<K, V>): List<V> {
+    var out: List<V> = list.new()
+    let n: i32 = len(m)
+    for i in range(0, n) {
+        let v: V = _live_value_at(m, i)
+        out = list.push(out, v)
+    }
+    return out
+}
+
+fn entries<K, V>(m: Map<K, V>): List<(K, V)> {
+    var out: List<(K, V)> = list.new()
+    let n: i32 = len(m)
+    for i in range(0, n) {
+        let k: K = _live_key_at(m, i)
+        let v: V = _live_value_at(m, i)
+        out = list.push(out, (k, v))
+    }
+    return out
+}

@@ -2331,6 +2331,23 @@ impl<'a> FnChecker<'a> {
                     }
                     return Ty::Unit;
                 }
+                "__is_ptr" => {
+                    // Compile-time predicate: at monomorphization, the
+                    // sample arg's T resolves to a concrete type and
+                    // this expands to iconst(1) for pointer types,
+                    // iconst(0) for scalars. Used by generic stdlib
+                    // wrappers to pass the C-side `is_ptr` flag without
+                    // a runtime probe.
+                    if args.len() != 1 {
+                        self.errors.push(TypeError {
+                            span: whole_span,
+                            message: format!("`__is_ptr` expects 1 argument, found {}", args.len()),
+                        });
+                    } else {
+                        self.infer_expr(&args[0].value);
+                    }
+                    return Ty::I32;
+                }
                 _ => {}
             }
 
@@ -2610,62 +2627,10 @@ impl<'a> FnChecker<'a> {
                 // annotation (same pattern as list.new → List<Error>).
                 return Some(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
             }
-            ("map", "set") => {
-                if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.set` expects 3 args".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let (key_ty, val_ty_expected) = match &map_ty {
-                    Ty::Map(k, v) => ((**k).clone(), (**v).clone()),
-                    _ => (Ty::Error, Ty::Error),
-                };
-                // Key: check against the map's K (unknown → infer from
-                // the arg, then refine the map's type below).
-                let k_actual = if matches!(key_ty, Ty::Error) {
-                    args.get(1).map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::Error)
-                } else {
-                    if let Some(a) = args.get(1) { self.check_expr(&a.value, &key_ty); }
-                    key_ty.clone()
-                };
-                let v_actual = if matches!(val_ty_expected, Ty::Error) {
-                    args.get(2).map(|a| self.infer_expr(&a.value)).unwrap_or(Ty::Error)
-                } else {
-                    if let Some(a) = args.get(2) { self.check_expr(&a.value, &val_ty_expected); }
-                    val_ty_expected.clone()
-                };
-                return match &map_ty {
-                    Ty::Map(k, v) if matches!(**k, Ty::Error) || matches!(**v, Ty::Error) => {
-                        let new_k = if matches!(**k, Ty::Error) { k_actual } else { (**k).clone() };
-                        let new_v = if matches!(**v, Ty::Error) { v_actual } else { (**v).clone() };
-                        Some(Ty::Map(Box::new(new_k), Box::new(new_v)))
-                    }
-                    _ => Some(map_ty),
-                };
-            }
-            ("map", "get") => {
-                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.get` expects 2 args".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let (key_ty, value_ty) = match map_ty {
-                    Ty::Map(k, v) => (*k, *v),
-                    _ => (Ty::Error, Ty::Error),
-                };
-                if let Some(a) = args.get(1) {
-                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
-                    else { self.infer_expr(&a.value); }
-                }
-                return Some(Ty::Option(Box::new(value_ty)));
-            }
-            ("map", "contains") => {
-                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.contains` expects 2 args".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let key_ty = match map_ty { Ty::Map(k, _) => *k, _ => Ty::Error };
-                if let Some(a) = args.get(1) {
-                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
-                    else { self.infer_expr(&a.value); }
-                }
-                return Some(Ty::Bool);
-            }
+            // map.remove / map.merge stay as codegen specials — their
+            // value_is_ptr flag has no natural V witness at the call
+            // site. Typechecker specials here match the old behavior
+            // (they're not routed to a Lumen wrapper sig).
             ("map", "remove") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.remove` expects 2 args".into() }); }
                 let map_ty = args.first().map(|a| self.infer_expr(&a.value))
@@ -2677,54 +2642,12 @@ impl<'a> FnChecker<'a> {
                 }
                 return Some(map_ty);
             }
-            ("map", "len") => {
-                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.len` expects 1 arg".into() }); }
-                if let Some(a) = args.first() { self.infer_expr(&a.value); }
-                return Some(Ty::I32);
-            }
-            ("map", "keys") => {
-                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.keys` expects 1 arg".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let key_ty = match map_ty { Ty::Map(k, _) => *k, _ => Ty::Error };
-                return Some(Ty::List(Box::new(key_ty)));
-            }
-            ("map", "values") => {
-                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.values` expects 1 arg".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
-                return Some(Ty::List(Box::new(val_ty)));
-            }
-            ("map", "entries") => {
-                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.entries` expects 1 arg".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let (key_ty, val_ty) = match map_ty {
-                    Ty::Map(k, v) => (*k, *v),
-                    _ => (Ty::Error, Ty::Error),
-                };
-                return Some(Ty::List(Box::new(Ty::Tuple(vec![key_ty, val_ty]))));
-            }
             ("map", "merge") => {
                 if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.merge` expects 2 args".into() }); }
                 let a_ty = args.first().map(|a| self.infer_expr(&a.value))
                     .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
                 if let Some(b) = args.get(1) { self.check_expr(&b.value, &a_ty); }
                 return Some(a_ty);
-            }
-            ("map", "get_or") => {
-                if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.get_or` expects 3 args".into() }); }
-                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
-                    .unwrap_or(Ty::Map(Box::new(Ty::Error), Box::new(Ty::Error)));
-                let key_ty = match &map_ty { Ty::Map(k, _) => (**k).clone(), _ => Ty::Error };
-                let val_ty = match &map_ty { Ty::Map(_, v) => (**v).clone(), _ => Ty::Error };
-                if let Some(a) = args.get(1) {
-                    if !matches!(key_ty, Ty::Error) { self.check_expr(&a.value, &key_ty); }
-                    else { self.infer_expr(&a.value); }
-                }
-                if let Some(a) = args.get(2) { self.check_expr(&a.value, &val_ty); }
-                return Some(val_ty);
             }
             (_unknown_mod, _) if !self.module.modules.contains_key(_unknown_mod) => {
                 return None;
