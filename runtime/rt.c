@@ -61,9 +61,11 @@ static void *rc_malloc_alloc(void *state, int64_t size) {
 }
 
 static LumenAllocator rc_malloc_allocator = { rc_malloc_alloc, NULL };
-// Single-threaded actor runtime today — a plain global suffices; move
-// to __thread if/when the runtime goes multi-threaded.
-static LumenAllocator *current_allocator = &rc_malloc_allocator;
+// Per-thread allocator stack — each OS thread carries its own active
+// allocator so arena blocks on one worker don't affect another's
+// RC-malloc path. __thread with a constant-address initializer is
+// POSIX + ELF-TLS compatible.
+static __thread LumenAllocator *current_allocator = &rc_malloc_allocator;
 
 // --- Arena allocator -----------------------------------------------------
 
@@ -745,11 +747,15 @@ typedef struct {
     int wait_fd;
 } GreenThread;
 
-static GreenThread gt_pool[GT_MAX];
-static int gt_count = 0;
-static int gt_current = -1;
-static ucontext_t gt_sched_ctx;
-static int gt_event_fd = -1;
+// Per-thread green-thread pool. Each OS thread carries its own
+// cooperative scheduler, so I/O blocking in a green thread on worker
+// A doesn't stall actors on worker B. `__thread` is straightforward
+// here — the gt_* statics are self-contained per-worker state.
+static __thread GreenThread gt_pool[GT_MAX];
+static __thread int gt_count = 0;
+static __thread int gt_current = -1;
+static __thread ucontext_t gt_sched_ctx;
+static __thread int gt_event_fd = -1;
 
 static void gt_init(void) {
     if (gt_event_fd < 0) {
@@ -1062,8 +1068,11 @@ void lumen_debug_init(void) {
 // Debug frame stack: fixed-size array of message pointers.
 // Much cheaper than linked-list allocation — just a pointer bump.
 #define DEBUG_STACK_MAX 4096
-static int64_t debug_stack[DEBUG_STACK_MAX];
-static int32_t debug_stack_top = 0;
+// Per-thread debug frame stack. Each worker's scope-push/pop for
+// --debug mode is isolated — a worker crashing prints only its own
+// frames, not the aggregate across threads.
+static __thread int64_t debug_stack[DEBUG_STACK_MAX];
+static __thread int32_t debug_stack_top = 0;
 
 void lumen_debug_push(int64_t msg_ptr) {
     if (debug_stack_top < DEBUG_STACK_MAX) {
@@ -1259,7 +1268,10 @@ void lumen_assert(int32_t cond, int64_t msg_ptr, int64_t file_ptr,
 // Single-OS-thread assumption: Lumen runs on cooperative green threads
 // today, so a static is safe. Switch to thread_local if/when that changes.
 
-static int32_t lumen_last_fs_errno = 0;
+// Per-thread errno sidechannel: each worker that reads/writes files
+// observes only its own errors. Without __thread, one actor's fs
+// failure would corrupt another's lumen_fs_errno() result.
+static __thread int32_t lumen_last_fs_errno = 0;
 
 int32_t lumen_fs_errno(void) { return lumen_last_fs_errno; }
 
@@ -1366,8 +1378,11 @@ typedef struct {
 #define LUMEN_MAP_INDEX(hdr) \
     ((int32_t *)((char *)LUMEN_MAP_ENTRIES(hdr) + (size_t)(hdr)->entry_cap * sizeof(LumenMapEntry)))
 
-// Per-thread is overkill for cooperative green-threading; mirror lumen_fs_errno.
-static int32_t lumen_map_last_get_found = 0;
+// Per-thread sidechannel for map.get's "did we find it?" result.
+// The companion signature (see lumen_map_get_found / lumen_map_get
+// in std/map.lm) reads this immediately after the call; __thread
+// keeps concurrent map.get calls from different workers isolated.
+static __thread int32_t lumen_map_last_get_found = 0;
 
 // FNV-1a 32-bit. Cheap, decent distribution for short string keys and
 // for the 8 bytes of a scalar key.

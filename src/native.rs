@@ -1193,9 +1193,18 @@ impl<'a> NativeCodegen<'a> {
         builder.ins().brif(is_rc, do_real_incr, &[], exit, &[]);
 
         builder.switch_to_block(do_real_incr);
-        let rc = builder.ins().load(cl_types::I32, flags, header, 0);
-        let new_rc = builder.ins().iadd_imm(rc, 1);
-        builder.ins().store(flags, new_rc, header, 0);
+        // Atomic +1 on the rc counter (lumen-h43). Uses cranelift's
+        // atomic_rmw so actor dispatch across OS threads doesn't race
+        // when multiple threads concurrently ref the same value.
+        let one = builder.ins().iconst(cl_types::I32, 1);
+        let atomic_flags = MemFlags::trusted();
+        builder.ins().atomic_rmw(
+            cl_types::I32,
+            atomic_flags,
+            cranelift_codegen::ir::AtomicRmwOp::Add,
+            header,
+            one,
+        );
         builder.ins().jump(exit, &[]);
 
         builder.switch_to_block(exit);
@@ -1243,14 +1252,23 @@ impl<'a> NativeCodegen<'a> {
         builder.ins().brif(is_rc, do_real_decr, &[], exit, &[]);
 
         builder.switch_to_block(do_real_decr);
-        let rc = builder.ins().load(cl_types::I32, flags, header, 0);
-        let new_rc = builder.ins().iadd_imm(rc, -1);
-        builder.ins().store(flags, new_rc, header, 0);
+        // Atomic -1 on the rc counter (lumen-h43). atomic_rmw returns
+        // the PREVIOUS value, so "the one that just decremented to 0"
+        // is the thread that saw old == 1.
+        let one = builder.ins().iconst(cl_types::I32, 1);
+        let atomic_flags = MemFlags::trusted();
+        let prev_rc = builder.ins().atomic_rmw(
+            cl_types::I32,
+            atomic_flags,
+            cranelift_codegen::ir::AtomicRmwOp::Sub,
+            header,
+            one,
+        );
 
-        // if new_rc == 0, free
-        let is_zero = builder.ins().icmp_imm(IntCC::Equal, new_rc, 0);
+        // If prev_rc == 1 we owned the last reference; free now.
+        let is_last = builder.ins().icmp_imm(IntCC::Equal, prev_rc, 1);
         let do_free = builder.create_block();
-        builder.ins().brif(is_zero, do_free, &[], exit, &[]);
+        builder.ins().brif(is_last, do_free, &[], exit, &[]);
 
         builder.switch_to_block(do_free);
         let free_ref = self.obj.declare_func_in_func(self.libc_free, builder.func);
