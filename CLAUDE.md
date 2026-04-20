@@ -89,3 +89,12 @@ Lumen is a statically-typed language that compiles to native code via Cranelift.
 - **No closures:** Lambdas are non-capturing (`fn(x: i32): i32 { return x + 1 }`)
 - **Tests:** Unit tests live in `#[cfg(test)] mod tests` in each source file
 - **RC convention:** Fresh allocations have rc=1. Borrowing expressions (variable reads, field access) need `rc_incr`. Scope cleanup does `rc_decr`.
+
+## Language Decisions
+
+These are settled. If a proposal conflicts, it's the proposal that needs adjusting.
+
+- **No traits / interfaces.** Generics monomorphize. Ad-hoc polymorphism (e.g. `io.println` on any type) is implemented as a codegen special, not a user-facing feature. A perceived "needs traits" gap is almost always a missing compiler `__builtin` or a case that can be monomorphized directly.
+- **Safe primitives only.** No `unsafe` block, no raw pointer arithmetic, no `reinterpret<T>`. The C runtime (`runtime/rt.c`) is the compiler's unsafe escape hatch; Lumen user code never reaches below it. Moving stdlib internals into Lumen requires new safe primitives (generic externs, `__rc_incr<T>`, `__is_ptr<T>`, etc.), not an `unsafe` keyword.
+- **Integer overflow traps.** Signed and unsigned arithmetic (`+` / `-` / `*` / unary `-` / `/` on `INT_MIN, -1`) aborts the process on overflow via cranelift's `*_overflow_trap` opcodes. Wrapping/saturating/checked arithmetic would be explicit opt-in primitives; none exist today.
+- **Multi-core actors (planned).** The runtime will eventually schedule actors across OS threads (see `lumen-sf0`). The user-facing Lumen surface won't change — actors stay the only concurrency story. No threads-as-a-language-primitive, no async/await.

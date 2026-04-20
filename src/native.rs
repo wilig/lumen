@@ -2231,9 +2231,41 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             BinOp::Sub if is_f64 => self.builder.ins().fsub(a, b),
             BinOp::Mul if is_f64 => self.builder.ins().fmul(a, b),
             BinOp::Div if is_f64 => self.builder.ins().fdiv(a, b),
-            BinOp::Add => self.builder.ins().iadd(a, b),
-            BinOp::Sub => self.builder.ins().isub(a, b),
-            BinOp::Mul => self.builder.ins().imul(a, b),
+            // Integer arithmetic traps on overflow per the language
+            // decision (lumen-ika). Cranelift gives us one
+            // fused-trap opcode (uadd_overflow_trap) and generic
+            // *_overflow variants that return (result, overflow-bit)
+            // — we fuse those with trapnz. SIGTRAP fires through
+            // the default handler, producing a backtrace via
+            // eh_frame + the DWARF we emit.
+            BinOp::Add if is_signed => {
+                let (res, of) = self.builder.ins().sadd_overflow(a, b);
+                self.builder.ins().trapnz(of, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW);
+                res
+            }
+            BinOp::Add => self.builder.ins().uadd_overflow_trap(a, b, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW),
+            BinOp::Sub if is_signed => {
+                let (res, of) = self.builder.ins().ssub_overflow(a, b);
+                self.builder.ins().trapnz(of, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW);
+                res
+            }
+            BinOp::Sub => {
+                let (res, of) = self.builder.ins().usub_overflow(a, b);
+                self.builder.ins().trapnz(of, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW);
+                res
+            }
+            BinOp::Mul if is_signed => {
+                let (res, of) = self.builder.ins().smul_overflow(a, b);
+                self.builder.ins().trapnz(of, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW);
+                res
+            }
+            BinOp::Mul => {
+                let (res, of) = self.builder.ins().umul_overflow(a, b);
+                self.builder.ins().trapnz(of, cranelift_codegen::ir::TrapCode::INTEGER_OVERFLOW);
+                res
+            }
+            // sdiv already traps on divide-by-zero AND on INT_MIN / -1
+            // (TrapCode::IntegerOverflow). udiv traps on /0 only.
             BinOp::Div if is_signed => self.builder.ins().sdiv(a, b),
             BinOp::Div => self.builder.ins().udiv(a, b),
             BinOp::Rem if is_signed => self.builder.ins().srem(a, b),
