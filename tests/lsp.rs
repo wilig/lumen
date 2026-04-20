@@ -128,6 +128,55 @@ fn lsp_resolves_std_imports() {
 }
 
 #[test]
+fn lsp_hover_shows_fn_signature() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen lsp");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin.write_all(frame(init).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+
+    // Define `greet(name: string): string`, then hover on `greet`
+    // inside its own body.
+    let src = r#"fn greet(name: string): string {\n    return name\n}"#;
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///h.lm","languageId":"lumen","version":1,"text":"{}"}}}}}}"#,
+        src,
+    );
+    stdin.write_all(frame(&did_open).as_bytes()).unwrap();
+    let _ = read_message(&mut reader); // diagnostics
+
+    // Position cursor inside `greet` (line 0, char 4).
+    let hover = r#"{"jsonrpc":"2.0","id":10,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///h.lm"},"position":{"line":0,"character":4}}}"#;
+    stdin.write_all(frame(hover).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains("fn greet(name: string)"),
+        "hover should show greet's signature, got:\n{resp}");
+
+    // Hover on the `name` param at (line 0, char 9).
+    let hover2 = r#"{"jsonrpc":"2.0","id":11,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///h.lm"},"position":{"line":0,"character":9}}}"#;
+    stdin.write_all(frame(hover2).as_bytes()).unwrap();
+    let resp2 = read_message(&mut reader);
+    assert!(resp2.contains("(param) name: string"),
+        "hover on param should show its declared type, got:\n{resp2}");
+
+    let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+    stdin.write_all(frame(shutdown).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+    stdin.write_all(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#).as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn lsp_clean_document_has_empty_diagnostics() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .arg("lsp")

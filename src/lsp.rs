@@ -19,11 +19,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::ast;
 use crate::imports;
 use crate::lexer;
 use crate::parser;
 use crate::span::Span;
-use crate::types::{self, TypeError};
+use crate::types::{self, FnSig, ModuleInfo, Ty, TypeError};
 
 /// Run the LSP server on stdin/stdout until a shutdown+exit sequence
 /// arrives. Returns the process exit code the CLI should use.
@@ -97,8 +98,9 @@ fn write_message(out: &mut impl Write, v: &Value) -> io::Result<()> {
 
 #[derive(Default)]
 struct Server {
-    /// Most recent source text for each open document, keyed by URI.
-    docs: HashMap<String, String>,
+    /// Per-document state — source + cached parse/typecheck results
+    /// so hover/go-to-def requests don't re-run the whole pipeline.
+    docs: HashMap<String, DocState>,
     /// Workspace root discovered via the client's `rootUri` at
     /// initialize time, falling back to the compiler source tree
     /// (`CARGO_MANIFEST_DIR`) so the built-in `std/` modules always
@@ -106,6 +108,17 @@ struct Server {
     workspace_root: Option<PathBuf>,
     shutting_down: bool,
     exit_requested: bool,
+}
+
+#[derive(Default)]
+struct DocState {
+    text: String,
+    /// Last successful parse of `text`. If the current text fails to
+    /// parse, we keep the previous parse around so hover keeps
+    /// working while the user types.
+    last_ast: Option<ast::Module>,
+    /// Last successful typecheck. Same fallback semantics as last_ast.
+    last_info: Option<ModuleInfo>,
 }
 
 impl Server {
@@ -161,58 +174,58 @@ impl Server {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
-        self.docs.insert(uri.to_string(), text);
-        vec![self.diagnostics_for(uri)]
+        let uri = uri.to_string();
+        self.docs.insert(uri.clone(), DocState { text, ..Default::default() });
+        vec![self.refresh(&uri)]
     }
 
     fn on_did_change(&mut self, params: &Value) -> Vec<Value> {
         let Some(uri) = text_document_uri(params) else { return Vec::new(); };
+        let uri = uri.to_string();
         // We advertise full-text sync, so each change carries the
         // complete document. Partial-sync support is a follow-up.
-        let changes = params.pointer("/contentChanges").and_then(|c| c.as_array());
-        if let Some(changes) = changes {
+        if let Some(changes) = params.pointer("/contentChanges").and_then(|c| c.as_array()) {
             if let Some(last) = changes.last() {
                 if let Some(text) = last.get("text").and_then(|t| t.as_str()) {
-                    self.docs.insert(uri.to_string(), text.to_string());
+                    let entry = self.docs.entry(uri.clone()).or_default();
+                    entry.text = text.to_string();
                 }
             }
         }
-        vec![self.diagnostics_for(uri)]
+        vec![self.refresh(&uri)]
     }
 
     fn on_did_save(&mut self, params: &Value) -> Vec<Value> {
         let Some(uri) = text_document_uri(params) else { return Vec::new(); };
-        vec![self.diagnostics_for(uri)]
+        let uri = uri.to_string();
+        vec![self.refresh(&uri)]
     }
 
     fn on_hover(&self, params: &Value) -> Value {
-        // MVP: report the symbol at the cursor position by its parsed
-        // identifier. Full type-aware hover hooks into the typechecker
-        // and is a clean follow-up.
         let Some(uri) = text_document_uri(params) else { return Value::Null; };
-        let Some(src) = self.docs.get(uri) else { return Value::Null; };
+        let Some(doc) = self.docs.get(uri) else { return Value::Null; };
         let line = params.pointer("/position/line").and_then(|l| l.as_u64()).unwrap_or(0) as u32;
         let col = params.pointer("/position/character").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
-        let word = word_at_position(src, line, col);
-        if word.is_empty() {
-            return Value::Null;
-        }
+        let word = word_at_position(&doc.text, line, col);
+        if word.is_empty() { return Value::Null; }
+        let markdown = resolve_hover(&word, doc)
+            .unwrap_or_else(|| format!("`{word}`"));
         json!({
-            "contents": {
-                "kind": "markdown",
-                "value": format!("`{word}`"),
-            }
+            "contents": { "kind": "markdown", "value": markdown }
         })
     }
 
-    /// Re-run lex / parse / typecheck for the document and convert
-    /// any errors into LSP diagnostics. Emits a
-    /// textDocument/publishDiagnostics notification (possibly with
-    /// an empty list to clear prior errors).
-    fn diagnostics_for(&self, uri: &str) -> Value {
-        let src = self.docs.get(uri).cloned().unwrap_or_default();
+    /// Re-run lex / parse / typecheck for the document, refresh the
+    /// cached AST + ModuleInfo (so hover sees current state), and
+    /// return a publishDiagnostics notification with any errors.
+    fn refresh(&mut self, uri: &str) -> Value {
+        let src = self.docs.get(uri).map(|d| d.text.clone()).unwrap_or_default();
         let root = self.resolve_root();
-        let diags = run_pipeline(&src, &root);
+        let (diags, new_ast, new_info) = run_pipeline(&src, &root);
+        if let Some(doc) = self.docs.get_mut(uri) {
+            if let Some(ast) = new_ast { doc.last_ast = Some(ast); }
+            if let Some(info) = new_info { doc.last_info = Some(info); }
+        }
         json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
@@ -284,25 +297,148 @@ fn word_at_position(src: &str, line: u32, col: u32) -> String {
 
 // --- Pipeline → LSP diagnostics -----------------------------------------
 
-/// Run lex/parse/typecheck on `src` and return LSP `Diagnostic` values.
-/// `workspace_root` scopes transitive import resolution — typically
-/// the client's rootUri, falling back to the compiler source tree so
-/// the built-in stdlib is always visible.
-fn run_pipeline(src: &str, workspace_root: &Path) -> Vec<Value> {
+/// Run lex/parse/typecheck on `src`. Returns LSP diagnostics plus
+/// (on each successful phase) the AST + ModuleInfo the hover handler
+/// uses to resolve symbol types.
+fn run_pipeline(
+    src: &str,
+    workspace_root: &Path,
+) -> (Vec<Value>, Option<ast::Module>, Option<ModuleInfo>) {
     let tokens = match lexer::lex(src) {
         Ok(t) => t,
-        Err(e) => return vec![diagnostic_from_span(&e.span, &e.message, "lex")],
+        Err(e) => return (vec![diagnostic_from_span(&e.span, &e.message, "lex")], None, None),
     };
     let module = match parser::parse(tokens) {
         Ok(m) => m,
-        Err(e) => return vec![diagnostic_from_span(&e.span, &e.message, "parse")],
+        Err(e) => return (vec![diagnostic_from_span(&e.span, &e.message, "parse")], None, None),
     };
     let resolved = imports::resolve(&module, workspace_root);
     match types::typecheck(&module, &resolved.imported) {
-        Ok(_) => Vec::new(),
-        Err(errors) => errors.iter()
-            .map(|e: &TypeError| diagnostic_from_span(&e.span, &e.message, "type"))
-            .collect(),
+        Ok(info) => (Vec::new(), Some(module), Some(info)),
+        Err(errors) => {
+            let diags = errors.iter()
+                .map(|e: &TypeError| diagnostic_from_span(&e.span, &e.message, "type"))
+                .collect();
+            // Keep the parsed AST even if typecheck failed — hover
+            // can still fall back to syntactic info (param types
+            // from annotations, etc.).
+            (diags, Some(module), None)
+        }
+    }
+}
+
+/// Look up hover info for `word`, preferring the most concrete source:
+///   1. A top-level fn signature from the last good typecheck.
+///   2. A user-defined struct / sum type.
+///   3. A param or let/var in the AST with that name.
+///
+/// Returns a markdown-ready snippet.
+fn resolve_hover(word: &str, doc: &DocState) -> Option<String> {
+    if let Some(info) = &doc.last_info {
+        if let Some(sig) = info.fns.get(word) {
+            return Some(format_fn_signature(word, sig));
+        }
+        if let Some(ty) = info.types.get(word) {
+            return Some(format_type_decl(word, ty));
+        }
+    }
+    if let Some(module) = &doc.last_ast {
+        if let Some(s) = find_binding_in_module(module, word) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn format_fn_signature(name: &str, sig: &FnSig) -> String {
+    let params: Vec<String> = sig.params.iter()
+        .map(|(n, t)| format!("{n}: {}", t.display()))
+        .collect();
+    let generics = if sig.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", sig.type_params.join(", "))
+    };
+    let effect = match sig.effect {
+        crate::ast::Effect::Io => " io",
+        crate::ast::Effect::Pure => "",
+    };
+    format!("```lumen\nfn {name}{generics}({}): {}{effect}\n```",
+        params.join(", "),
+        sig.ret.display())
+}
+
+fn format_type_decl(name: &str, info: &types::TypeInfo) -> String {
+    use types::TypeInfo;
+    match info {
+        TypeInfo::Struct { fields, .. } => {
+            let body: Vec<String> = fields.iter()
+                .map(|(n, t)| format!("    {n}: {}", t.display()))
+                .collect();
+            format!("```lumen\ntype {name} = {{\n{}\n}}\n```", body.join(",\n"))
+        }
+        TypeInfo::Sum { variants, .. } => {
+            let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+            format!("```lumen\ntype {name} = {}\n```", names.join(" | "))
+        }
+    }
+}
+
+/// Walk every function decl in the module; if any param or let/var
+/// binding has the given name, format a one-line hover entry.
+/// Later bindings shadow earlier ones — we return the first match
+/// from a depth-first walk (good enough for MVP; position-aware
+/// scoping is a follow-up).
+fn find_binding_in_module(module: &ast::Module, word: &str) -> Option<String> {
+    use ast::{Item, StmtKind};
+    for item in &module.items {
+        if let Item::Fn(f) = item {
+            for p in &f.params {
+                if p.name == word {
+                    return Some(format!("```lumen\n(param) {}: {}\n```", p.name, display_ast_type(&p.ty)));
+                }
+            }
+            // Walk statements for matching bindings.
+            for stmt in &f.body.stmts {
+                match &stmt.kind {
+                    StmtKind::Let { name, ty, .. } | StmtKind::Var { name, ty, .. } => {
+                        if name == word {
+                            let ty_str = ty.as_ref().map(display_ast_type)
+                                .unwrap_or_else(|| "_".to_string());
+                            return Some(format!("```lumen\nlet {name}: {ty_str}\n```"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stringify an ast::Type without requiring a ModuleInfo. Approximates
+/// the compiler's internal Ty::display for cases where we only have
+/// syntactic type info (e.g. hover on a let binding before typecheck
+/// reaches a successful pass).
+fn display_ast_type(t: &ast::Type) -> String {
+    use ast::TypeKind;
+    match &t.kind {
+        TypeKind::Named { name, args } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(display_ast_type).collect();
+                format!("{name}<{}>", inner.join(", "))
+            }
+        }
+        TypeKind::Tuple(elems) => {
+            let inner: Vec<String> = elems.iter().map(display_ast_type).collect();
+            format!("({})", inner.join(", "))
+        }
+        TypeKind::FnPtr { params, ret } => {
+            let p: Vec<String> = params.iter().map(display_ast_type).collect();
+            format!("fn({}): {}", p.join(", "), display_ast_type(ret))
+        }
     }
 }
 
