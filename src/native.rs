@@ -310,12 +310,15 @@ impl<'a> NativeCodegen<'a> {
             .declare_function("lumen_assert", Linkage::Import, &assert_sig)
             .unwrap();
 
-        // rc_alloc(size: i64) -> ptr: malloc(size+8), set rc=1, return ptr+8
+        // rc_alloc(size: i64) -> ptr: dispatches through the current
+        // allocator (malloc + rc header by default, or a bump-allocated
+        // region inside an `arena { ... }` block). Defined in rt.c so
+        // the allocator vtable lives in one place.
         let mut rc_alloc_sig = obj.make_signature();
         rc_alloc_sig.params.push(AbiParam::new(PTR));
         rc_alloc_sig.returns.push(AbiParam::new(PTR));
         let helper_rc_alloc = obj
-            .declare_function("lumen_rc_alloc", Linkage::Local, &rc_alloc_sig)
+            .declare_function("lumen_rc_alloc", Linkage::Import, &rc_alloc_sig)
             .unwrap();
 
         // rc_incr(ptr): if ptr in heap, rc++
@@ -360,6 +363,34 @@ impl<'a> NativeCodegen<'a> {
         let rt_drain_sig = obj.make_signature();
         let rt_drain = obj
             .declare_function("lumen_rt_drain", Linkage::Import, &rt_drain_sig)
+            .unwrap();
+
+        // --- Arena allocator (lumen-z3e) ---
+        // lumen_arena_new(initial: i64) -> i64
+        let mut arena_new_sig = obj.make_signature();
+        arena_new_sig.params.push(AbiParam::new(cl_types::I64));
+        arena_new_sig.returns.push(AbiParam::new(cl_types::I64));
+        let arena_new = obj
+            .declare_function("lumen_arena_new", Linkage::Import, &arena_new_sig)
+            .unwrap();
+        // lumen_arena_free(arena: i64)
+        let mut arena_free_sig = obj.make_signature();
+        arena_free_sig.params.push(AbiParam::new(cl_types::I64));
+        let arena_free = obj
+            .declare_function("lumen_arena_free", Linkage::Import, &arena_free_sig)
+            .unwrap();
+        // lumen_allocator_push_arena(arena: i64) -> i64 (prev allocator)
+        let mut push_sig = obj.make_signature();
+        push_sig.params.push(AbiParam::new(cl_types::I64));
+        push_sig.returns.push(AbiParam::new(cl_types::I64));
+        let alloc_push = obj
+            .declare_function("lumen_allocator_push_arena", Linkage::Import, &push_sig)
+            .unwrap();
+        // lumen_allocator_pop(prev: i64)
+        let mut pop_sig = obj.make_signature();
+        pop_sig.params.push(AbiParam::new(cl_types::I64));
+        let alloc_pop = obj
+            .declare_function("lumen_allocator_pop", Linkage::Import, &pop_sig)
             .unwrap();
 
         // --- debug.print primitives ---
@@ -538,7 +569,17 @@ impl<'a> NativeCodegen<'a> {
             global_data: HashMap::new(),
             lambda_ids: HashMap::new(),
             lambda_sigs: HashMap::new(),
-            module_fn_ids: HashMap::new(),
+            module_fn_ids: {
+                let mut m = HashMap::new();
+                // Runtime allocator + arena functions (declared above
+                // as Import; compile_arena_block looks them up via
+                // module_func).
+                m.insert("lumen_arena_new".to_string(), arena_new);
+                m.insert("lumen_arena_free".to_string(), arena_free);
+                m.insert("lumen_allocator_push_arena".to_string(), alloc_push);
+                m.insert("lumen_allocator_pop".to_string(), alloc_pop);
+                m
+            },
             local_fn_ids: HashMap::new(),
             uses_io: false,
             debug_mode: false,
@@ -808,9 +849,8 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
-        // Define helper bodies (concat/println/itoa are now in rt.c).
+        // Define helper bodies (concat/println/itoa/rc_alloc are in rt.c).
         self.define_print_frames_helper()?;
-        self.define_rc_alloc_helper()?;
         self.define_rc_incr_helper()?;
         self.define_rc_decr_helper()?;
 
@@ -1064,42 +1104,6 @@ impl<'a> NativeCodegen<'a> {
         self.obj
             .define_function(self.helper_print_frames, &mut ctx)
             .unwrap();
-        Ok(())
-    }
-
-    /// `lumen_rc_alloc(size: i64) -> ptr`: malloc(size+8), write rc=1 at
-    /// the start, return ptr+8 (pointer to payload).
-    fn define_rc_alloc_helper(&mut self) -> Result<(), NativeError> {
-        let mut sig = self.obj.make_signature();
-        sig.params.push(AbiParam::new(PTR));
-        sig.returns.push(AbiParam::new(PTR));
-        let mut ctx = self.obj.make_context();
-        ctx.func.signature = sig;
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-
-        let size = builder.block_params(block)[0];
-        let eight = builder.ins().iconst(PTR, 8);
-        let total = builder.ins().iadd(size, eight);
-        let malloc_ref = self.obj.declare_func_in_func(self.libc_malloc, builder.func);
-        let call = builder.ins().call(malloc_ref, &[total]);
-        let raw = builder.inst_results(call)[0];
-        // *raw = 1 (refcount, i32)
-        let one = builder.ins().iconst(cl_types::I32, 1);
-        builder.ins().store(MemFlags::new(), one, raw, 0);
-        // *(raw+4) = 0x4C554D45 ("LUME" magic sentinel)
-        let magic = builder.ins().iconst(cl_types::I32, 0x4C554D45u32 as i64);
-        builder.ins().store(MemFlags::new(), magic, raw, 4);
-        // return raw + 8
-        let payload = builder.ins().iadd(raw, eight);
-        builder.ins().return_(&[payload]);
-
-        builder.seal_all_blocks();
-        builder.finalize();
-        self.obj.define_function(self.helper_rc_alloc, &mut ctx).unwrap();
         Ok(())
     }
 
@@ -1982,11 +1986,44 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 Ok(self.builder.ins().func_addr(PTR, func_ref))
             }
             ExprKind::Interpolated(parts) => self.compile_interpolated(parts),
+            ExprKind::Arena(block) => self.compile_arena_block(block),
             _ => Err(NativeError {
                 span: expr.span,
                 message: "expression not supported in native backend".into(),
             }),
         }
+    }
+
+    /// `arena { ... }` — swap the allocator for the extent of the
+    /// block, emit the body, then restore and free. Every rc_alloc
+    /// inside the block routes through the arena; rc_incr/decr skip
+    /// sentinel-less arena memory so per-value reference counting
+    /// silently becomes a no-op, and the whole region goes away at
+    /// the arena's close.
+    fn compile_arena_block(&mut self, block: &ast::Block) -> Result<Value, NativeError> {
+        let initial = self.builder.ins().iconst(cl_types::I64, 4096);
+        let new_fid = self.module_func("lumen_arena_new");
+        let new_ref = self.cg.obj.declare_func_in_func(new_fid, self.builder.func);
+        let new_call = self.builder.ins().call(new_ref, &[initial]);
+        let arena = self.builder.inst_results(new_call)[0];
+
+        let push_fid = self.module_func("lumen_allocator_push_arena");
+        let push_ref = self.cg.obj.declare_func_in_func(push_fid, self.builder.func);
+        let push_call = self.builder.ins().call(push_ref, &[arena]);
+        let prev = self.builder.inst_results(push_call)[0];
+
+        // Body — value is discarded (arena yields unit).
+        let _ = self.compile_block(block)?;
+
+        let pop_fid = self.module_func("lumen_allocator_pop");
+        let pop_ref = self.cg.obj.declare_func_in_func(pop_fid, self.builder.func);
+        self.builder.ins().call(pop_ref, &[prev]);
+
+        let free_fid = self.module_func("lumen_arena_free");
+        let free_ref = self.cg.obj.declare_func_in_func(free_fid, self.builder.func);
+        self.builder.ins().call(free_ref, &[arena]);
+
+        Ok(self.builder.ins().iconst(cl_types::I32, 0))
     }
 
     fn compile_binary(
@@ -5004,6 +5041,7 @@ fn collect_strings_expr(expr: &Expr, acc: &mut Vec<String>) {
                 }
             }
         }
+        ExprKind::Arena(body) => collect_strings_block(body, acc),
         _ => {}
     }
 }

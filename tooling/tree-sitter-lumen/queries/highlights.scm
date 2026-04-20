@@ -24,6 +24,7 @@
   "spawn"
   "send"
   "ask"
+  "arena"
 ] @keyword
 
 [

@@ -1,0 +1,48 @@
+// Arena allocator (lumen-z3e). Allocations inside the arena block
+// come from a bump region; the whole region is freed on exit.
+// rc_incr / rc_decr skip sentinel-less arena memory, so per-value
+// ref-counting silently no-ops inside the block.
+import std/test
+
+type Point = {
+    x: i32,
+    y: i32,
+}
+
+fn sum_points(n: i32): i32 {
+    var total: i32 = 0
+    arena {
+        for i in range(0, n) {
+            let p: Point = Point { x: i, y: i * 2 }
+            total = total + p.x + p.y
+        }
+    }
+    return total
+}
+
+fn main(): i32 io {
+    // Arena block that allocates 100 Points and sums their fields.
+    // 0..100 contributes sum(i) + sum(2i) = sum(i)*3 for i in 0..100
+    // sum(0..100) = 99*100/2 = 4950 → total = 14850.
+    test.eq(sum_points(100), 14850, "arena: point sum")
+
+    // Arena-allocated values survive until block exit — a tuple
+    // built inside, then read inside, works fine.
+    arena {
+        let t: (i32, i32, i32) = (1, 2, 3)
+        test.eq(t.0 + t.1 + t.2, 6, "arena: tuple in-block read")
+    }
+
+    // Outside strings used read-only inside the arena: the original
+    // malloc-allocated string's ref count is bumped on entry, decr'd
+    // on exit — arena does not interfere with normal RC for outer
+    // values.
+    let greeting: string = "hello"
+    arena {
+        let local: string = greeting
+        test.eq(local, "hello", "arena: outer string borrow")
+    }
+    test.eq(greeting, "hello", "arena: outer string survives block")
+
+    return test.summary()
+}

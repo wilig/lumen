@@ -366,6 +366,12 @@ pub enum ExprKind {
     /// literal chunks and embedded expressions whose values are stringified
     /// at runtime via the strbuf helpers.
     Interpolated(Vec<InterpPiece>),
+
+    /// `arena { ... }` — swap the allocator to a bump-region for the
+    /// extent of the block, then free the whole region on exit. The
+    /// block's tail value is discarded; arena yields unit. See
+    /// lumen-z3e.
+    Arena(Block),
 }
 
 #[derive(Debug, Clone)]

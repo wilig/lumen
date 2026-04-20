@@ -340,6 +340,7 @@ module.exports = grammar({
       $.spawn_expr,
       $.send_expr,
       $.ask_expr,
+      $.arena_expr,
       $.interpolated_string,
       $.identifier,
       $._literal,
@@ -519,6 +520,11 @@ module.exports = grammar({
       field("method", $.identifier),
       field("args", $.call_arguments),
     )),
+
+    arena_expr: $ => seq(
+      "arena",
+      field("body", $.block),
+    ),
 
     // --- Patterns ----------------------------------------------------
 

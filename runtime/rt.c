@@ -29,6 +29,120 @@
 void lumen_rt_drain(void);
 int lumen_rt_step(void);
 
+// --- Allocator dispatch --------------------------------------------------
+//
+// MVP has two allocators: the default RC-malloc (per-allocation malloc
+// + 8-byte header carrying rc + 0x4C554D45 sentinel) and the arena
+// allocator (bump-allocate from a region; whole region freed at once,
+// zeroed header so rc_incr/decr skip arena memory). rc_incr/rc_decr
+// already no-op on memory without the sentinel — arena allocations are
+// invisible to RC by construction.
+//
+// The pointer-indirection via LumenAllocator is deliberately
+// generalized: later tickets can graduate this into a pluggable vtable
+// for user allocators without touching every call site.
+
+typedef struct {
+    // Return a payload pointer. The block has 8 bytes of header space
+    // BEFORE the returned pointer (header lives at ptr-8). For the
+    // default allocator that header carries rc+magic; for arena it's
+    // zeroed so the sentinel check skips it.
+    void *(*alloc)(void *state, int64_t size);
+    void *state;
+} LumenAllocator;
+
+static void *rc_malloc_alloc(void *state, int64_t size) {
+    (void)state;
+    char *raw = (char *)malloc(8 + (size_t)size);
+    if (!raw) { fprintf(stderr, "FATAL: rc_alloc oom (size=%lld)\n", (long long)size); abort(); }
+    *(int32_t *)(raw + 0) = 1;            // rc = 1
+    *(int32_t *)(raw + 4) = 0x4C554D45;   // "LUME" sentinel
+    return raw + 8;
+}
+
+static LumenAllocator rc_malloc_allocator = { rc_malloc_alloc, NULL };
+// Single-threaded actor runtime today — a plain global suffices; move
+// to __thread if/when the runtime goes multi-threaded.
+static LumenAllocator *current_allocator = &rc_malloc_allocator;
+
+// --- Arena allocator -----------------------------------------------------
+
+typedef struct {
+    char *base;
+    char *cur;
+    char *end;
+} LumenArena;
+
+static void *arena_alloc(void *state, int64_t size) {
+    LumenArena *a = (LumenArena *)state;
+    int64_t need = 8 + size;
+    if (a->cur + need > a->end) {
+        int64_t used = (int64_t)(a->cur - a->base);
+        int64_t cap = (int64_t)(a->end - a->base);
+        int64_t new_cap = cap * 2;
+        if (new_cap < used + need) new_cap = used + need + 4096;
+        char *new_base = (char *)realloc(a->base, (size_t)new_cap);
+        if (!new_base) { fprintf(stderr, "FATAL: arena grow oom\n"); abort(); }
+        a->base = new_base;
+        a->cur = new_base + used;
+        a->end = new_base + new_cap;
+    }
+    char *raw = a->cur;
+    a->cur += need;
+    // Zero the header so the sentinel check in rc_incr/rc_decr fails.
+    *(int32_t *)(raw + 0) = 0;
+    *(int32_t *)(raw + 4) = 0;
+    return raw + 8;
+}
+
+int64_t lumen_arena_new(int64_t initial_size) {
+    LumenArena *a = (LumenArena *)malloc(sizeof(LumenArena));
+    if (!a) { fprintf(stderr, "FATAL: arena_new oom\n"); abort(); }
+    if (initial_size < 4096) initial_size = 4096;
+    a->base = (char *)malloc((size_t)initial_size);
+    if (!a->base) { fprintf(stderr, "FATAL: arena_new region oom\n"); abort(); }
+    a->cur = a->base;
+    a->end = a->base + initial_size;
+    return (int64_t)(uintptr_t)a;
+}
+
+void lumen_arena_free(int64_t arena) {
+    LumenArena *a = (LumenArena *)(uintptr_t)arena;
+    if (!a) return;
+    free(a->base);
+    free(a);
+}
+
+// Swap the current allocator to one backed by `arena`, returning the
+// previous allocator pointer so the emitted block can restore it on
+// exit. The slot struct is malloc'd so nested arenas can each carry
+// distinct state pointers.
+int64_t lumen_allocator_push_arena(int64_t arena) {
+    LumenArena *a = (LumenArena *)(uintptr_t)arena;
+    LumenAllocator *prev = current_allocator;
+    LumenAllocator *slot = (LumenAllocator *)malloc(sizeof(LumenAllocator));
+    if (!slot) { fprintf(stderr, "FATAL: allocator slot oom\n"); abort(); }
+    slot->alloc = arena_alloc;
+    slot->state = a;
+    current_allocator = slot;
+    return (int64_t)(uintptr_t)prev;
+}
+
+void lumen_allocator_pop(int64_t prev_allocator) {
+    LumenAllocator *prev = (LumenAllocator *)(uintptr_t)prev_allocator;
+    if (current_allocator != &rc_malloc_allocator) {
+        free(current_allocator);
+    }
+    current_allocator = prev;
+}
+
+// Core rc_alloc: dispatches through current_allocator. Replaces the
+// cranelift-defined helper of the same name.
+int64_t lumen_rc_alloc(int64_t size) {
+    void *payload = current_allocator->alloc(current_allocator->state, size);
+    return (int64_t)(uintptr_t)payload;
+}
+
 // --- Message queue -------------------------------------------------------
 
 typedef struct {

@@ -900,8 +900,16 @@ impl Parser {
             TokenKind::Spawn => self.parse_spawn_expr(),
             TokenKind::Send => self.parse_send_expr(),
             TokenKind::Ask => self.parse_ask_expr(),
+            TokenKind::Arena => self.parse_arena_expr(),
             _ => self.parse_or_expr(ctx),
         }
+    }
+
+    fn parse_arena_expr(&mut self) -> Result<Expr, ParseError> {
+        let start = self.expect(&TokenKind::Arena, "`arena`")?.span;
+        let block = self.parse_block()?;
+        let span = merge(start, block.span);
+        Ok(Expr { kind: ExprKind::Arena(block), span })
     }
 
     fn parse_spawn_expr(&mut self) -> Result<Expr, ParseError> {
@@ -1684,6 +1692,7 @@ fn describe_token(kind: &TokenKind) -> String {
         TokenKind::Actor => "`actor`".into(),
         TokenKind::Msg => "`msg`".into(),
         TokenKind::Spawn => "`spawn`".into(),
+        TokenKind::Arena => "`arena`".into(),
         TokenKind::Send => "`send`".into(),
         TokenKind::Ask => "`ask`".into(),
         TokenKind::As => "`as`".into(),

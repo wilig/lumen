@@ -1824,6 +1824,13 @@ impl<'a> FnChecker<'a> {
                 Ty::String
             }
 
+            ExprKind::Arena(block) => {
+                // Arena body typechecks as any block; its value is
+                // discarded and the whole expression yields unit.
+                self.check_block(block, None);
+                Ty::Unit
+            }
+
             ExprKind::Ident(name) => {
                 if let Some(b) = self.lookup(name) {
                     b.ty.clone()
