@@ -82,20 +82,17 @@ fn is_space_byte(b: i32): i32 {
 
 fn trim(s: string): string {
     let slen = len(s)
+    let b = bytes.from_string(s)
     var start = 0
     var end = slen
-    // NOTE: A `let b = bytes.from_string(s)` hoist here would be
-    // clearer, but it triggers a latent codegen bug (lumen-y40) where
-    // the second for-loop's IR degrades in large programs. The inline
-    // re-conversion is a stable workaround until that's tracked down.
     for _ in range(0, slen) {
         if start < slen {
-            if is_space_byte(bytes.get(bytes.from_string(s), start)) == 1 { start += 1 }
+            if is_space_byte(bytes.get(b, start)) == 1 { start += 1 }
         }
     }
     for _ in range(0, slen) {
         if end > start {
-            if is_space_byte(bytes.get(bytes.from_string(s), end - 1)) == 1 { end -= 1 }
+            if is_space_byte(bytes.get(b, end - 1)) == 1 { end -= 1 }
         }
     }
     return substring(s, start, end - start)
