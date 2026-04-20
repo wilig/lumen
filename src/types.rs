@@ -164,6 +164,14 @@ pub struct ModuleInfo {
     /// `Empty` / `Cell { ... }` / `Cell(...)` belongs to without
     /// re-running the inference itself.
     pub variant_resolutions: HashMap<u32, String>,
+    /// Mangled instantiation → (template name, args). Lets codegen
+    /// concretize a "deferred" instantiation (one whose args contained
+    /// `Ty::Generic` because it appeared inside a generic fn's sig or
+    /// body) at fn-monomorphization time. e.g. `Pair$GT_I32` produced
+    /// by `fn make<T>(): Pair<T, i32>` lives here as `("Pair", [Generic("T"), I32])`;
+    /// when `make<I32>` is monomorphized the codegen substitutes T → I32
+    /// and registers the concrete `Pair$I32_I32`.
+    pub generic_type_args: HashMap<String, (String, Vec<Ty>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,13 +204,13 @@ pub enum TypeInfo {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariantInfo {
     pub name: String,
     pub payload: Option<VariantPayloadInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VariantPayloadInfo {
     Named(Vec<(String, Ty)>),
     Positional(Vec<Ty>),
@@ -242,6 +250,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         generic_type_templates: HashMap::new(),
         generic_type_origins: HashMap::new(),
         variant_resolutions: HashMap::new(),
+        generic_type_args: HashMap::new(),
     };
 
     // Register imported module APIs.
@@ -538,7 +547,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                 continue;
             };
             let sig = sig.clone();
-            let mut checker = FnChecker::new(&info, &sig, &mut errors);
+            let mut checker = FnChecker::new(&mut info, &sig, &mut errors);
             // Wrap body in a synthetic FnDecl for check_fn.
             let synthetic = FnDecl {
                 name: fn_name.clone(),
@@ -581,7 +590,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             };
             let mut resolutions;
             {
-                let mut checker = FnChecker::new(&info, &sig, &mut errors);
+                let mut checker = FnChecker::new(&mut info, &sig, &mut errors);
                 checker.check_fn(f);
                 resolutions = std::mem::take(&mut checker.variant_resolutions);
             }
@@ -726,89 +735,121 @@ fn register_generic_instantiations(
     // Process worklist. Each instantiation may reference more generic
     // types in its substituted fields → add them to the worklist.
     while let Some((name, args)) = worklist.pop() {
-        let template = match info.generic_type_templates.get(&name).cloned() {
-            Some(t) => t,
-            None => continue,
-        };
-        if template.type_params.len() != args.len() {
-            errors.push(TypeError {
-                span: template.span,
-                message: format!(
-                    "`{name}<...>` expects {} type arguments, found {}",
-                    template.type_params.len(),
-                    args.len()
-                ),
-            });
-            continue;
-        }
-        let mangled = mangle_type_instantiation(&name, &args);
-        if info.types.contains_key(&mangled) { continue; }
-
-        // Insert a placeholder so recursive references (e.g. Tree<T> in
-        // its own variant body) terminate.
-        info.types.insert(mangled.clone(), TypeInfo::Struct {
-            fields: Vec::new(),
-            span: template.span,
-        });
-        info.generic_type_origins.insert(mangled.clone(), name.clone());
-
-        let subs: HashMap<String, Ty> = template.type_params.iter().zip(args.iter())
-            .map(|(p, a)| (p.clone(), a.clone()))
-            .collect();
-
-        let body = match &template.body {
-            TypeBody::Struct(fields) => {
-                let mut resolved = Vec::new();
-                for f in fields {
-                    let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
-                        Ok(t) => t,
-                        Err(e) => { errors.push(e); Ty::Error }
-                    };
-                    let ty = substitute_generic(raw, &subs);
-                    queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
-                    resolved.push((f.name.clone(), ty));
-                }
-                TypeInfo::Struct { fields: resolved, span: template.span }
-            }
-            TypeBody::Sum(variants) => {
-                let mut out = Vec::new();
-                for v in variants {
-                    let payload = match &v.payload {
-                        None => None,
-                        Some(VariantPayload::Named(fields)) => {
-                            let mut resolved = Vec::new();
-                            for f in fields {
-                                let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
-                                    Ok(t) => t,
-                                    Err(e) => { errors.push(e); Ty::Error }
-                                };
-                                let ty = substitute_generic(raw, &subs);
-                                queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
-                                resolved.push((f.name.clone(), ty));
-                            }
-                            Some(VariantPayloadInfo::Named(resolved))
-                        }
-                        Some(VariantPayload::Positional(tys)) => {
-                            let mut resolved = Vec::new();
-                            for t in tys {
-                                let raw = match resolve_type_with_params(t, &info.types, &template.type_params) {
-                                    Ok(t) => t,
-                                    Err(e) => { errors.push(e); Ty::Error }
-                                };
-                                let ty = substitute_generic(raw, &subs);
-                                queue_generic_uses_in_ty(&ty, info, &mut worklist, &mut seen);
-                                resolved.push(ty);
-                            }
-                            Some(VariantPayloadInfo::Positional(resolved))
-                        }
-                    };
-                    out.push(VariantInfo { name: v.name.clone(), payload });
-                }
-                TypeInfo::Sum { variants: out, span: template.span }
-            }
-        };
-        info.types.insert(mangled, body);
+        register_one_generic_instantiation_with_seen(&name, &args, info, errors, &mut worklist, &mut seen);
     }
+}
+
+/// Public version: register a single (template, args) instantiation
+/// on demand. Used by the codegen during fn monomorphization to
+/// concretize deferred instantiations like `Pair$GT_I32` → `Pair$I32_I32`.
+/// Recursively registers any sub-instantiations referenced in the
+/// substituted body's field types.
+pub fn register_one_generic_instantiation(
+    name: &str,
+    args: &[Ty],
+    info: &mut ModuleInfo,
+    errors: &mut Vec<TypeError>,
+) {
+    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    register_one_generic_instantiation_with_seen(name, args, info, errors, &mut worklist, &mut seen);
+    while let Some((n, a)) = worklist.pop() {
+        register_one_generic_instantiation_with_seen(&n, &a, info, errors, &mut worklist, &mut seen);
+    }
+}
+
+fn register_one_generic_instantiation_with_seen(
+    name: &str,
+    args: &[Ty],
+    info: &mut ModuleInfo,
+    errors: &mut Vec<TypeError>,
+    worklist: &mut Vec<(String, Vec<Ty>)>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let template = match info.generic_type_templates.get(name).cloned() {
+        Some(t) => t,
+        None => return,
+    };
+    if template.type_params.len() != args.len() {
+        errors.push(TypeError {
+            span: template.span,
+            message: format!(
+                "`{name}<...>` expects {} type arguments, found {}",
+                template.type_params.len(),
+                args.len()
+            ),
+        });
+        return;
+    }
+    let mangled = mangle_type_instantiation(name, args);
+    if info.types.contains_key(&mangled) { return; }
+    seen.insert(mangled.clone());
+
+    // Insert a placeholder so recursive references (Tree<T> referencing
+    // Tree<T> in its own variant body) terminate.
+    info.types.insert(mangled.clone(), TypeInfo::Struct {
+        fields: Vec::new(),
+        span: template.span,
+    });
+    info.generic_type_origins.insert(mangled.clone(), name.to_string());
+    info.generic_type_args.insert(mangled.clone(), (name.to_string(), args.to_vec()));
+
+    let subs: HashMap<String, Ty> = template.type_params.iter().zip(args.iter())
+        .map(|(p, a)| (p.clone(), a.clone()))
+        .collect();
+
+    let body = match &template.body {
+        TypeBody::Struct(fields) => {
+            let mut resolved = Vec::new();
+            for f in fields {
+                let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
+                    Ok(t) => t,
+                    Err(e) => { errors.push(e); Ty::Error }
+                };
+                let ty = substitute_generic(raw, &subs);
+                queue_generic_uses_in_ty(&ty, info, worklist, seen);
+                resolved.push((f.name.clone(), ty));
+            }
+            TypeInfo::Struct { fields: resolved, span: template.span }
+        }
+        TypeBody::Sum(variants) => {
+            let mut out = Vec::new();
+            for v in variants {
+                let payload = match &v.payload {
+                    None => None,
+                    Some(VariantPayload::Named(fields)) => {
+                        let mut resolved = Vec::new();
+                        for f in fields {
+                            let raw = match resolve_type_with_params(&f.ty, &info.types, &template.type_params) {
+                                Ok(t) => t,
+                                Err(e) => { errors.push(e); Ty::Error }
+                            };
+                            let ty = substitute_generic(raw, &subs);
+                            queue_generic_uses_in_ty(&ty, info, worklist, seen);
+                            resolved.push((f.name.clone(), ty));
+                        }
+                        Some(VariantPayloadInfo::Named(resolved))
+                    }
+                    Some(VariantPayload::Positional(tys)) => {
+                        let mut resolved = Vec::new();
+                        for t in tys {
+                            let raw = match resolve_type_with_params(t, &info.types, &template.type_params) {
+                                Ok(t) => t,
+                                Err(e) => { errors.push(e); Ty::Error }
+                            };
+                            let ty = substitute_generic(raw, &subs);
+                            queue_generic_uses_in_ty(&ty, info, worklist, seen);
+                            resolved.push(ty);
+                        }
+                        Some(VariantPayloadInfo::Positional(resolved))
+                    }
+                };
+                out.push(VariantInfo { name: v.name.clone(), payload });
+            }
+            TypeInfo::Sum { variants: out, span: template.span }
+        }
+    };
+    info.types.insert(mangled, body);
 }
 
 pub fn mangle_type_instantiation(name: &str, args: &[Ty]) -> String {
@@ -846,34 +887,40 @@ fn mangle_ty_for_type_inst(t: &Ty) -> String {
 }
 
 /// Collect every (template_name, type_args) usage in a module's items.
+/// Each fn/msg-handler walks its body+sig with its own `type_params`
+/// in scope, so `Pair<T, i32>` inside `fn make<T>(): Pair<T, i32>`
+/// produces a deferred instantiation `(Pair, [Generic("T"), I32])`
+/// that the type checker registers and the codegen later concretizes
+/// per fn-monomorphization.
 fn collect_generic_uses_in_module(m: &Module, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
     for item in &m.items {
         match item {
             Item::Fn(f) => {
-                for p in &f.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
-                collect_generic_uses_in_ast_type(&f.return_type, info, out);
-                collect_generic_uses_in_block(&f.body, info, out);
+                let tp = &f.type_params;
+                for p in &f.params { collect_generic_uses_in_ast_type(&p.ty, tp, info, out); }
+                collect_generic_uses_in_ast_type(&f.return_type, tp, info, out);
+                collect_generic_uses_in_block(&f.body, tp, info, out);
             }
             Item::ExternFn(ef) => {
-                for p in &ef.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
-                collect_generic_uses_in_ast_type(&ef.return_type, info, out);
+                let tp: &[String] = &[];
+                for p in &ef.params { collect_generic_uses_in_ast_type(&p.ty, tp, info, out); }
+                collect_generic_uses_in_ast_type(&ef.return_type, tp, info, out);
             }
             Item::Type(td) => {
-                if td.type_params.is_empty() {
-                    match &td.body {
-                        TypeBody::Struct(fields) => {
-                            for f in fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
-                        }
-                        TypeBody::Sum(variants) => {
-                            for v in variants {
-                                if let Some(p) = &v.payload {
-                                    match p {
-                                        VariantPayload::Named(fields) => {
-                                            for f in fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
-                                        }
-                                        VariantPayload::Positional(tys) => {
-                                            for t in tys { collect_generic_uses_in_ast_type(t, info, out); }
-                                        }
+                let tp = &td.type_params;
+                match &td.body {
+                    TypeBody::Struct(fields) => {
+                        for f in fields { collect_generic_uses_in_ast_type(&f.ty, tp, info, out); }
+                    }
+                    TypeBody::Sum(variants) => {
+                        for v in variants {
+                            if let Some(p) = &v.payload {
+                                match p {
+                                    VariantPayload::Named(fields) => {
+                                        for f in fields { collect_generic_uses_in_ast_type(&f.ty, tp, info, out); }
+                                    }
+                                    VariantPayload::Positional(tys) => {
+                                        for t in tys { collect_generic_uses_in_ast_type(t, tp, info, out); }
                                     }
                                 }
                             }
@@ -882,113 +929,121 @@ fn collect_generic_uses_in_module(m: &Module, info: &ModuleInfo, out: &mut Vec<(
                 }
             }
             Item::Actor(ad) => {
-                for f in &ad.fields { collect_generic_uses_in_ast_type(&f.ty, info, out); }
+                let tp: &[String] = &[];
+                for f in &ad.fields { collect_generic_uses_in_ast_type(&f.ty, tp, info, out); }
             }
             Item::MsgHandler(mh) => {
-                for p in &mh.params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
-                collect_generic_uses_in_ast_type(&mh.return_type, info, out);
-                collect_generic_uses_in_block(&mh.body, info, out);
+                let tp: &[String] = &[];
+                for p in &mh.params { collect_generic_uses_in_ast_type(&p.ty, tp, info, out); }
+                collect_generic_uses_in_ast_type(&mh.return_type, tp, info, out);
+                collect_generic_uses_in_block(&mh.body, tp, info, out);
             }
         }
     }
 }
 
-fn collect_generic_uses_in_ast_type(t: &crate::ast::Type, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+fn collect_generic_uses_in_ast_type(t: &crate::ast::Type, type_params: &[String], info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
     match &t.kind {
         TypeKind::Named { name, args } => {
-            // Recurse into args first.
-            for a in args { collect_generic_uses_in_ast_type(a, info, out); }
+            // Recurse into args first so nested generics also get queued.
+            for a in args { collect_generic_uses_in_ast_type(a, type_params, info, out); }
             if !args.is_empty() && info.generic_type_templates.contains_key(name) {
                 let resolved_args: Vec<Ty> = args.iter()
-                    .map(|a| resolve_type(a, &info.types).unwrap_or(Ty::Error))
+                    .map(|a| resolve_type_with_params(a, &info.types, type_params).unwrap_or(Ty::Error))
                     .collect();
+                // Allow Generic args through — they produce a "deferred"
+                // instantiation like `Pair$GT_I32` that the codegen
+                // concretizes per fn-monomorphization. Only filter out
+                // genuine Errors (unknown type names etc).
                 if !resolved_args.iter().any(|t| matches!(t, Ty::Error)) {
                     out.push((name.clone(), resolved_args));
                 }
             }
         }
-        TypeKind::Tuple(elems) => for e in elems { collect_generic_uses_in_ast_type(e, info, out); }
+        TypeKind::Tuple(elems) => for e in elems { collect_generic_uses_in_ast_type(e, type_params, info, out); }
         TypeKind::FnPtr { params, ret } => {
-            for p in params { collect_generic_uses_in_ast_type(p, info, out); }
-            collect_generic_uses_in_ast_type(ret, info, out);
+            for p in params { collect_generic_uses_in_ast_type(p, type_params, info, out); }
+            collect_generic_uses_in_ast_type(ret, type_params, info, out);
         }
     }
 }
 
-fn collect_generic_uses_in_block(b: &Block, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
-    for s in &b.stmts { collect_generic_uses_in_stmt(s, info, out); }
-    if let Some(t) = &b.tail { collect_generic_uses_in_expr(t, info, out); }
+fn collect_generic_uses_in_block(b: &Block, type_params: &[String], info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+    for s in &b.stmts { collect_generic_uses_in_stmt(s, type_params, info, out); }
+    if let Some(t) = &b.tail { collect_generic_uses_in_expr(t, type_params, info, out); }
 }
 
-fn collect_generic_uses_in_stmt(s: &Stmt, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+fn collect_generic_uses_in_stmt(s: &Stmt, type_params: &[String], info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
     match &s.kind {
         StmtKind::Let { ty, value, .. } | StmtKind::Var { ty, value, .. } => {
-            if let Some(t) = ty { collect_generic_uses_in_ast_type(t, info, out); }
-            collect_generic_uses_in_expr(value, info, out);
+            if let Some(t) = ty { collect_generic_uses_in_ast_type(t, type_params, info, out); }
+            collect_generic_uses_in_expr(value, type_params, info, out);
         }
-        StmtKind::Assign { value, .. } => collect_generic_uses_in_expr(value, info, out),
-        StmtKind::LetTuple { value, .. } => collect_generic_uses_in_expr(value, info, out),
-        StmtKind::Expr(e) => collect_generic_uses_in_expr(e, info, out),
+        StmtKind::Assign { value, .. } => collect_generic_uses_in_expr(value, type_params, info, out),
+        StmtKind::LetTuple { value, .. } => collect_generic_uses_in_expr(value, type_params, info, out),
+        StmtKind::Expr(e) => collect_generic_uses_in_expr(e, type_params, info, out),
         StmtKind::For { iter, body, .. } => {
-            collect_generic_uses_in_expr(iter, info, out);
-            collect_generic_uses_in_block(body, info, out);
+            collect_generic_uses_in_expr(iter, type_params, info, out);
+            collect_generic_uses_in_block(body, type_params, info, out);
         }
-        StmtKind::Return(Some(e)) => collect_generic_uses_in_expr(e, info, out),
+        StmtKind::Return(Some(e)) => collect_generic_uses_in_expr(e, type_params, info, out),
         StmtKind::Return(None) => {}
     }
 }
 
-fn collect_generic_uses_in_expr(e: &Expr, info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
+fn collect_generic_uses_in_expr(e: &Expr, type_params: &[String], info: &ModuleInfo, out: &mut Vec<(String, Vec<Ty>)>) {
     match &e.kind {
         ExprKind::Cast { expr, to } => {
-            collect_generic_uses_in_expr(expr, info, out);
-            collect_generic_uses_in_ast_type(to, info, out);
+            collect_generic_uses_in_expr(expr, type_params, info, out);
+            collect_generic_uses_in_ast_type(to, type_params, info, out);
         }
         ExprKind::Lambda { params, return_type, body } => {
-            for p in params { collect_generic_uses_in_ast_type(&p.ty, info, out); }
-            collect_generic_uses_in_ast_type(return_type, info, out);
-            collect_generic_uses_in_block(body, info, out);
+            // Lambda body inherits enclosing fn's type_params (no fresh
+            // generics inside lambdas — they're non-capturing scalars).
+            for p in params { collect_generic_uses_in_ast_type(&p.ty, type_params, info, out); }
+            collect_generic_uses_in_ast_type(return_type, type_params, info, out);
+            collect_generic_uses_in_block(body, type_params, info, out);
         }
-        ExprKind::Block(b) => collect_generic_uses_in_block(b, info, out),
+        ExprKind::Block(b) => collect_generic_uses_in_block(b, type_params, info, out),
         ExprKind::Paren(e) | ExprKind::Unary { rhs: e, .. } | ExprKind::Try(e) | ExprKind::TupleField { receiver: e, .. } => {
-            collect_generic_uses_in_expr(e, info, out)
+            collect_generic_uses_in_expr(e, type_params, info, out)
         }
-        ExprKind::Field { receiver, .. } => collect_generic_uses_in_expr(receiver, info, out),
+        ExprKind::Field { receiver, .. } => collect_generic_uses_in_expr(receiver, type_params, info, out),
         ExprKind::Binary { lhs, rhs, .. } => {
-            collect_generic_uses_in_expr(lhs, info, out);
-            collect_generic_uses_in_expr(rhs, info, out);
+            collect_generic_uses_in_expr(lhs, type_params, info, out);
+            collect_generic_uses_in_expr(rhs, type_params, info, out);
         }
         ExprKind::Call { callee, args } => {
-            collect_generic_uses_in_expr(callee, info, out);
-            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+            collect_generic_uses_in_expr(callee, type_params, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, type_params, info, out); }
         }
         ExprKind::MethodCall { receiver, args, .. } => {
-            collect_generic_uses_in_expr(receiver, info, out);
-            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+            collect_generic_uses_in_expr(receiver, type_params, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, type_params, info, out); }
         }
         ExprKind::If { cond, then_block, else_block } => {
-            collect_generic_uses_in_expr(cond, info, out);
-            collect_generic_uses_in_block(then_block, info, out);
-            collect_generic_uses_in_block(else_block, info, out);
+            collect_generic_uses_in_expr(cond, type_params, info, out);
+            collect_generic_uses_in_block(then_block, type_params, info, out);
+            collect_generic_uses_in_block(else_block, type_params, info, out);
         }
         ExprKind::Match { scrutinee, arms } => {
-            collect_generic_uses_in_expr(scrutinee, info, out);
-            for arm in arms { collect_generic_uses_in_expr(&arm.body, info, out); }
+            collect_generic_uses_in_expr(scrutinee, type_params, info, out);
+            for arm in arms { collect_generic_uses_in_expr(&arm.body, type_params, info, out); }
         }
         ExprKind::StructLit { fields, spread, .. } => {
-            for f in fields { collect_generic_uses_in_expr(&f.value, info, out); }
-            if let Some(s) = spread { collect_generic_uses_in_expr(s, info, out); }
+            for f in fields { collect_generic_uses_in_expr(&f.value, type_params, info, out); }
+            if let Some(s) = spread { collect_generic_uses_in_expr(s, type_params, info, out); }
         }
-        ExprKind::TupleLit(elems) => for e in elems { collect_generic_uses_in_expr(e, info, out); },
-        ExprKind::Spawn { fields, .. } => for f in fields { collect_generic_uses_in_expr(&f.value, info, out); },
+        ExprKind::TupleLit(elems) => for e in elems { collect_generic_uses_in_expr(e, type_params, info, out); },
+        ExprKind::Spawn { fields, .. } => for f in fields { collect_generic_uses_in_expr(&f.value, type_params, info, out); },
         ExprKind::Send { handle, args, .. } | ExprKind::Ask { handle, args, .. } => {
-            collect_generic_uses_in_expr(handle, info, out);
-            for a in args { collect_generic_uses_in_expr(&a.value, info, out); }
+            collect_generic_uses_in_expr(handle, type_params, info, out);
+            for a in args { collect_generic_uses_in_expr(&a.value, type_params, info, out); }
         }
         ExprKind::Interpolated(parts) => {
             for p in parts {
                 if let crate::ast::InterpPiece::Expr(e) = p {
-                    collect_generic_uses_in_expr(e, info, out);
+                    collect_generic_uses_in_expr(e, type_params, info, out);
                 }
             }
         }
@@ -1022,7 +1077,7 @@ fn queue_generic_uses_in_ty(ty: &Ty, info: &ModuleInfo, worklist: &mut Vec<(Stri
 // ---------------------------------------------------------------------------
 
 struct FnChecker<'a> {
-    module: &'a ModuleInfo,
+    module: &'a mut ModuleInfo,
     sig: &'a FnSig,
     scopes: Vec<Scope>,
     errors: &'a mut Vec<TypeError>,
@@ -1050,7 +1105,7 @@ struct Binding {
 }
 
 impl<'a> FnChecker<'a> {
-    fn new(module: &'a ModuleInfo, sig: &'a FnSig, errors: &'a mut Vec<TypeError>) -> Self {
+    fn new(module: &'a mut ModuleInfo, sig: &'a FnSig, errors: &'a mut Vec<TypeError>) -> Self {
         Self {
             module,
             sig,
@@ -1058,6 +1113,45 @@ impl<'a> FnChecker<'a> {
             errors,
             lambda_scope_floor: None,
             variant_resolutions: HashMap::new(),
+        }
+    }
+
+    /// Walk `ty`, finding deferred `Ty::User` names (registered with
+    /// Generic args during the pre-pass — e.g. `Pair$GT_I32` from
+    /// `fn make<T>(): Pair<T, i32>`'s sig). For each, substitute its
+    /// stored generic args via `subs` to get concrete args, register
+    /// the concrete instantiation if not already present, and replace
+    /// the Ty::User name with the concrete mangled name. Recurses into
+    /// nested generics.
+    fn concretize_ty(&mut self, ty: &Ty, subs: &HashMap<String, Ty>) -> Ty {
+        match ty {
+            Ty::User(name) => {
+                let entry = self.module.generic_type_args.get(name).cloned();
+                if let Some((tmpl, args)) = entry {
+                    let concrete_args: Vec<Ty> = args.into_iter()
+                        .map(|a| substitute_generic(a, subs))
+                        .map(|a| self.concretize_ty(&a, subs))
+                        .collect();
+                    let new_mangled = mangle_type_instantiation(&tmpl, &concrete_args);
+                    if !self.module.types.contains_key(&new_mangled) {
+                        register_one_generic_instantiation(&tmpl, &concrete_args, self.module, self.errors);
+                    }
+                    Ty::User(new_mangled)
+                } else {
+                    ty.clone()
+                }
+            }
+            Ty::List(inner) => Ty::List(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Map(k, v) => Ty::Map(Box::new(self.concretize_ty(k, subs)), Box::new(self.concretize_ty(v, subs))),
+            Ty::Option(inner) => Ty::Option(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Result(o, e) => Ty::Result(Box::new(self.concretize_ty(o, subs)), Box::new(self.concretize_ty(e, subs))),
+            Ty::Handle(inner) => Ty::Handle(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| self.concretize_ty(t, subs)).collect()),
+            Ty::FnPtr { params, ret } => Ty::FnPtr {
+                params: params.iter().map(|p| self.concretize_ty(p, subs)).collect(),
+                ret: Box::new(self.concretize_ty(ret, subs)),
+            },
+            _ => ty.clone(),
         }
     }
 
@@ -1913,6 +2007,21 @@ impl<'a> FnChecker<'a> {
             }) {
                 self.check_effect(sig.effect, whole_span);
                 self.check_args_against_params(&sig.params, args, whole_span);
+                // Generic callee: infer subs from arg types, substitute
+                // and concretize the return type so the call site sees
+                // the concrete instantiation (e.g. Pair$I32_I32) instead
+                // of the deferred form (e.g. Pair$GT_I32).
+                if !sig.type_params.is_empty() {
+                    let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+                    let mut subs: HashMap<String, Ty> = HashMap::new();
+                    for (i, (_, pty)) in sig.params.iter().enumerate() {
+                        if let Some(at) = arg_tys.get(i) {
+                            unify_for_subs(pty, at, &mut subs);
+                        }
+                    }
+                    let subbed = substitute_generic(sig.ret.clone(), &subs);
+                    return self.concretize_ty(&subbed, &subs);
+                }
                 return sig.ret;
             }
 
@@ -2145,39 +2254,41 @@ impl<'a> FnChecker<'a> {
             _ => {}
         }
         // --- Data-driven lookup from imported module .lm files ---
-        if let Some(mod_fns) = self.module.modules.get(module) {
-            if let Some(sig) = mod_fns.get(method) {
-                if sig.effect == Effect::Io {
-                    self.check_effect(Effect::Io, span);
-                }
-                if args.len() != sig.params.len() {
-                    self.errors.push(TypeError {
-                        span,
-                        message: format!(
-                            "`{module}.{method}` expects {} args, found {}",
-                            sig.params.len(), args.len()
-                        ),
-                    });
-                } else {
-                    for (i, (_, pty)) in sig.params.iter().enumerate() {
-                        self.check_expr(&args[i].value, pty);
-                    }
-                }
-                // Generic callee: infer the substitution from arg types
-                // and apply to the return so the call site sees the
-                // concrete type instead of Ty::Generic.
-                if !sig.type_params.is_empty() {
-                    let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
-                    let mut subs: HashMap<String, Ty> = HashMap::new();
-                    for (i, (_, pty)) in sig.params.iter().enumerate() {
-                        if let Some(at) = arg_tys.get(i) {
-                            unify_for_subs(pty, at, &mut subs);
-                        }
-                    }
-                    return Some(substitute_generic(sig.ret.clone(), &subs));
-                }
-                return Some(sig.ret.clone());
+        // Clone the sig so subsequent mutations of self.module (e.g.
+        // registering generic instantiations) don't conflict with the borrow.
+        let sig = self.module.modules.get(module).and_then(|m| m.get(method)).cloned();
+        if let Some(sig) = sig {
+            if sig.effect == Effect::Io {
+                self.check_effect(Effect::Io, span);
             }
+            if args.len() != sig.params.len() {
+                self.errors.push(TypeError {
+                    span,
+                    message: format!(
+                        "`{module}.{method}` expects {} args, found {}",
+                        sig.params.len(), args.len()
+                    ),
+                });
+            } else {
+                for (i, (_, pty)) in sig.params.iter().enumerate() {
+                    let pty = pty.clone();
+                    self.check_expr(&args[i].value, &pty);
+                }
+            }
+            // Generic callee: infer the substitution from arg types
+            // and apply to the return so the call site sees the
+            // concrete type instead of Ty::Generic.
+            if !sig.type_params.is_empty() {
+                let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+                let mut subs: HashMap<String, Ty> = HashMap::new();
+                for (i, (_, pty)) in sig.params.iter().enumerate() {
+                    if let Some(at) = arg_tys.get(i) {
+                        unify_for_subs(pty, at, &mut subs);
+                    }
+                }
+                return Some(substitute_generic(sig.ret.clone(), &subs));
+            }
+            return Some(sig.ret.clone());
         }
         None
     }
@@ -2191,21 +2302,27 @@ impl<'a> FnChecker<'a> {
         args: &[Arg],
         span: Span,
     ) -> Ty {
-        let Some(msgs) = self.module.actors.get(actor_name) else {
-            self.errors.push(TypeError {
-                span,
-                message: format!("unknown actor type `{actor_name}`"),
-            });
-            return Ty::Error;
-        };
-        let Some(msg_sig) = msgs.iter().find(|m| m.name == method) else {
-            self.errors.push(TypeError {
-                span,
-                message: format!(
-                    "actor `{actor_name}` has no message handler `{method}`"
-                ),
-            });
-            return Ty::Error;
+        // Clone the msg sig so subsequent self mutations don't conflict.
+        let msg_sig = self.module.actors.get(actor_name)
+            .and_then(|msgs| msgs.iter().find(|m| m.name == method).cloned());
+        let msg_sig = match msg_sig {
+            Some(s) => s,
+            None => {
+                if self.module.actors.get(actor_name).is_none() {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!("unknown actor type `{actor_name}`"),
+                    });
+                } else {
+                    self.errors.push(TypeError {
+                        span,
+                        message: format!(
+                            "actor `{actor_name}` has no message handler `{method}`"
+                        ),
+                    });
+                }
+                return Ty::Error;
+            }
         };
         if args.len() != msg_sig.params.len() {
             self.errors.push(TypeError {
@@ -2218,8 +2335,8 @@ impl<'a> FnChecker<'a> {
             });
         } else {
             for (i, arg) in args.iter().enumerate() {
-                let (_, pty) = &msg_sig.params[i];
-                self.check_expr(&arg.value, pty);
+                let pty = msg_sig.params[i].1.clone();
+                self.check_expr(&arg.value, &pty);
             }
         }
         msg_sig.ret.clone()
@@ -2457,8 +2574,14 @@ impl<'a> FnChecker<'a> {
 
         match &scrut_ty {
             Ty::User(name) => {
-                if let Some(TypeInfo::Sum { variants, .. }) = self.module.types.get(name) {
-                    self.check_exhaustiveness(variants, arms, span);
+                // Clone the variants list so we can mutably borrow self
+                // (check_exhaustiveness pushes errors).
+                let variants = match self.module.types.get(name) {
+                    Some(TypeInfo::Sum { variants, .. }) => Some(variants.clone()),
+                    _ => None,
+                };
+                if let Some(variants) = variants {
+                    self.check_exhaustiveness(&variants, arms, span);
                 }
             }
             Ty::Option(_) => {
@@ -2770,7 +2893,7 @@ pub fn unify_for_subs(generic: &Ty, concrete: &Ty, subs: &mut HashMap<String, Ty
 }
 
 /// Replace Ty::Generic(name) inside `ty` with substitutions from `subs`.
-fn substitute_generic(ty: Ty, subs: &HashMap<String, Ty>) -> Ty {
+pub fn substitute_generic(ty: Ty, subs: &HashMap<String, Ty>) -> Ty {
     if subs.is_empty() { return ty; }
     match ty {
         Ty::Generic(name) => subs.get(&name).cloned().unwrap_or(Ty::Generic(name)),

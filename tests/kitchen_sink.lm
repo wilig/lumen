@@ -75,6 +75,15 @@ fn id<T>(x: T): T {
     return x
 }
 
+// Generic types referenced inside a generic fn body.
+fn make_pair<T>(x: T): Pair<T, i32> {
+    return Pair { fst: x, snd: 0 }
+}
+
+fn wrap_some<T>(x: T): Maybe<T> {
+    return Just { value: x }
+}
+
 fn pick_first<A, B>(a: A, b: B): A {
     return a
 }
@@ -165,6 +174,15 @@ fn main(): i32 io {
     let bi: Box<i32> = Box { val: 100 }
     let bs: Box<string> = Box { val: "boxed" }
     io.println("bi = \{bi.val}, bs = \{bs.val}")
+
+    // generic types referenced inside generic fn bodies
+    let gp: Pair<string, i32> = make_pair("inferred")
+    io.println("make_pair: \{gp.fst}, \{gp.snd}")
+    let gm: Maybe<i32> = wrap_some(99)
+    match gm {
+        Nothing => io.println("wrap_some: nothing"),
+        Just { value: v } => io.println("wrap_some: just \{v}"),
+    }
 
     // generic sum types
     let m1: Maybe<i32> = Nothing

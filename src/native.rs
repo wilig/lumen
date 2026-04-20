@@ -29,7 +29,7 @@ use crate::types::{ModuleInfo, Ty, TypeInfo};
 /// Compile a type-checked module to a native object file (bytes).
 pub fn compile_native(
     module: &ast::Module,
-    info: &ModuleInfo,
+    info: &mut ModuleInfo,
     imported_modules: &[(&str, &ast::Module)],
     debug: bool,
     source_path: &str,
@@ -88,7 +88,7 @@ struct FmtFuncs {
 // ---------------------------------------------------------------------------
 
 struct NativeCodegen<'a> {
-    info: &'a ModuleInfo,
+    info: &'a mut ModuleInfo,
     obj: ObjectModule,
 
     /// Lumen fn name → Cranelift FuncId.
@@ -195,7 +195,7 @@ struct MonomorphRequest {
 }
 
 impl<'a> NativeCodegen<'a> {
-    fn new(info: &'a ModuleInfo) -> Result<Self, NativeError> {
+    fn new(info: &'a mut ModuleInfo) -> Result<Self, NativeError> {
         let isa = cranelift_native::builder()
             .map_err(|e| NativeError {
                 span: Span::DUMMY,
@@ -1515,6 +1515,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     Some(annot) => {
                         let raw = resolve_type_to_ty(annot);
                         let annot_ty = substitute_ty(raw, &self.active_subs);
+                        // Concretize any deferred Ty::User in the annotation
+                        // (e.g. `let p: Pair<T, i32>` inside a generic fn at
+                        // T=I32 becomes Pair$I32_I32). Uses active_subs which
+                        // is empty for non-generic fns, so this is a no-op
+                        // outside generic contexts.
+                        let active_subs = self.active_subs.clone();
+                        let annot_ty = self.concretize_ty(&annot_ty, &active_subs);
                         if ty_more_specific(&annot_ty, &inferred_ty) { annot_ty } else { inferred_ty }
                     }
                     None => inferred_ty,
@@ -1934,6 +1941,49 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.do_monomorphize(&qualified, &qualified, &sig, arg_tys, Some(module.to_string()))
     }
 
+    /// Walk `ty`, finding deferred `Ty::User` names (registered by the
+    /// type-checker pre-pass with Generic args — e.g. `Pair$GT_I32`
+    /// from `fn make<T>(): Pair<T, i32>`'s sig). For each, substitute
+    /// its stored generic args via `subs` to get concrete args, register
+    /// the concrete instantiation if not already present, and replace
+    /// the Ty::User name with the concrete mangled name.
+    fn concretize_ty(&mut self, ty: &Ty, subs: &HashMap<String, Ty>) -> Ty {
+        match ty {
+            Ty::User(name) => {
+                let entry = self.cg.info.generic_type_args.get(name).cloned();
+                if let Some((tmpl, args)) = entry {
+                    let concrete_args: Vec<Ty> = args.into_iter()
+                        .map(|a| substitute_ty(a, subs))
+                        .map(|a| self.concretize_ty(&a, subs))
+                        .collect();
+                    let new_mangled = crate::types::mangle_type_instantiation(&tmpl, &concrete_args);
+                    if !self.cg.info.types.contains_key(&new_mangled) {
+                        let mut errors = Vec::new();
+                        crate::types::register_one_generic_instantiation(
+                            &tmpl, &concrete_args, self.cg.info, &mut errors,
+                        );
+                        // Errors here would mean a malformed template arity —
+                        // already caught by the type checker. Ignore.
+                    }
+                    Ty::User(new_mangled)
+                } else {
+                    ty.clone()
+                }
+            }
+            Ty::List(inner) => Ty::List(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Map(k, v) => Ty::Map(Box::new(self.concretize_ty(k, subs)), Box::new(self.concretize_ty(v, subs))),
+            Ty::Option(inner) => Ty::Option(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Result(o, e) => Ty::Result(Box::new(self.concretize_ty(o, subs)), Box::new(self.concretize_ty(e, subs))),
+            Ty::Handle(inner) => Ty::Handle(Box::new(self.concretize_ty(inner, subs))),
+            Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|t| self.concretize_ty(t, subs)).collect()),
+            Ty::FnPtr { params, ret } => Ty::FnPtr {
+                params: params.iter().map(|p| self.concretize_ty(p, subs)).collect(),
+                ret: Box::new(self.concretize_ty(ret, subs)),
+            },
+            _ => ty.clone(),
+        }
+    }
+
     /// Shared monomorphization logic. `qualified_name` is the base for
     /// name mangling; `template_key` is the key into `generic_templates`.
     /// `module` records which imported module owns the template (so the
@@ -1969,6 +2019,13 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .map(|(n, t)| (n.clone(), substitute_ty(t.clone(), &subs)))
             .collect();
         let subbed_ret = substitute_ty(sig.ret.clone(), &subs);
+        // Concretize any deferred Ty::User in the substituted sig — e.g.
+        // `Pair$GT_I32` from `fn make<T>(): Pair<T, i32>` becomes
+        // `Pair$I32_I32` here when monomorphizing make<I32>.
+        let subbed_params: Vec<(String, Ty)> = subbed_params.into_iter()
+            .map(|(n, t)| (n, self.concretize_ty(&t, &subs)))
+            .collect();
+        let subbed_ret = self.concretize_ty(&subbed_ret, &subs);
         let subbed_sig = crate::types::FnSig {
             params: subbed_params,
             ret: subbed_ret,
@@ -2581,7 +2638,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     /// name (already registered by the type-checker pre-pass). For a
     /// non-generic struct, returns `name` unchanged.
     fn resolve_struct_lit_name(
-        &self,
+        &mut self,
         name: &str,
         fields: &[ast::FieldInit],
     ) -> Result<String, NativeError> {
@@ -3502,7 +3559,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         }
     }
 
-    fn infer_ty(&self, expr: &Expr) -> Result<Ty, NativeError> {
+    fn infer_ty(&mut self, expr: &Expr) -> Result<Ty, NativeError> {
         // Simplified type inference for codegen dispatch.
         Ok(match &expr.kind {
             ExprKind::IntLit { suffix, .. } => match suffix {
@@ -3573,9 +3630,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         "None" => return Ok(Ty::Option(Box::new(Ty::Error))),
                         _ => {}
                     }
-                    if let Some(sig) = self.cg.info.fns.get(name) {
+                    if let Some(sig) = self.cg.info.fns.get(name).cloned() {
                         // Generic callee: infer the substitution from
-                        // call-site arg types and apply to the return.
+                        // call-site arg types and apply to the return,
+                        // then concretize any deferred Ty::User names.
                         if !sig.type_params.is_empty() {
                             let mut subs: HashMap<String, Ty> = HashMap::new();
                             for (i, (_, pty)) in sig.params.iter().enumerate() {
@@ -3584,7 +3642,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                                     unify_into(pty, &at, &mut subs);
                                 }
                             }
-                            return Ok(substitute_ty(sig.ret.clone(), &subs));
+                            let subbed = substitute_ty(sig.ret.clone(), &subs);
+                            return Ok(self.concretize_ty(&subbed, &subs));
                         }
                         return Ok(sig.ret.clone());
                     }
@@ -3776,23 +3835,28 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     if m == "math" {
                         return Ok(Ty::F64);
                     }
-                    // Fall through to imported module lookup.
-                    if let Some(mod_fns) = self.cg.info.modules.get(m.as_str()) {
-                        if let Some(sig) = mod_fns.get(method.as_str()) {
-                            // Generic module fn: infer the substitution
-                            // from arg types and apply to the return.
-                            if !sig.type_params.is_empty() {
-                                let mut subs: HashMap<String, Ty> = HashMap::new();
-                                for (i, (_, pty)) in sig.params.iter().enumerate() {
-                                    if let Some(arg) = args.get(i) {
-                                        let at = self.infer_ty(&arg.value)?;
-                                        unify_into(pty, &at, &mut subs);
-                                    }
+                    // Fall through to imported module lookup. Clone the
+                    // sig so we can re-borrow self mutably for infer_ty
+                    // and concretize_ty calls below.
+                    let sig = self.cg.info.modules.get(m.as_str())
+                        .and_then(|mf| mf.get(method.as_str()))
+                        .cloned();
+                    if let Some(sig) = sig {
+                        // Generic module fn: infer the substitution
+                        // from arg types and apply to the return,
+                        // then concretize any deferred Ty::User names.
+                        if !sig.type_params.is_empty() {
+                            let mut subs: HashMap<String, Ty> = HashMap::new();
+                            for (i, (_, pty)) in sig.params.iter().enumerate() {
+                                if let Some(arg) = args.get(i) {
+                                    let at = self.infer_ty(&arg.value)?;
+                                    unify_into(pty, &at, &mut subs);
                                 }
-                                return Ok(substitute_ty(sig.ret.clone(), &subs));
                             }
-                            return Ok(sig.ret.clone());
+                            let subbed = substitute_ty(sig.ret.clone(), &subs);
+                            return Ok(self.concretize_ty(&subbed, &subs));
                         }
+                        return Ok(sig.ret.clone());
                     }
                 }
                 Ty::I32
@@ -3899,7 +3963,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         })
     }
 
-    fn infer_block_ty(&self, block: &ast::Block) -> Option<Ty> {
+    fn infer_block_ty(&mut self, block: &ast::Block) -> Option<Ty> {
         block.tail.as_ref().map(|e| self.infer_ty(e).unwrap_or(Ty::I32))
     }
 
