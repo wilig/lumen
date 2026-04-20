@@ -37,6 +37,7 @@ pub fn compile_native(
     let mut cg = NativeCodegen::new(info)?;
     cg.debug_mode = debug;
     cg.source_path = source_path.to_string();
+    cg.dwarf = crate::dwarf::DwarfBuilder::new(source_path);
     cg.compile_module(module, imported_modules)?;
     Ok(cg.finish())
 }
@@ -186,6 +187,9 @@ struct NativeCodegen<'a> {
     /// call site reusing the same instantiation just calls the existing
     /// FuncId rather than re-declaring).
     monomorph_done: HashSet<String>,
+    /// DWARF debug info builder. Populated as user fns are defined and
+    /// flushed to the object in `finish()`. See src/dwarf.rs (lumen-v3w).
+    dwarf: crate::dwarf::DwarfBuilder,
 }
 
 struct MonomorphRequest {
@@ -213,6 +217,10 @@ impl<'a> NativeCodegen<'a> {
                 // IR patterns (nested if-without-else with return).
                 b.set("enable_verifier", "false").ok();
                 b.set("opt_level", "speed").ok();
+                // Emit frame pointers and unwind tables so DWARF
+                // debug info and `gdb bt` work out of the box.
+                b.set("unwind_info", "true").ok();
+                b.set("preserve_frame_pointers", "true").ok();
                 // AArch64 (macOS) requires PIC; cranelift-object only handles
                 // GOT-based aarch64 relocations, not direct ADRP ones.
                 if cfg!(target_arch = "aarch64") {
@@ -587,6 +595,7 @@ impl<'a> NativeCodegen<'a> {
             generic_templates: HashMap::new(),
             monomorph_queue: Vec::new(),
             monomorph_done: HashSet::new(),
+            dwarf: crate::dwarf::DwarfBuilder::new("<unset>"),
         })
     }
 
@@ -964,7 +973,8 @@ impl<'a> NativeCodegen<'a> {
     }
 
     fn finish(self) -> Vec<u8> {
-        let product = self.obj.finish();
+        let mut product = self.obj.finish();
+        self.dwarf.emit(&mut product);
         product.emit().unwrap()
     }
 
@@ -1393,6 +1403,9 @@ impl<'a> NativeCodegen<'a> {
         builder.switch_to_block(entry);
         // (sealed later)
 
+        // Capture before current_module is moved into the FnEmitter.
+        let is_imported = current_module.is_some();
+
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
             fb.active_subs = active_subs;
@@ -1496,6 +1509,26 @@ impl<'a> NativeCodegen<'a> {
                 span: f.span,
                 message: format!("define {}: {e}", f.name),
             })?;
+
+        // Record for DWARF: function name, symbol (FuncId), compiled
+        // size, and source line. Only user-module, non-monomorphized
+        // fns get recorded — imported-module fns and monomorphizations
+        // would misattribute line numbers to the user's source file
+        // (the CU only references one file at MVP). Multi-file DWARF
+        // is a cleanly additive follow-up.
+        // Record user-module fns only (main module, plus user-module
+        // monomorphizations — their decl_line points into the user
+        // source file). Imported-module fns are skipped so their line
+        // numbers don't get misattributed to the user's source.
+        let is_user_fn = !is_imported;
+        if is_user_fn {
+            if let Some(compiled) = ctx.compiled_code() {
+                let size = compiled.code_buffer().len() as u32;
+                if f.span.line > 0 {
+                    self.dwarf.record_function(&f.name, func_id, size, f.span.line);
+                }
+            }
+        }
 
         Ok(())
     }

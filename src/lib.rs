@@ -4,6 +4,7 @@
 //! See `docs/design.md` and `docs/grammar.ebnf`.
 
 pub mod ast;
+pub mod dwarf;
 pub mod lexer;
 pub mod native;
 pub mod parser;
