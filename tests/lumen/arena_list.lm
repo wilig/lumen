@@ -1,0 +1,62 @@
+// Arena phase 2 (lumen-4jg): list, map, string, and strbuf
+// allocations inside an arena block come from the arena's bump
+// region, not libc malloc. The whole region is reclaimed at block
+// exit regardless of how many individual collections were built.
+import std/test
+import std/list
+import std/map
+
+fn build_int_list(n: i32): i32 {
+    var acc: i32 = 0
+    arena {
+        var xs: List<i32> = list.new()
+        for i in range(0, n) {
+            xs = list.push(xs, i)
+        }
+        // Use the list inside the arena so we actually exercise it.
+        for i in range(0, list.len(xs)) {
+            acc = acc + list.get(xs, i)
+        }
+    }
+    return acc
+}
+
+fn build_string_map(n: i32): i32 {
+    var total_len: i32 = 0
+    arena {
+        var m: Map<string, i32> = map.new()
+        for i in range(0, n) {
+            // Each iteration builds a fresh interpolated key string
+            // AND a fresh list of chars — all arena-allocated.
+            let k: string = "key-${i}"
+            m = map.set(m, k, i)
+        }
+        let ks = map.keys(m)
+        for i in range(0, list.len(ks)) {
+            let s: string = list.get(ks, i)
+            total_len = total_len + string_len(s)
+        }
+    }
+    return total_len
+}
+
+fn main(): i32 io {
+    // 1024 pushes exercise 7 list growth realloc cycles (8 → 16 → ...
+    // → 1024). Arena realloc = alloc-fresh + memcpy, leaving older
+    // buffers to be reclaimed at arena close.
+    test.eq(build_int_list(1024), 1024 * 1023 / 2, "arena: list sum")
+
+    // Each iteration interpolates a new key. With phase-2, the key
+    // and the map's entry table all live in the arena.
+    //   key-0..key-9  → 5 chars each  (10 keys × 5 = 50)
+    //   key-10..key-99 → 6 chars each  (90 × 6 = 540)
+    // Total for n=100: 590.
+    test.eq(build_string_map(100), 590, "arena: map + string keys")
+
+    // Running the same workload twice shows the arena can be
+    // opened/closed repeatedly without leaking (valgrind would catch
+    // it; a simple repeat at least proves no crash/corruption).
+    test.eq(build_int_list(256), 256 * 255 / 2, "arena: second run")
+
+    return test.summary()
+}

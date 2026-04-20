@@ -143,6 +143,24 @@ int64_t lumen_rc_alloc(int64_t size) {
     return (int64_t)(uintptr_t)payload;
 }
 
+// Resize a payload: for the default allocator this is a real libc
+// realloc (preserves the rc header). For the arena, we allocate a
+// fresh block and memcpy — the old block stays in the arena until
+// reset/free. Used by list/map grow paths so the whole data structure
+// lives in whatever allocator was active when it was created.
+static void *lumen_realloc_raw(void *old_payload, int64_t old_size, int64_t new_size) {
+    if (current_allocator == &rc_malloc_allocator) {
+        char *old_raw = (char *)old_payload - 8;
+        char *new_raw = (char *)realloc(old_raw, 8 + (size_t)new_size);
+        if (!new_raw) { fprintf(stderr, "FATAL: realloc oom (size=%lld)\n", (long long)new_size); abort(); }
+        return new_raw + 8;
+    }
+    void *new_payload = current_allocator->alloc(current_allocator->state, new_size);
+    int64_t copy = old_size < new_size ? old_size : new_size;
+    if (copy > 0) memcpy(new_payload, old_payload, (size_t)copy);
+    return new_payload;
+}
+
 // --- Message queue -------------------------------------------------------
 
 typedef struct {
@@ -231,15 +249,12 @@ void lumen_rt_yield(void) {
 // --- TCP socket operations ------------------------------------------------
 
 // Allocate a Lumen bytes value: [rc:i32=1 | magic:i32=0x4C554D45 | len:i32 | data...]
-// Returns pointer to the payload (len field), same as lumen_rc_alloc would.
+// Returns pointer to the payload (len field). Routes through the
+// current allocator so bytes created inside an arena live in the arena.
 static char *alloc_bytes(int32_t len) {
-    // Total: 8 (rc header) + 4 (len) + len (data)
-    char *raw = (char *)malloc(8 + 4 + len);
-    if (!raw) return NULL;
-    *(int32_t *)(raw + 0) = 1;            // refcount
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic "LUME"
-    char *payload = raw + 8;
-    *(int32_t *)(payload) = len;           // bytes length
+    char *payload = (char *)current_allocator->alloc(
+        current_allocator->state, (int64_t)(4 + len));
+    *(int32_t *)(payload) = len;
     return payload;
 }
 
@@ -560,10 +575,8 @@ typedef struct {
 int64_t lumen_list_new(int32_t elem_size) {
     int32_t initial_cap = 8;
     int32_t total = sizeof(ListHeader) + elem_size * initial_cap;
-    char *raw = (char *)malloc(8 + total);
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
-    ListHeader *hdr = (ListHeader *)(raw + 8);
+    ListHeader *hdr = (ListHeader *)current_allocator->alloc(
+        current_allocator->state, (int64_t)total);
     hdr->len = 0;
     hdr->cap = initial_cap;
     hdr->elem_size = elem_size;
@@ -585,16 +598,11 @@ static int64_t list_ensure_cap(int64_t list_ptr) {
         fprintf(stderr, "FATAL: list capacity overflow (cap=%d)\n", hdr->cap);
         abort();
     }
-    int32_t new_cap = hdr->cap * 2;
-    int32_t total = (int32_t)sizeof(ListHeader) + hdr->elem_size * new_cap;
-    // realloc the entire block (including rc header).
-    char *raw = (char *)hdr - 8;
-    raw = realloc(raw, 8 + total);
-    if (!raw) {
-        fprintf(stderr, "FATAL: list realloc failed (size=%d)\n", 8 + total);
-        abort();
-    }
-    hdr = (ListHeader *)(raw + 8);
+    int32_t old_cap = hdr->cap;
+    int32_t new_cap = old_cap * 2;
+    int32_t old_total = (int32_t)sizeof(ListHeader) + hdr->elem_size * old_cap;
+    int32_t new_total = (int32_t)sizeof(ListHeader) + hdr->elem_size * new_cap;
+    hdr = (ListHeader *)lumen_realloc_raw(hdr, old_total, new_total);
     hdr->cap = new_cap;
     return (int64_t)(uintptr_t)hdr;
 }
@@ -906,10 +914,8 @@ int64_t lumen_itoa(int32_t n) {
     if (neg) tmp[pos++] = '-';
     // Reverse into a Lumen string.
     int32_t len = pos;
-    char *raw = (char *)malloc(8 + 4 + len);
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
-    char *payload = raw + 8;
+    char *payload = (char *)current_allocator->alloc(
+        current_allocator->state, (int64_t)(4 + len));
     *(int32_t *)payload = len;
     for (int i = 0; i < len; i++) {
         payload[4 + i] = tmp[len - 1 - i];
@@ -924,10 +930,8 @@ int64_t lumen_concat(int64_t a_ptr, int64_t b_ptr) {
     int32_t a_len = a ? *(int32_t *)a : 0;
     int32_t b_len = b ? *(int32_t *)b : 0;
     int32_t total = a_len + b_len;
-    char *raw = (char *)malloc(8 + 4 + total);
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
-    char *payload = raw + 8;
+    char *payload = (char *)current_allocator->alloc(
+        current_allocator->state, (int64_t)(4 + total));
     *(int32_t *)payload = total;
     if (a_len > 0) memcpy(payload + 4, a + 4, a_len);
     if (b_len > 0) memcpy(payload + 4 + a_len, b + 4, b_len);
@@ -1101,10 +1105,8 @@ void lumen_strbuf_bool(void *buf, int32_t v) {
 int64_t lumen_strbuf_finish(void *buf) {
     LumenStrBuf *b = (LumenStrBuf *)buf;
     int32_t total = b->len;
-    char *raw = (char *)malloc(8 + 4 + total);
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
-    char *payload = raw + 8;
+    char *payload = (char *)current_allocator->alloc(
+        current_allocator->state, (int64_t)(4 + total));
     *(int32_t *)payload = total;
     if (total > 0) memcpy(payload + 4, b->data, total);
     free(b->data);
@@ -1184,17 +1186,15 @@ int64_t lumen_fs_read(int64_t path_ptr) {
     if (size < 0) { lumen_last_fs_errno = errno; fclose(f); return 0; }
     rewind(f);
 
-    char *raw = (char *)malloc(8 + 4 + (size_t)size);
-    if (!raw) { lumen_last_fs_errno = ENOMEM; fclose(f); return 0; }
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic "LUME"
-    char *payload = raw + 8;
+    char *payload = (char *)current_allocator->alloc(
+        current_allocator->state, (int64_t)(4 + (size_t)size));
     *(int32_t *)payload = (int32_t)size;
     if (size > 0) {
         size_t got = fread(payload + 4, 1, (size_t)size, f);
         if (got != (size_t)size) {
             int e = ferror(f) ? errno : EIO;
-            free(raw);
+            // Leak the partial allocation — on malloc-backed it's a
+            // real leak, on arena it's reclaimed at arena close.
             fclose(f);
             lumen_last_fs_errno = e ? e : EIO;
             return 0;
@@ -1339,10 +1339,8 @@ int64_t lumen_map_new(int32_t key_is_ptr) {
     size_t total = sizeof(LumenMapHeader)
                  + (size_t)entry_cap * sizeof(LumenMapEntry)
                  + (size_t)index_cap * sizeof(int32_t);
-    char *raw = (char *)malloc(8 + total);
-    *(int32_t *)(raw + 0) = 1;            // rc
-    *(int32_t *)(raw + 4) = 0x4C554D45;   // magic
-    LumenMapHeader *hdr = (LumenMapHeader *)(raw + 8);
+    LumenMapHeader *hdr = (LumenMapHeader *)current_allocator->alloc(
+        current_allocator->state, (int64_t)total);
     hdr->live_count = 0;
     hdr->entry_count = 0;
     hdr->entry_cap = entry_cap;
@@ -1360,16 +1358,13 @@ int64_t lumen_map_new(int32_t key_is_ptr) {
 // and rebuild the index from scratch.
 static int64_t lumen_map_grow(int64_t map_ptr, int32_t new_entry_cap, int32_t new_index_cap) {
     LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
+    size_t old_total = sizeof(LumenMapHeader)
+                     + (size_t)hdr->entry_cap * sizeof(LumenMapEntry)
+                     + (size_t)hdr->index_cap * sizeof(int32_t);
     size_t new_total = sizeof(LumenMapHeader)
                      + (size_t)new_entry_cap * sizeof(LumenMapEntry)
                      + (size_t)new_index_cap * sizeof(int32_t);
-    char *raw = (char *)hdr - 8;
-    raw = realloc(raw, 8 + new_total);
-    if (!raw) {
-        fprintf(stderr, "FATAL: map realloc failed\n");
-        abort();
-    }
-    hdr = (LumenMapHeader *)(raw + 8);
+    hdr = (LumenMapHeader *)lumen_realloc_raw(hdr, (int64_t)old_total, (int64_t)new_total);
     int32_t old_entry_count = hdr->entry_count;
     hdr->entry_cap = new_entry_cap;
     hdr->index_cap = new_index_cap;
