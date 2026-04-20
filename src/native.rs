@@ -837,6 +837,7 @@ impl<'a> NativeCodegen<'a> {
                 ret: ret_ty,
                 effect: ast::Effect::Pure,
                 type_params: Vec::new(),
+                is_extern: false,
             };
             let synthetic = FnDecl {
                 name: lam_name.clone(),
@@ -2164,6 +2165,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         if sig.type_params.is_empty() {
             return None;
         }
+        // Generic externs share one C symbol across T instantiations
+        // — there's no body to specialize. The compile_call extern
+        // branch handles the widen/narrow at the boundary.
+        if sig.is_extern {
+            return None;
+        }
 
         // If the type checker resolved the type args from context (args
         // + expected return), use those directly. Otherwise infer from
@@ -2217,6 +2224,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             ret: subbed_ret,
             effect: sig.effect,
             type_params: Vec::new(),
+            is_extern: sig.is_extern,
         };
 
         if !self.cg.monomorph_done.contains(&mangled) {
@@ -2284,6 +2292,32 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             let dbg = self.builder.ins().iconst(cl_types::I32, if self.cg.debug_mode { 1 } else { 0 });
             let func_ref = self.cg.obj.declare_func_in_func(self.cg.helper_assert, self.builder.func);
             self.builder.ins().call(func_ref, &[cond, msg, file_ptr, line, col, dbg]);
+            return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+        }
+
+        // __rc_incr<T>(v) / __rc_decr<T>(v): compile-time-conditional
+        // rc adjustment. Inside a generic fn body, T can be Ty::Generic;
+        // active_subs resolves it at monomorphization. If T is scalar
+        // (or resolves to scalar), the call compiles to nothing.
+        // Needed so pure-Lumen stdlib wrappers over raw externs can
+        // manage ref counts without a runtime "is it a ptr" probe.
+        if name == "__rc_incr" || name == "__rc_decr" {
+            if let Some(arg) = args.first() {
+                let arg_ty = self.infer_ty(&arg.value)?;
+                let resolved = substitute_ty(arg_ty, &self.active_subs);
+                if !is_scalar(&resolved) {
+                    let val = self.compile_expr(&arg.value)?;
+                    if name == "__rc_incr" {
+                        self.emit_rc_incr(val);
+                    } else {
+                        self.emit_rc_decr_typed(val, &resolved);
+                    }
+                } else {
+                    // Still evaluate the arg for any side effects,
+                    // then discard. Scalars are free.
+                    let _ = self.compile_expr(&arg.value)?;
+                }
+            }
             return Ok(self.builder.ins().iconst(cl_types::I32, 0));
         }
 
@@ -2370,7 +2404,23 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         // type-args the type checker resolved from context (for arg-less
         // generic calls like `nothing<T>(): Maybe<T>`).
         let type_args_override = self.cg.info.call_resolutions.get(&span.start).cloned();
-        let (effective_name, effective_sig) =
+        // Intra-module unqualified call to a generic fn declared in
+        // the current imported module (e.g. `push(out, v)` inside
+        // std/list's own `map`). monomorphize_if_generic only looks
+        // in info.fns; check the current module's generic fns first.
+        let module_generic = self.current_module.as_ref().and_then(|m| {
+            self.cg.info.modules.get(m).and_then(|sigs| {
+                sigs.get(&name).filter(|s| !s.type_params.is_empty()).cloned()
+            }).map(|_| m.clone())
+        });
+        let (effective_name, effective_sig) = if let Some(m) = module_generic {
+            match self.monomorphize_module_method_if_generic(
+                &m, &name, &arg_tys, type_args_override.clone(),
+            ) {
+                Some(pair) => (pair.0, Some(pair.1)),
+                None => (name.clone(), None),
+            }
+        } else {
             match self.monomorphize_if_generic(&name, &arg_tys, type_args_override) {
                 Some(pair) => (pair.0, Some(pair.1)),
                 None => {
@@ -2387,7 +2437,8 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                         .or_else(|| self.cg.info.fns.get(&name).cloned());
                     (name.clone(), sig)
                 }
-            };
+            }
+        };
 
         // Inside a module body, unqualified calls resolve via the
         // module's local_fn_ids first (avoids global-fn_ids collisions
@@ -2408,6 +2459,36 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             .cg
             .obj
             .declare_func_in_func(*func_id, self.builder.func);
+
+        // Extern callee: widen narrow scalars to the I64-shaped ABI
+        // slots (especially for generic externs where T-typed params
+        // are registered as I64 but the call site may pass I32/Char).
+        // Narrow the return similarly.
+        if let Some(sig) = effective_sig.as_ref() {
+            if sig.is_extern {
+                let subs = self.current_call_subs(&name, span);
+                let mut widened = Vec::with_capacity(arg_vals.len());
+                for (i, val) in arg_vals.iter().enumerate() {
+                    if let Some((_, param_ty)) = sig.params.get(i) {
+                        let declared = substitute_ty(param_ty.clone(), &subs);
+                        let arg_ty = &arg_tys[i];
+                        let w = self.convert_for_call(*val, arg_ty, &declared);
+                        let w = self.convert_for_call(w, &declared, param_ty);
+                        widened.push(w);
+                    } else {
+                        widened.push(*val);
+                    }
+                }
+                let call = self.builder.ins().call(func_ref, &widened);
+                let results = self.builder.inst_results(call);
+                if results.is_empty() {
+                    return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+                }
+                let result = results[0];
+                let declared_ret = substitute_ty(sig.ret.clone(), &subs);
+                return Ok(self.convert_for_call(result, &sig.ret, &declared_ret));
+            }
+        }
 
         // rc_incr each pointer argument so the callee's scope-exit
         // decr doesn't free values the caller still holds.
@@ -2430,15 +2511,39 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         }
     }
 
+    /// Build the T-substitution map for a call expression: from the
+    /// typechecker's recorded call_resolutions[span] plus the current
+    /// monomorphization's active_subs. Empty when the call isn't
+    /// generic or has no resolution.
+    fn current_call_subs(&self, name: &str, span: Span) -> HashMap<String, Ty> {
+        let mut subs = HashMap::new();
+        if let Some(type_args) = self.cg.info.call_resolutions.get(&span.start) {
+            // Resolve type params from whichever source the name
+            // lives under. For user-module fns it's info.fns; for
+            // imported modules (when this is called via method-call
+            // dispatch it's already handled separately).
+            let sig = self.cg.info.fns.get(name).cloned().or_else(|| {
+                self.current_module
+                    .as_ref()
+                    .and_then(|m| self.cg.info.modules.get(m))
+                    .and_then(|m| m.get(name))
+                    .cloned()
+            });
+            if let Some(sig) = sig {
+                for (tp, ty) in sig.type_params.iter().zip(type_args.iter()) {
+                    let resolved = substitute_ty(ty.clone(), &self.active_subs);
+                    subs.insert(tp.clone(), resolved);
+                }
+            }
+        }
+        subs
+    }
+
     // --- Method call helpers ------------------------------------------------
 
     /// Compile args, call a builtin FuncId, return the result.
     fn call_builtin(&mut self, func_id: FuncId, args: &[ast::Arg]) -> Result<Value, NativeError> {
-        let mut vals = Vec::new();
-        for a in args { vals.push(self.compile_expr(&a.value)?); }
-        let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
-        let call = self.builder.ins().call(func_ref, &vals);
-        Ok(self.builder.inst_results(call)[0])
+        self.call_builtin_typed(func_id, args, None)
     }
 
     /// Compile args, call a void builtin FuncId, return unit (i32 0).
@@ -2448,6 +2553,90 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
         self.builder.ins().call(func_ref, &vals);
         Ok(self.builder.ins().iconst(cl_types::I32, 0))
+    }
+
+    /// Like call_builtin but with Lumen-sig-aware argument widening.
+    /// When an arg's Cranelift type is narrower than the declared
+    /// param type (say Lumen i32 passed to an i64 slot on a generic
+    /// extern), inserts sextend / ireduce / bitcast so the Cranelift
+    /// sig match is satisfied. Lets generic externs take 8-byte slots
+    /// at the C ABI while callers pass their natural-width Lumen
+    /// types. The return value is narrowed per `ret_expected` if
+    /// provided (for generic extern calls where the monomorphized
+    /// return type is narrower than the registered I64 slot).
+    fn call_builtin_typed(
+        &mut self,
+        func_id: FuncId,
+        args: &[ast::Arg],
+        sig: Option<&crate::types::FnSig>,
+    ) -> Result<Value, NativeError> {
+        self.call_builtin_typed_sub(func_id, args, sig, &HashMap::new())
+    }
+
+    fn call_builtin_typed_sub(
+        &mut self,
+        func_id: FuncId,
+        args: &[ast::Arg],
+        sig: Option<&crate::types::FnSig>,
+        subs: &HashMap<String, Ty>,
+    ) -> Result<Value, NativeError> {
+        let mut vals = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let val = self.compile_expr(&a.value)?;
+            let val = if let Some(s) = sig {
+                if let Some((_, param_ty)) = s.params.get(i) {
+                    let declared = substitute_ty(param_ty.clone(), subs);
+                    // The registered Cranelift sig used the ORIGINAL
+                    // param type via lumen_to_cl (so Generic → I64).
+                    // We need to widen the arg from the declared-post-sub
+                    // Cranelift type to that original-registered type.
+                    let arg_ty = self.infer_ty(&a.value)?;
+                    let widened = self.convert_for_call(val, &arg_ty, &declared);
+                    // Further widen from declared-post-sub to registered-pre-sub.
+                    self.convert_for_call(widened, &declared, param_ty)
+                } else { val }
+            } else { val };
+            vals.push(val);
+        }
+        let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &vals);
+        let result = self.builder.inst_results(call)[0];
+        if let Some(s) = sig {
+            let declared_ret = substitute_ty(s.ret.clone(), subs);
+            // Narrow return from registered-pre-sub CL type down to
+            // declared-post-sub CL type if narrower (generic T
+            // monomorphized to i32/char/etc.).
+            Ok(self.convert_for_call(result, &s.ret, &declared_ret))
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Convert a compiled value between two Lumen types that share a
+    /// Cranelift representation mismatch (scalar widening / narrowing
+    /// at FFI boundary). Returns the original value untouched when no
+    /// conversion is needed.
+    fn convert_for_call(&mut self, val: Value, from: &Ty, to: &Ty) -> Value {
+        let from_cl = lumen_to_cl(from);
+        let to_cl = lumen_to_cl(to);
+        if from_cl == to_cl {
+            return val;
+        }
+        match (from_cl, to_cl) {
+            (a, b) if a == cl_types::I32 && b == cl_types::I64 => {
+                self.builder.ins().sextend(cl_types::I64, val)
+            }
+            (a, b) if a == cl_types::I64 && b == cl_types::I32 => {
+                self.builder.ins().ireduce(cl_types::I32, val)
+            }
+            (a, b) if a == cl_types::F64 && b == cl_types::I64 => {
+                self.builder.ins().bitcast(cl_types::I64, MemFlags::new(), val)
+            }
+            (a, b) if a == cl_types::I64 && b == cl_types::F64 => {
+                self.builder.ins().bitcast(cl_types::F64, MemFlags::new(), val)
+            }
+            _ => val,
+        }
     }
 
     /// Look up a module function's FuncId by its C link name.
@@ -2961,8 +3150,29 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 .and_then(|m| m.get(method))
             {
                 if let Some(&func_id) = self.cg.module_fn_ids.get(link_name.as_str()) {
-                    return if is_void { self.call_builtin_void(func_id, args) }
-                           else { self.call_builtin(func_id, args) };
+                    let sig = self.cg.info.modules
+                        .get(mod_name.as_str())
+                        .and_then(|m| m.get(method))
+                        .cloned();
+                    // Generic externs: look up the typechecker's
+                    // resolved T-args for this call site (if any) so
+                    // the return-side narrowing knows its target.
+                    let mut subs = HashMap::new();
+                    if let Some(sig_ref) = &sig {
+                        if !sig_ref.type_params.is_empty() {
+                            if let Some(type_args) = self.cg.info.call_resolutions.get(&span.start) {
+                                for (tp, ty) in sig_ref.type_params.iter().zip(type_args.iter()) {
+                                    let resolved = substitute_ty(ty.clone(), &self.active_subs);
+                                    subs.insert(tp.clone(), resolved);
+                                }
+                            }
+                        }
+                    }
+                    return if is_void {
+                        self.call_builtin_void(func_id, args)
+                    } else {
+                        self.call_builtin_typed_sub(func_id, args, sig.as_ref(), &subs)
+                    };
                 }
             }
             // Generic Lumen fn in an imported module: monomorphize per

@@ -78,10 +78,16 @@ pub struct MsgHandlerDecl {
 /// `extern fn sqrt(x: f64): f64 link "lumen_sqrt"`
 /// Declares an external C-ABI function resolved by the linker.
 /// If `link_name` is set, that symbol is used for linking instead of `name`.
+/// `type_params` allows phantom generics on externs: the C symbol is one
+/// function, but the Lumen-facing signature can be parameterized so
+/// wrappers in std/list etc. can receive T-typed values/returns instead
+/// of opaque i64. Widening/narrowing is inserted by the codegen at the
+/// call boundary.
 #[derive(Debug, Clone)]
 pub struct ExternFnDecl {
     pub name: String,
     pub name_span: Span,
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub return_type: Type,
     /// Optional C symbol name: `link "lumen_sqrt"`.

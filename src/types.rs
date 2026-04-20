@@ -253,6 +253,11 @@ pub struct FnSig {
     /// Names appearing in `params`/`ret` as `Ty::Generic(name)` reference
     /// these. At each call site the codegen substitutes concrete types.
     pub type_params: Vec<String>,
+    /// True for extern fns (FFI boundary). Generic externs share a
+    /// single C symbol across T instantiations — the codegen inserts
+    /// scalar widening/narrowing at call boundaries rather than
+    /// monomorphizing the body (there is no body).
+    pub is_extern: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,16 +294,16 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         for item in &imp.module.items {
             if let Item::ExternFn(ef) = item {
                 let params: Vec<(String, Ty)> = ef.params.iter().filter_map(|p| {
-                    resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
+                    resolve_type_with_params(&p.ty, &info.types, &ef.type_params).ok().map(|t| (p.name.clone(), t))
                 }).collect();
-                let ret = resolve_type(&ef.return_type, &info.types).unwrap_or(Ty::Error);
+                let ret = resolve_type_with_params(&ef.return_type, &info.types, &ef.type_params).unwrap_or(Ty::Error);
                 // io and net modules have io effect.
                 let effect = if imp.name == "io" || imp.name == "net" {
                     Effect::Io
                 } else {
                     Effect::Pure
                 };
-                let sig = FnSig { params, ret, effect, type_params: Vec::new() };
+                let sig = FnSig { params, ret, effect, type_params: ef.type_params.clone(), is_extern: true };
                 if let Some(link) = &ef.link_name {
                     mod_links.insert(ef.name.clone(), link.clone());
                 } else {
@@ -311,7 +316,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     resolve_type_with_params(&p.ty, &info.types, &f.type_params).ok().map(|t| (p.name.clone(), t))
                 }).collect();
                 let ret = resolve_type_with_params(&f.return_type, &info.types, &f.type_params).unwrap_or(Ty::Error);
-                let sig = FnSig { params, ret, effect: f.effect, type_params: f.type_params.clone() };
+                let sig = FnSig { params, ret, effect: f.effect, type_params: f.type_params.clone(), is_extern: false };
                 mod_fns.insert(f.name.clone(), sig);
             }
         }
@@ -483,7 +488,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params: fn_params,
                     ret: ret.clone(),
                     effect: Effect::Pure,
-                    type_params: Vec::new(),
+                    type_params: Vec::new(), is_extern: false,
                 },
             );
             if let Some(msgs) = info.actors.get_mut(&mh.actor_name) {
@@ -526,7 +531,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params,
                     ret,
                     effect: f.effect,
-                    type_params: f.type_params.clone(),
+                    type_params: f.type_params.clone(), is_extern: false,
                 },
             );
         }
@@ -544,12 +549,12 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             }
             let mut params = Vec::new();
             for p in &ef.params {
-                match resolve_type(&p.ty, &info.types) {
+                match resolve_type_with_params(&p.ty, &info.types, &ef.type_params) {
                     Ok(t) => params.push((p.name.clone(), t)),
                     Err(e) => errors.push(e),
                 }
             }
-            let ret = match resolve_type(&ef.return_type, &info.types) {
+            let ret = match resolve_type_with_params(&ef.return_type, &info.types, &ef.type_params) {
                 Ok(t) => t,
                 Err(e) => {
                     errors.push(e);
@@ -562,7 +567,8 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
                     params,
                     ret,
                     effect: Effect::Io,
-                    type_params: Vec::new(),
+                    type_params: ef.type_params.clone(),
+                    is_extern: true,
                 },
             );
         }
@@ -2195,6 +2201,17 @@ impl<'a> FnChecker<'a> {
                 "range" => return self.check_range_call(args, whole_span),
                 "string_len" => return self.check_string_len_call(args, whole_span),
                 "assert" => return self.check_assert_call(args, whole_span),
+                "__rc_incr" | "__rc_decr" => {
+                    if args.len() != 1 {
+                        self.errors.push(TypeError {
+                            span: whole_span,
+                            message: format!("`{name}` expects 1 argument, found {}", args.len()),
+                        });
+                    } else {
+                        self.infer_expr(&args[0].value);
+                    }
+                    return Ty::Unit;
+                }
                 _ => {}
             }
 
@@ -2204,6 +2221,7 @@ impl<'a> FnChecker<'a> {
                 ret: s.ret.clone(),
                 effect: s.effect,
                 type_params: s.type_params.clone(),
+                is_extern: s.is_extern,
             }) {
                 self.check_effect(sig.effect, whole_span);
                 if !sig.type_params.is_empty() {

@@ -1,0 +1,51 @@
+// Generic externs, FFI auto-widening, and __rc_incr<T> / __rc_decr<T>
+// primitives. These are the building blocks for moving stdlib wrappers
+// (list, map) to pure Lumen — user code can already use them to write
+// type-safe C FFI wrappers without reinterpreting i64 slots manually.
+import std/test
+
+// The same C symbols lumen_list_* back these — one C function per
+// symbol, monomorphization happens only in the Lumen type system.
+extern fn _list_new(elem_size: i32): i64 link "lumen_list_new"
+extern fn _list_push<T>(l: i64, v: T): i64 link "lumen_list_push"
+extern fn _list_get<T>(l: i64, i: i32): T link "lumen_list_get"
+extern fn _list_len(l: i64): i32 link "lumen_list_len"
+
+fn main(): i32 io {
+    var xs: i64 = _list_new(8)
+
+    // i32 values: auto-widened to i64 at the FFI boundary.
+    xs = _list_push(xs, 10)
+    xs = _list_push(xs, 20)
+    xs = _list_push(xs, 30)
+    test.eq(_list_len(xs), 3, "len after 3 pushes")
+
+    // Return value auto-narrowed from i64 to i32.
+    let a: i32 = _list_get(xs, 0)
+    let b: i32 = _list_get(xs, 2)
+    test.eq(a, 10, "get[0] i32")
+    test.eq(b, 30, "get[2] i32")
+
+    // String T: pointer-shaped, no widen needed.
+    var ss: i64 = _list_new(8)
+    ss = _list_push(ss, "hi")
+    ss = _list_push(ss, "there")
+    let s0: string = _list_get(ss, 0)
+    let s1: string = _list_get(ss, 1)
+    test.eq(s0, "hi", "get[0] string")
+    test.eq(s1, "there", "get[1] string")
+
+    // __rc_incr<T> / __rc_decr<T> are no-ops on scalars, call the
+    // real rc helpers for pointer types. Just confirm they compile
+    // and don't crash on either shape.
+    let n: i32 = 42
+    __rc_incr(n)
+    __rc_decr(n)
+    let p: string = "shared"
+    __rc_incr(p)
+    __rc_decr(p)
+    test.eq(n, 42, "rc ops on scalar are no-ops")
+    test.eq(p, "shared", "rc ops on pointer preserve value")
+
+    return test.summary()
+}

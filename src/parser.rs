@@ -323,6 +323,24 @@ impl Parser {
         self.expect(&TokenKind::Fn, "`fn` after `extern`")?;
         let (name, name_span) = self.expect_ident("extern function name")?;
 
+        // Optional generic type parameters: extern fn foo<T>(...). The
+        // type params are phantom — one C symbol is shared across all
+        // monomorphizations. The codegen inserts i32↔i64 widening at
+        // the call boundary when T's natural Cranelift type doesn't
+        // match the i64-shaped slot the C ABI actually uses.
+        let mut type_params = Vec::new();
+        if matches!(self.peek_kind(), TokenKind::Lt) {
+            self.bump();
+            loop {
+                let (tp, _) = self.expect_ident("type parameter name")?;
+                type_params.push(tp);
+                if self.eat(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Gt, "`>` to close type parameters")?;
+        }
+
         self.expect(&TokenKind::LParen, "`(` after function name")?;
         let mut params = Vec::new();
         if !matches!(self.peek_kind(), TokenKind::RParen) {
@@ -357,6 +375,7 @@ impl Parser {
         Ok(ExternFnDecl {
             name,
             name_span,
+            type_params,
             params,
             return_type,
             link_name,
