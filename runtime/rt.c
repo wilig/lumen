@@ -946,20 +946,45 @@ int64_t lumen_concat(int64_t a_ptr, int64_t b_ptr) {
 // since it's defined in the Cranelift-generated object.
 extern char *lumen_frame_chain;
 
+// Print a backtrace via libc's backtrace() + backtrace_symbols_fd().
+// Walks the DWARF .eh_frame we emit by default, so function names
+// from .symtab show up without requiring --debug. Addresses can be
+// fed through `addr2line -e <binary>` to get file:line locations
+// from the .debug_line table.
+#include <execinfo.h>
+static void lumen_print_backtrace(void) {
+    void *buf[64];
+    int n = backtrace(buf, 64);
+    if (n > 0) {
+        backtrace_symbols_fd(buf, n, 2);  // stderr
+    }
+}
+
 static void lumen_crash_handler(int sig) {
     const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGABRT ? "SIGABRT" : "signal";
     fprintf(stderr, "\n--- CRASH: %s ---\nStack trace:\n", name);
-    // Use the debug stack (array-based, set by lumen_debug_push/pop).
+    lumen_print_backtrace();
+    // If --debug mode is on, also dump the push/pop message stack
+    // for human-readable context (annotated with file:col).
     void lumen_debug_print_stack(void);
     lumen_debug_print_stack();
     fprintf(stderr, "---\n");
     _exit(128 + sig);
 }
 
-// Called at program start in --debug mode to install the crash handler.
-void lumen_debug_init(void) {
+// Install the default crash handler at program start — runs via the
+// ELF .init_array before main, so any SIGSEGV/SIGABRT in user code
+// gets an eh_frame-backed backtrace even without --debug.
+__attribute__((constructor))
+static void lumen_install_default_crash_handler(void) {
     signal(SIGSEGV, lumen_crash_handler);
     signal(SIGABRT, lumen_crash_handler);
+}
+
+// --debug mode keeps lumen_debug_init as a no-op shim for backwards
+// compat — the default installer above already wired things up.
+void lumen_debug_init(void) {
+    // No-op: the constructor above handles this.
 }
 
 // Debug frame stack: fixed-size array of message pointers.
@@ -1139,8 +1164,13 @@ void lumen_assert(int32_t cond, int64_t msg_ptr, int64_t file_ptr,
         fwrite(msg + 4, 1, msg_len, stderr);
     }
     fprintf(stderr, "\n");
+    // Always emit a backtrace on assert — libc's backtrace() uses
+    // the .eh_frame we emit by default, giving function names +
+    // addresses even without --debug. --debug adds the annotated
+    // push/pop message stack on top.
+    fprintf(stderr, "Stack trace:\n");
+    lumen_print_backtrace();
     if (debug_mode) {
-        fprintf(stderr, "Stack trace:\n");
         lumen_debug_print_stack();
     }
     abort();
