@@ -1435,6 +1435,10 @@ impl<'a> NativeCodegen<'a> {
 
         let mut ctx = self.obj.make_context();
         ctx.func.signature = cl_sig;
+        // Opt into value-label tracking so set_val_label actually
+        // stores assignments; without this, collect_debug_info's
+        // pre-allocated map is None and set_val_label silently drops.
+        ctx.func.collect_debug_info();
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
 
@@ -1445,6 +1449,10 @@ impl<'a> NativeCodegen<'a> {
 
         // Capture before current_module is moved into the FnEmitter.
         let current_module_name: Option<String> = current_module.clone();
+        // Populated inside the FnEmitter scope (via std::mem::take) so
+        // we can consult them after the function has been compiled.
+        let mut captured_binding_labels: Vec<(String, u32)> = Vec::new();
+        let mut captured_name_types: HashMap<String, Ty> = HashMap::new();
 
         {
             let mut fb = FnEmitter::new(self, &mut builder, sig, &f.name);
@@ -1458,6 +1466,10 @@ impl<'a> NativeCodegen<'a> {
                 let var = fb.fresh_var(lumen_to_cl(pty));
                 let val = fb.builder.block_params(entry)[i];
                 fb.builder.def_var(var, val);
+                // Tag the incoming value so cranelift tracks it
+                // across register allocation / stack spills. The
+                // harvested ranges become DW_AT_location entries.
+                fb.attach_label(pname, val);
                 fb.names.insert(pname.clone(), var);
                 fb.name_types.insert(pname.clone(), pty.clone());
             }
@@ -1538,6 +1550,10 @@ impl<'a> NativeCodegen<'a> {
                     fb.builder.ins().return_(&[result]);
                 }
             }
+            // Capture the label→name map plus the per-binding type
+            // so we can harvest value_labels_ranges after compile.
+            captured_binding_labels = std::mem::take(&mut fb.binding_labels);
+            captured_name_types = std::mem::take(&mut fb.name_types);
         } // fb dropped here, releasing the mutable borrow on builder
 
         builder.seal_all_blocks();
@@ -1568,14 +1584,38 @@ impl<'a> NativeCodegen<'a> {
                     last = Some((line, col));
                     rows.push(crate::dwarf::LineRow { offset: sl.start, line, col });
                 }
-                let params: Vec<crate::dwarf::Param> = sig.params.iter()
-                    .map(|(n, ty)| crate::dwarf::Param {
-                        name: n.clone(),
-                        ty: ty_to_dwarf(ty, self.info),
-                    })
-                    .collect();
+                // Build a label → ranges lookup from cranelift's
+                // value_labels_ranges for this function.
+                let label_ranges = &compiled.value_labels_ranges;
+                let param_names: std::collections::HashSet<String> = sig.params.iter()
+                    .map(|(n, _)| n.clone()).collect();
+                // Parameters, with location ranges when cranelift
+                // tracked them (falls back to ABI-based single-reg
+                // location on the DWARF side if empty).
+                let mut params: Vec<crate::dwarf::Param> = Vec::with_capacity(sig.params.len());
+                for (pname, pty) in &sig.params {
+                    let locs = lookup_binding_locations(&captured_binding_labels, pname, label_ranges);
+                    params.push(crate::dwarf::Param {
+                        name: pname.clone(),
+                        ty: ty_to_dwarf(pty, self.info),
+                        locations: locs,
+                    });
+                }
                 let ret = ty_to_dwarf(&sig.ret, self.info);
-                self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index, params, ret);
+                // Locals: every non-param binding collected in the
+                // FnEmitter gets a DW_TAG_variable entry.
+                let mut locals: Vec<crate::dwarf::Local> = Vec::new();
+                for (bname, _label_id) in &captured_binding_labels {
+                    if param_names.contains(bname) { continue; }
+                    let ty = captured_name_types.get(bname).cloned().unwrap_or(Ty::I32);
+                    let locs = lookup_binding_locations(&captured_binding_labels, bname, label_ranges);
+                    locals.push(crate::dwarf::Local {
+                        name: bname.clone(),
+                        ty: ty_to_dwarf(&ty, self.info),
+                        locations: locs,
+                    });
+                }
+                self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index, params, ret, locals);
             }
         }
 
@@ -1617,6 +1657,12 @@ struct FnEmitter<'a, 'b, 'c> {
     /// resolve via `cg.local_fn_ids[current_module]` first, falling back
     /// to the global `cg.fn_ids` only if not found there.
     current_module: Option<String>,
+    /// ValueLabel id assigned to each named Lumen binding (params,
+    /// let, var). Used at the end of the function to harvest
+    /// cranelift's value_labels_ranges and emit DW_AT_location.
+    /// Maps binding name → u32 (cranelift ValueLabel).
+    binding_labels: Vec<(String, u32)>,
+    next_value_label: u32,
 }
 
 impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
@@ -1637,7 +1683,23 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             hit_return: false,
             active_subs: HashMap::new(),
             current_module: None,
+            binding_labels: Vec::new(),
+            next_value_label: 0,
         }
+    }
+
+    /// Tag a cranelift Value with a fresh label and remember which
+    /// Lumen name it came from. After the function compiles, we look
+    /// up the label's range/location in compiled_code.value_labels_ranges
+    /// to build DW_AT_location for the binding.
+    fn attach_label(&mut self, name: &str, val: Value) {
+        let label_id = self.next_value_label;
+        self.next_value_label += 1;
+        self.binding_labels.push((name.to_string(), label_id));
+        self.builder.set_val_label(
+            val,
+            cranelift_codegen::ir::ValueLabel::from_u32(label_id),
+        );
     }
 
     fn fresh_var(&mut self, ty: CLType) -> Variable {
@@ -1763,6 +1825,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let cl_ty = lumen_to_cl(&lumen_ty);
                 let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
+                self.attach_label(name, val);
                 self.names.insert(name.clone(), var);
                 self.name_types.insert(name.clone(), lumen_ty.clone());
                 // Register pointer-typed bindings for scope-exit cleanup.
@@ -1881,6 +1944,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     let val = self.builder.ins().load(cl_ty, MemFlags::new(), ptr, offset);
                     let var = self.fresh_var(cl_ty);
                     self.builder.def_var(var, val);
+                    self.attach_label(name, val);
                     self.names.insert(name.clone(), var);
                     self.name_types.insert(name.clone(), fty.clone());
                     if !is_scalar(&fty) {
@@ -3101,6 +3165,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
         let binder_var = self.fresh_var(cl_types::I32);
         self.builder.def_var(binder_var, start);
+        self.attach_label(binder, start);
         self.names.insert(binder.to_string(), binder_var);
 
         let header_bb = self.builder.create_block();
@@ -3751,6 +3816,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let var = self.fresh_var(PTR);
                 let v = self.builder.use_var(scrut_var);
                 self.builder.def_var(var, v);
+                self.attach_label(name, v);
                 self.names.insert(name.clone(), var);
             }
             let body_val = self.compile_expr(&arm.body)?;
@@ -3837,6 +3903,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let val = self.builder.ins().load(cl_ty, MemFlags::new(), payload_ptr, offset);
                 let var = self.fresh_var(cl_ty);
                 self.builder.def_var(var, val);
+                self.attach_label(bind_name, val);
                 self.names.insert(bind_name.clone(), var);
                 self.name_types.insert(bind_name.clone(), fty);
             }
@@ -4681,6 +4748,61 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::Generic(_) => PTR,
         Ty::FnPtr { .. } => PTR,
         Ty::Error => cl_types::I32,
+    }
+}
+
+/// Find the last-assigned ValueLabel for `name` and translate
+/// cranelift's ValueLocRanges for it into DWARF LocRanges. The last
+/// entry wins if `attach_label` was called multiple times (e.g., a
+/// `var` that's re-assigned) — cranelift tracks each def separately
+/// but for DWARF we want the most recent definition's live range.
+fn lookup_binding_locations(
+    binding_labels: &[(String, u32)],
+    name: &str,
+    ranges: &cranelift_codegen::ValueLabelsRanges,
+) -> Vec<crate::dwarf::LocRange> {
+    let label_id = match binding_labels.iter().rev().find(|(n, _)| n == name) {
+        Some((_, id)) => *id,
+        None => return Vec::new(),
+    };
+    let label = cranelift_codegen::ir::ValueLabel::from_u32(label_id);
+    let Some(cl_ranges) = ranges.get(&label) else { return Vec::new(); };
+    cl_ranges.iter().filter_map(|r| {
+        let loc = label_value_loc_to_dwarf(&r.loc)?;
+        Some(crate::dwarf::LocRange { start: r.start, end: r.end, loc })
+    }).collect()
+}
+
+/// Translate cranelift's `LabelValueLoc` into the DWARF-facing
+/// `VarLoc`. Register numbers are mapped from hardware encoding to
+/// the x86-64 System V DWARF numbering (which differs — the AMD64 ABI
+/// orders hardware regs rax/rcx/rdx/rbx/rsp/rbp/rsi/rdi, DWARF orders
+/// rax/rdx/rcx/rbx/rsi/rdi/rbp/rsp).
+fn label_value_loc_to_dwarf(
+    loc: &cranelift_codegen::LabelValueLoc,
+) -> Option<crate::dwarf::VarLoc> {
+    use cranelift_codegen::LabelValueLoc;
+    use regalloc2::RegClass;
+    match loc {
+        LabelValueLoc::Reg(reg) => {
+            let hw = reg.to_real_reg()?.hw_enc();
+            let class = reg.class();
+            let dwarf_num = match class {
+                RegClass::Int => {
+                    // hw → dwarf mapping for x86-64 GPRs.
+                    const X64_GPR_HW_TO_DWARF: [u16; 16] =
+                        [0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15];
+                    X64_GPR_HW_TO_DWARF.get(hw as usize).copied()?
+                }
+                RegClass::Float => {
+                    // xmm0..xmm15 → DWARF 17..32.
+                    17u16 + hw as u16
+                }
+                RegClass::Vector => return None,
+            };
+            Some(crate::dwarf::VarLoc::Reg(dwarf_num))
+        }
+        LabelValueLoc::CFAOffset(off) => Some(crate::dwarf::VarLoc::CfaOffset(*off)),
     }
 }
 

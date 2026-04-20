@@ -92,11 +92,42 @@ pub struct StructField {
     pub offset: u32,
 }
 
+/// One entry in a DWARF location list: over the byte-offset range
+/// [start, end) within the function, the value lives at `loc`.
+#[derive(Clone, Copy, Debug)]
+pub enum VarLoc {
+    /// Hardware register, indexed by its DWARF register number.
+    Reg(u16),
+    /// Byte offset from the Canonical Frame Address (`DW_OP_call_frame_cfa`
+    /// + a signed integer).
+    CfaOffset(i64),
+}
+
+#[derive(Clone, Debug)]
+pub struct LocRange {
+    pub start: u32,
+    pub end: u32,
+    pub loc: VarLoc,
+}
+
 /// A parameter captured for a function, for DW_TAG_formal_parameter.
 #[derive(Clone)]
 pub struct Param {
     pub name: String,
     pub ty: DwarfTy,
+    /// Empty → fall back to ABI-based single-register location (from
+    /// ax3). Non-empty → emit a .debug_loc location list so gdb can
+    /// track the value across spills and moves.
+    pub locations: Vec<LocRange>,
+}
+
+/// A local binding (let/var/for-binder/match-binding) that lives in a
+/// function's scope. Emitted as DW_TAG_variable inside the subprogram.
+#[derive(Clone)]
+pub struct Local {
+    pub name: String,
+    pub ty: DwarfTy,
+    pub locations: Vec<LocRange>,
 }
 
 /// Per-function debug info. Populated as each Lumen fn is lowered; the
@@ -113,6 +144,7 @@ struct FunctionEntry {
     file_index: usize,
     params: Vec<Param>,
     ret: DwarfTy,
+    locals: Vec<Local>,
 }
 
 struct SourceFile {
@@ -185,6 +217,7 @@ impl DwarfBuilder {
         file_index: usize,
         params: Vec<Param>,
         ret: DwarfTy,
+        locals: Vec<Local>,
     ) {
         self.functions.push(FunctionEntry {
             name: name.to_string(),
@@ -195,6 +228,7 @@ impl DwarfBuilder {
             file_index,
             params,
             ret,
+            locals,
         });
     }
 
@@ -320,26 +354,24 @@ impl DwarfBuilder {
                 die.set(gimli::DW_AT_type, AttributeValue::UnitRef(rt));
             }
 
-            // Formal parameters as children of the subprogram DIE.
-            // DW_AT_location uses the System V AMD64 ABI register
-            // assignment — int/ptr params in rdi/rsi/rdx/rcx/r8/r9,
-            // float params in xmm0..xmm7. Accurate at function entry;
-            // gdb may show stale values after the fn moves registers
-            // to stack slots (full range info is a follow-up).
+            // Formal parameters: DW_AT_location comes from cranelift's
+            // value_labels_ranges if the binding was tracked, else
+            // falls back to the System V AMD64 ABI register guess
+            // (correct at function entry only).
             let param_ty_ids: Vec<_> = f.params.iter()
                 .map(|p| get_or_build_type(&mut dwarf, root, &mut type_cache, &self.structs, &p.ty))
                 .collect();
             let mut int_slot: usize = 0;
             let mut float_slot: usize = 0;
-            // DWARF 5, section 3.4: x86-64 register numbering. Int
-            // ABI regs in order: rdi=5, rsi=4, rdx=1, rcx=2, r8=8, r9=9.
-            // Float ABI regs: xmm0=17 ... xmm7=24.
             const INT_DWARF_REGS: [u8; 6] = [5, 4, 1, 2, 8, 9];
             const FLOAT_DWARF_REGS: [u8; 8] = [17, 18, 19, 20, 21, 22, 23, 24];
             for (p, &tid) in f.params.iter().zip(param_ty_ids.iter()) {
                 let param_die = dwarf.unit.add(subp, gimli::DW_TAG_formal_parameter);
                 let pname = dwarf.strings.add(p.name.clone());
-                let reg = if matches!(p.ty, DwarfTy::F64) {
+                // Track the ABI slot regardless of whether we end up
+                // using it — so slot counts stay aligned with the
+                // Lumen param order.
+                let abi_reg = if matches!(p.ty, DwarfTy::F64) {
                     let r = FLOAT_DWARF_REGS.get(float_slot).copied();
                     float_slot += 1;
                     r
@@ -348,16 +380,40 @@ impl DwarfBuilder {
                     int_slot += 1;
                     r
                 };
-                let d = dwarf.unit.get_mut(param_die);
-                d.set(gimli::DW_AT_name, AttributeValue::StringRef(pname));
-                d.set(gimli::DW_AT_type, AttributeValue::UnitRef(tid));
-                if let Some(r) = reg {
-                    // DW_OP_reg0..DW_OP_reg31 are single-byte opcodes
-                    // 0x50..0x6f. For regs >=32 we'd need DW_OP_regx
-                    // + ULEB — none of the ABI regs trigger that.
+                {
+                    let d = dwarf.unit.get_mut(param_die);
+                    d.set(gimli::DW_AT_name, AttributeValue::StringRef(pname));
+                    d.set(gimli::DW_AT_type, AttributeValue::UnitRef(tid));
+                }
+                if !p.locations.is_empty() {
+                    set_location_from_ranges(&mut dwarf, param_die, f.func_id, f.size, &p.locations);
+                } else if let Some(r) = abi_reg {
                     let mut expr = gimli::write::Expression::new();
                     expr.op_reg(gimli::Register(r as u16));
-                    d.set(gimli::DW_AT_location, AttributeValue::Exprloc(expr));
+                    dwarf.unit.get_mut(param_die).set(
+                        gimli::DW_AT_location,
+                        AttributeValue::Exprloc(expr),
+                    );
+                }
+            }
+
+            // Locals as DW_TAG_variable children. Emitted when
+            // cranelift tracked their locations; otherwise we still
+            // emit the DIE (name + type) so `info locals` shows them,
+            // but gdb says "optimized out" for the value.
+            let local_ty_ids: Vec<_> = f.locals.iter()
+                .map(|l| get_or_build_type(&mut dwarf, root, &mut type_cache, &self.structs, &l.ty))
+                .collect();
+            for (l, &tid) in f.locals.iter().zip(local_ty_ids.iter()) {
+                let var_die = dwarf.unit.add(subp, gimli::DW_TAG_variable);
+                let lname = dwarf.strings.add(l.name.clone());
+                {
+                    let d = dwarf.unit.get_mut(var_die);
+                    d.set(gimli::DW_AT_name, AttributeValue::StringRef(lname));
+                    d.set(gimli::DW_AT_type, AttributeValue::UnitRef(tid));
+                }
+                if !l.locations.is_empty() {
+                    set_location_from_ranges(&mut dwarf, var_die, f.func_id, f.size, &l.locations);
                 }
             }
         }
@@ -717,6 +773,63 @@ fn build_base_type(
     die.set(gimli::DW_AT_encoding, AttributeValue::Encoding(encoding));
     die.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size));
     id
+}
+
+/// Translate a `VarLoc` to a gimli DWARF expression.
+fn varloc_to_expr(loc: VarLoc) -> gimli::write::Expression {
+    let mut expr = gimli::write::Expression::new();
+    match loc {
+        VarLoc::Reg(n) => expr.op_reg(gimli::Register(n)),
+        VarLoc::CfaOffset(off) => {
+            // `DW_OP_call_frame_cfa` + constant + `DW_OP_plus`.
+            expr.op(gimli::DW_OP_call_frame_cfa);
+            expr.op_consts(off);
+            expr.op(gimli::DW_OP_plus);
+        }
+    }
+    expr
+}
+
+/// Attach DW_AT_location to a DIE. Single-range bindings that span
+/// the whole function become a DW_FORM_exprloc; multi-range or
+/// partial ones become a .debug_loc location list so gdb can
+/// track the value as cranelift moves it between regs and spills.
+fn set_location_from_ranges(
+    dwarf: &mut DwarfUnit,
+    die_id: gimli::write::UnitEntryId,
+    func_id: FuncId,
+    func_size: u32,
+    ranges: &[LocRange],
+) {
+    let covers_whole = ranges.len() == 1
+        && ranges[0].start == 0
+        && ranges[0].end >= func_size;
+    if covers_whole {
+        dwarf.unit.get_mut(die_id).set(
+            gimli::DW_AT_location,
+            AttributeValue::Exprloc(varloc_to_expr(ranges[0].loc)),
+        );
+        return;
+    }
+    let mut list = gimli::write::LocationList(Vec::with_capacity(ranges.len()));
+    for r in ranges {
+        list.0.push(gimli::write::Location::StartEnd {
+            begin: Address::Symbol {
+                symbol: func_id.as_u32() as usize,
+                addend: r.start as i64,
+            },
+            end: Address::Symbol {
+                symbol: func_id.as_u32() as usize,
+                addend: r.end as i64,
+            },
+            data: varloc_to_expr(r.loc),
+        });
+    }
+    let list_id = dwarf.unit.locations.add(list);
+    dwarf.unit.get_mut(die_id).set(
+        gimli::DW_AT_location,
+        AttributeValue::LocationListRef(list_id),
+    );
 }
 
 /// Split a source path into (file_name, directory). Canonicalizes if
