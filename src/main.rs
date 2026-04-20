@@ -144,6 +144,8 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String], extra_link_flags: &[St
     // can resolve function names in stack traces (without it, only
     // symbols in the dynamic table are visible — most Lumen fns are
     // Local-linkage and wouldn't appear).
+    //
+    // -lpthread wires the runtime's worker thread pool.
     let mut link_args = vec![
         obj_path.clone(),
         "-o".to_string(),
@@ -151,6 +153,7 @@ fn link(obj_bytes: &[u8], stem: &str, imports: &[String], extra_link_flags: &[St
         "-rdynamic".to_string(),
         "-lc".to_string(),
         "-lm".to_string(),
+        "-lpthread".to_string(),
     ];
 
     // Compile the main runtime.

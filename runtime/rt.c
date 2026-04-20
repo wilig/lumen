@@ -161,6 +161,78 @@ static void *lumen_realloc_raw(void *old_payload, int64_t old_size, int64_t new_
     return new_payload;
 }
 
+// --- Worker thread pool (lumen-u53) --------------------------------------
+//
+// Spawns N pthreads at program start. Each worker runs a dispatch
+// loop that wakes on a condvar, checks for work, and goes back to
+// sleep. Actor dispatch does not yet run on workers — the main
+// thread's cooperative green-thread scheduler continues unchanged.
+// This phase only proves the pool lifecycle: workers start cleanly,
+// shut down cleanly, and don't interfere with anything.
+//
+// Later phases (cv1/wwl/h43) add per-worker message queues, actor
+// pinning + migration, and atomic RC so workers can actually run
+// actor code.
+
+#include <pthread.h>
+
+#define LUMEN_MAX_WORKERS 64
+static pthread_t lumen_workers[LUMEN_MAX_WORKERS];
+static int32_t lumen_worker_count = 0;
+static pthread_mutex_t lumen_worker_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lumen_worker_wake = PTHREAD_COND_INITIALIZER;
+// 0 = running, 1 = shutdown requested. Workers exit when observed.
+static volatile int32_t lumen_worker_shutdown = 0;
+
+static int32_t lumen_worker_count_from_env(void) {
+    const char *env = getenv("LUMEN_THREADS");
+    if (env) {
+        int n = atoi(env);
+        if (n > 0 && n <= LUMEN_MAX_WORKERS) return n;
+    }
+    // Default: number of CPUs, clamped. sysconf(_SC_NPROCESSORS_ONLN)
+    // is POSIX but not universal; fall back to 4 if unavailable.
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) n = 4;
+    if (n > LUMEN_MAX_WORKERS) n = LUMEN_MAX_WORKERS;
+    return (int32_t)n;
+}
+
+static void *lumen_worker_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&lumen_worker_mu);
+    while (!lumen_worker_shutdown) {
+        // Nothing to do yet — sleep until shutdown (or future work).
+        // Later phases will check per-worker queues here.
+        pthread_cond_wait(&lumen_worker_wake, &lumen_worker_mu);
+    }
+    pthread_mutex_unlock(&lumen_worker_mu);
+    return NULL;
+}
+
+__attribute__((constructor))
+static void lumen_worker_pool_start(void) {
+    lumen_worker_count = lumen_worker_count_from_env();
+    for (int i = 0; i < lumen_worker_count; i++) {
+        if (pthread_create(&lumen_workers[i], NULL, lumen_worker_main, NULL) != 0) {
+            // Pool is best-effort; reduce count to what we actually got.
+            lumen_worker_count = i;
+            break;
+        }
+    }
+}
+
+__attribute__((destructor))
+static void lumen_worker_pool_stop(void) {
+    pthread_mutex_lock(&lumen_worker_mu);
+    lumen_worker_shutdown = 1;
+    pthread_cond_broadcast(&lumen_worker_wake);
+    pthread_mutex_unlock(&lumen_worker_mu);
+    for (int i = 0; i < lumen_worker_count; i++) {
+        pthread_join(lumen_workers[i], NULL);
+    }
+}
+
 // --- Message queue -------------------------------------------------------
 
 typedef struct {
