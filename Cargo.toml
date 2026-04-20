@@ -24,6 +24,8 @@ target-lexicon = "0.13"
 gimli = { version = "0.33", default-features = false, features = ["write"] }
 object = { version = "0.38", default-features = false, features = ["write"] }
 regalloc2 = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.dev]
 opt-level = 0

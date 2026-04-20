@@ -54,6 +54,11 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
+        "lsp" => {
+            // Speaks LSP over stdin/stdout; editor clients launch
+            // `lumen lsp` as a subprocess.
+            ExitCode::from(lumen::lsp::run() as u8)
+        }
         "--version" | "-V" => {
             println!("lumen {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -66,6 +71,7 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("  lumen build [--debug] <path.lm> [-lname] [-Lpath] [-framework name]");
     eprintln!("  lumen run   <path.lm>");
+    eprintln!("  lumen lsp                                     # language server on stdin/stdout");
     eprintln!("  lumen --version");
 }
 

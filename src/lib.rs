@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod dwarf;
 pub mod lexer;
+pub mod lsp;
 pub mod native;
 pub mod parser;
 pub mod span;
