@@ -1,0 +1,7 @@
+# Generated parser — produced by `tree-sitter generate` from grammar.js.
+# Regenerated on every build; not worth tracking and adds churn to diffs.
+src/
+node_modules/
+build/
+package-lock.json
+*.wasm

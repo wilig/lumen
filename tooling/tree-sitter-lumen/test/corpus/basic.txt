@@ -1,0 +1,145 @@
+================================================================================
+hello world
+================================================================================
+
+import std/io
+
+fn main(): i32 io {
+    io.println("hello, world")
+    return 0
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (import
+    path: (module_path
+      (identifier)
+      (identifier)))
+  (fn_decl
+    name: (identifier)
+    params: (parameters)
+    return_type: (named_type name: (identifier))
+    effect: (effect)
+    body: (block
+      (expr_stmt
+        (method_call_expr
+          receiver: (identifier)
+          method: (identifier)
+          args: (call_arguments
+            (argument value: (string_literal)))))
+      (return_stmt value: (integer_literal)))))
+
+================================================================================
+fn with generics
+================================================================================
+
+fn identity<T>(x: T): T {
+    return x
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (fn_decl
+    name: (identifier)
+    type_params: (type_parameters (identifier))
+    params: (parameters
+      (parameter
+        name: (identifier)
+        type: (named_type name: (identifier))))
+    return_type: (named_type name: (identifier))
+    body: (block
+      (return_stmt value: (identifier)))))
+
+================================================================================
+struct and variant
+================================================================================
+
+type Point = { x: i32, y: i32 }
+type Maybe<T> = None | Some(T)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (type_decl
+    name: (identifier)
+    body: (struct_body
+      (field name: (identifier) type: (named_type name: (identifier)))
+      (field name: (identifier) type: (named_type name: (identifier)))))
+  (type_decl
+    name: (identifier)
+    type_params: (type_parameters (identifier))
+    body: (sum_body
+      (variant name: (identifier))
+      (variant
+        name: (identifier)
+        payload: (variant_positional_payload
+          (named_type name: (identifier)))))))
+
+================================================================================
+match expression
+================================================================================
+
+fn describe(x: Option<i32>): string {
+    return match x {
+        Some(n) => "got it",
+        None => "empty",
+    }
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (fn_decl
+    name: (identifier)
+    params: (parameters
+      (parameter
+        name: (identifier)
+        type: (named_type
+          name: (identifier)
+          (type_arguments (named_type name: (identifier))))))
+    return_type: (named_type name: (identifier))
+    body: (block
+      (return_stmt
+        value: (match_expr
+          scrutinee: (identifier)
+          (match_arm
+            pattern: (variant_pattern
+              name: (identifier)
+              payload: (variant_pattern_positional
+                (binding_pattern (identifier))))
+            body: (string_literal))
+          (match_arm
+            pattern: (binding_pattern (identifier))
+            body: (string_literal)))))))
+
+================================================================================
+string interpolation
+================================================================================
+
+fn greet(name: string): unit io {
+    io.println("hello, ${name}!")
+}
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (fn_decl
+    name: (identifier)
+    params: (parameters
+      (parameter
+        name: (identifier)
+        type: (named_type name: (identifier))))
+    return_type: (named_type name: (identifier))
+    effect: (effect)
+    body: (block
+      tail: (method_call_expr
+        receiver: (identifier)
+        method: (identifier)
+        args: (call_arguments
+          (argument
+            value: (interpolated_string
+              (string_content)
+              (string_interpolation (identifier))
+              (string_content))))))))
