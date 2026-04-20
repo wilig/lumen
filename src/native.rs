@@ -1510,12 +1510,6 @@ impl<'a> NativeCodegen<'a> {
                 message: format!("define {}: {e}", f.name),
             })?;
 
-        // Record for DWARF: function name, symbol (FuncId), compiled
-        // size, and source line. Only user-module, non-monomorphized
-        // fns get recorded — imported-module fns and monomorphizations
-        // would misattribute line numbers to the user's source file
-        // (the CU only references one file at MVP). Multi-file DWARF
-        // is a cleanly additive follow-up.
         // Record user-module fns only (main module, plus user-module
         // monomorphizations — their decl_line points into the user
         // source file). Imported-module fns are skipped so their line
@@ -1525,7 +1519,31 @@ impl<'a> NativeCodegen<'a> {
             if let Some(compiled) = ctx.compiled_code() {
                 let size = compiled.code_buffer().len() as u32;
                 if f.span.line > 0 {
-                    self.dwarf.record_function(&f.name, func_id, size, f.span.line);
+                    // Harvest cranelift's per-instruction source
+                    // locations (set via FunctionBuilder::set_srcloc)
+                    // and translate to DWARF line rows.
+                    let mut rows: Vec<crate::dwarf::LineRow> = Vec::new();
+                    let mut last: Option<(u32, u32)> = None;
+                    for sl in compiled.buffer.get_srclocs_sorted() {
+                        let packed = sl.loc.bits();
+                        // Cranelift's default SourceLoc is !0 (0xffffffff);
+                        // our "no info" sentinel is 0. Skip both.
+                        if packed == 0 || packed == !0 { continue; }
+                        let (line, col) = {
+                            let line = (packed >> 12) & 0x000F_FFFF;
+                            let col = packed & 0x0000_0FFF;
+                            (line, col)
+                        };
+                        // Dedupe consecutive rows with the same line+col.
+                        if last == Some((line, col)) { continue; }
+                        last = Some((line, col));
+                        rows.push(crate::dwarf::LineRow {
+                            offset: sl.start,
+                            line,
+                            col,
+                        });
+                    }
+                    self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows);
                 }
             }
         }
@@ -1595,6 +1613,15 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         self.builder.declare_var(ty)
     }
 
+    /// Attach a Lumen source location to subsequent instructions. The
+    /// line+col is packed into cranelift's opaque SourceLoc u32 (line
+    /// in the high 20 bits, col in the low 12). `dwarf::unpack_srcloc`
+    /// decodes on the way out.
+    fn set_srcloc(&mut self, span: crate::span::Span) {
+        let packed = crate::dwarf::pack_srcloc(span.line, span.col);
+        self.builder.set_srcloc(cranelift_codegen::ir::SourceLoc::new(packed));
+    }
+
     fn compile_block(&mut self, block: &ast::Block) -> Result<Value, NativeError> {
         self.compile_block_with_cleanup(block, Vec::new())
     }
@@ -1656,6 +1683,11 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     }
 
     fn compile_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), NativeError> {
+        // Attach the statement's source span to every instruction
+        // emitted while lowering this stmt. Cranelift keeps this in
+        // its MachSrcLoc table; we harvest it at function-end to
+        // build the DWARF line program (lumen-ix6).
+        self.set_srcloc(stmt.span);
         match &stmt.kind {
             StmtKind::Let { name, value, ty } | StmtKind::Var { name, value, ty } => {
                 let inferred_ty = self.infer_ty(value)?;

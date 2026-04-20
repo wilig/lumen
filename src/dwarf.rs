@@ -33,6 +33,31 @@ use object::write::{Relocation, StandardSegment};
 use object::{RelocationEncoding, RelocationFlags, SectionKind};
 use std::collections::HashMap;
 
+/// Pack a (line, col) pair into cranelift's 32-bit SourceLoc. Line
+/// goes in the high 20 bits and column in the low 12. 0x0 is reserved
+/// for "no info" (SourceLoc::default).
+pub fn pack_srcloc(line: u32, col: u32) -> u32 {
+    let l = line & 0x000F_FFFF;
+    let c = col & 0x0000_0FFF;
+    (l << 12) | c
+}
+
+fn unpack_srcloc(packed: u32) -> (u32, u32) {
+    let line = (packed >> 12) & 0x000F_FFFF;
+    let col = packed & 0x0000_0FFF;
+    (line, col)
+}
+
+/// One line-program entry: a byte offset inside the function where
+/// the given source line+col begins. Harvested from cranelift's
+/// MachSrcLocs after compile.
+#[derive(Clone, Copy)]
+pub struct LineRow {
+    pub offset: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
 /// Per-function debug info. Populated as each Lumen fn is lowered; the
 /// FuncId is the handle cranelift-object gives us and maps one-to-one
 /// onto a symbol in the output ELF.
@@ -41,6 +66,7 @@ struct FunctionEntry {
     func_id: FuncId,
     size: u32,
     decl_line: u32,
+    line_rows: Vec<LineRow>,
 }
 
 pub struct DwarfBuilder {
@@ -82,12 +108,20 @@ impl DwarfBuilder {
         }
     }
 
-    pub fn record_function(&mut self, name: &str, func_id: FuncId, size: u32, decl_line: u32) {
+    pub fn record_function(
+        &mut self,
+        name: &str,
+        func_id: FuncId,
+        size: u32,
+        decl_line: u32,
+        line_rows: Vec<LineRow>,
+    ) {
         self.functions.push(FunctionEntry {
             name: name.to_string(),
             func_id,
             size,
             decl_line,
+            line_rows,
         });
     }
 
@@ -134,10 +168,24 @@ impl DwarfBuilder {
 
         for f in &self.functions {
             line_program.begin_sequence(Some(address_for_func(f.func_id)));
-            line_program.row().file = default_file;
-            line_program.row().line = f.decl_line as u64;
-            line_program.row().column = 0;
-            line_program.generate_row();
+            if f.line_rows.is_empty() {
+                // No per-statement info — emit one row at the decl
+                // line so `break funcname` still resolves. Coarse
+                // stepping is acceptable fallback.
+                line_program.row().file = default_file;
+                line_program.row().line = f.decl_line as u64;
+                line_program.row().column = 0;
+                line_program.generate_row();
+            } else {
+                for row in &f.line_rows {
+                    line_program.row().address_offset = row.offset as u64;
+                    line_program.row().file = default_file;
+                    line_program.row().line = row.line as u64;
+                    line_program.row().column = row.col as u64;
+                    line_program.row().is_statement = true;
+                    line_program.generate_row();
+                }
+            }
             line_program.end_sequence(f.size as u64);
         }
 
