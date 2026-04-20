@@ -699,10 +699,25 @@ impl<'a> NativeCodegen<'a> {
             }
         }
 
-        // Declare and compile fn items from imported modules.
-        for &(mod_name, mod_ast) in imported_modules {
-            // Intern strings from the imported module.
+        // Declare and compile fn items from imported modules. Two
+        // passes so generic templates in one module are available
+        // when another module's body compiles (e.g. std/string's
+        // split calls list.new; if std/string is processed first,
+        // std/list's templates must already be registered).
+        for &(_mod_name, mod_ast) in imported_modules {
             self.intern_all_strings(mod_ast);
+        }
+        for &(mod_name, mod_ast) in imported_modules {
+            for item in &mod_ast.items {
+                if let Item::Fn(f) = item {
+                    if !f.type_params.is_empty() {
+                        let key = format!("{mod_name}.{}", f.name);
+                        self.generic_templates.insert(key, f.clone());
+                    }
+                }
+            }
+        }
+        for &(mod_name, mod_ast) in imported_modules {
             // Declare extern fns so the module's Lumen functions can call them.
             for item in &mod_ast.items {
                 if let Item::ExternFn(ef) = item {
@@ -2404,16 +2419,17 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         // type-args the type checker resolved from context (for arg-less
         // generic calls like `nothing<T>(): Maybe<T>`).
         let type_args_override = self.cg.info.call_resolutions.get(&span.start).cloned();
-        // Intra-module unqualified call to a generic fn declared in
-        // the current imported module (e.g. `push(out, v)` inside
-        // std/list's own `map`). monomorphize_if_generic only looks
-        // in info.fns; check the current module's generic fns first.
-        let module_generic = self.current_module.as_ref().and_then(|m| {
+        // Intra-module unqualified call to a generic Lumen fn (not
+        // an extern) declared in the current imported module —
+        // monomorphize_if_generic only looks in info.fns; these
+        // live in info.modules[current_module]. Generic externs
+        // don't need monomorphization (one C symbol shared across T).
+        let module_generic_non_extern = self.current_module.as_ref().and_then(|m| {
             self.cg.info.modules.get(m).and_then(|sigs| {
-                sigs.get(&name).filter(|s| !s.type_params.is_empty()).cloned()
+                sigs.get(&name).filter(|s| !s.type_params.is_empty() && !s.is_extern).cloned()
             }).map(|_| m.clone())
         });
-        let (effective_name, effective_sig) = if let Some(m) = module_generic {
+        let (effective_name, effective_sig) = if let Some(m) = module_generic_non_extern {
             match self.monomorphize_module_method_if_generic(
                 &m, &name, &arg_tys, type_args_override.clone(),
             ) {
@@ -2541,11 +2557,6 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
 
     // --- Method call helpers ------------------------------------------------
 
-    /// Compile args, call a builtin FuncId, return the result.
-    fn call_builtin(&mut self, func_id: FuncId, args: &[ast::Arg]) -> Result<Value, NativeError> {
-        self.call_builtin_typed(func_id, args, None)
-    }
-
     /// Compile args, call a void builtin FuncId, return unit (i32 0).
     fn call_builtin_void(&mut self, func_id: FuncId, args: &[ast::Arg]) -> Result<Value, NativeError> {
         let mut vals = Vec::new();
@@ -2555,24 +2566,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         Ok(self.builder.ins().iconst(cl_types::I32, 0))
     }
 
-    /// Like call_builtin but with Lumen-sig-aware argument widening.
-    /// When an arg's Cranelift type is narrower than the declared
-    /// param type (say Lumen i32 passed to an i64 slot on a generic
-    /// extern), inserts sextend / ireduce / bitcast so the Cranelift
-    /// sig match is satisfied. Lets generic externs take 8-byte slots
-    /// at the C ABI while callers pass their natural-width Lumen
-    /// types. The return value is narrowed per `ret_expected` if
-    /// provided (for generic extern calls where the monomorphized
-    /// return type is narrower than the registered I64 slot).
-    fn call_builtin_typed(
-        &mut self,
-        func_id: FuncId,
-        args: &[ast::Arg],
-        sig: Option<&crate::types::FnSig>,
-    ) -> Result<Value, NativeError> {
-        self.call_builtin_typed_sub(func_id, args, sig, &HashMap::new())
-    }
-
+    /// Compile args, call a FuncId with Lumen-sig-aware argument
+    /// widening (generic externs live in an i64 slot at the C ABI but
+    /// callers pass their natural-width Lumen types — sextend / ireduce
+    /// / bitcast bridges the gap). Return value is narrowed back down
+    /// if the monomorphized return type is narrower than the registered
+    /// slot.
     fn call_builtin_typed_sub(
         &mut self,
         func_id: FuncId,
@@ -2706,64 +2705,10 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 self.builder.ins().call(serve_ref, &[port, handler_addr]);
                 return Ok(self.builder.ins().iconst(cl_types::I32, 0));
             }
-            // list.new: pass elem_size=8
-            if mod_name == "list" && method == "new" {
-                let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
-                let fid = self.module_func("lumen_list_new");
-                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[elem_size]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            // list.push: rc_incr pointer-typed values, sextend i32→i64
-            if mod_name == "list" && method == "push" {
-                let l = self.compile_expr(&args[0].value)?;
-                let val_raw = self.compile_expr(&args[1].value)?;
-                let val_ty = self.infer_ty(&args[1].value)?;
-                if !is_scalar(&val_ty) { self.emit_rc_incr(val_raw); }
-                let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
-                    self.builder.ins().sextend(cl_types::I64, val_raw)
-                } else { val_raw };
-                let fid = self.module_func("lumen_list_push");
-                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[l, val64]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
-            // list.get: ireduce i64→i32 if elem type is i32
-            if mod_name == "list" && method == "get" {
-                let l = self.compile_expr(&args[0].value)?;
-                let i = self.compile_expr(&args[1].value)?;
-                let fid = self.module_func("lumen_list_get");
-                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[l, i]);
-                let result = self.builder.inst_results(call)[0];
-                let list_ty = self.infer_ty(&args[0].value)?;
-                let elem_ty = match list_ty { Ty::List(inner) => *inner, _ => Ty::I64 };
-                // For pointer-typed elements, the list owns its slot's
-                // reference. The caller's binding (e.g. `let raw = list.get(...)`)
-                // adds a new owner — without rc_incr, scope-exit would
-                // decr the shared ptr to 0 and free a slot the list still
-                // holds (lumen-358 surfaced this via string elements).
-                if !is_scalar(&elem_ty) {
-                    self.emit_rc_incr(result);
-                }
-                return Ok(if lumen_to_cl(&elem_ty) == cl_types::I32 {
-                    self.builder.ins().ireduce(cl_types::I32, result)
-                } else { result });
-            }
-            // list.set: sextend val if i32
-            if mod_name == "list" && method == "set" {
-                let l = self.compile_expr(&args[0].value)?;
-                let i = self.compile_expr(&args[1].value)?;
-                let val_raw = self.compile_expr(&args[2].value)?;
-                let val_ty = self.infer_ty(&args[2].value)?;
-                let val64 = if lumen_to_cl(&val_ty) == cl_types::I32 {
-                    self.builder.ins().sextend(cl_types::I64, val_raw)
-                } else { val_raw };
-                let fid = self.module_func("lumen_list_set");
-                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[l, i, val64]);
-                return Ok(self.builder.inst_results(call)[0]);
-            }
+            // list.new / list.push / list.get / list.set used to live
+            // here as codegen specials. They're now pure-Lumen generic
+            // wrappers in std/list.lm over the _new_raw / _push_raw /
+            // _get_raw / _set_raw externs — lumen-d86.
             // map.new(): uses the typechecker's recorded [K, V] in
             // call_resolutions (populated by check_expr when there's
             // a let/var annotation on the binding). Defaults to

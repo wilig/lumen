@@ -5,12 +5,35 @@
 // mutating operations return the (possibly relocated) list pointer —
 // rebind with `xs = list.push(xs, v)`.
 
-extern fn new(elem_size: i32): i64 link "lumen_list_new"
-extern fn len(list: i64): i32 link "lumen_list_len"
-extern fn push(list: i64, value: i64): i64 link "lumen_list_push"
-extern fn get(list: i64, index: i32): i64 link "lumen_list_get"
-extern fn set(list: i64, index: i32, value: i64): i64 link "lumen_list_set"
-extern fn remove(list: i64, index: i32): i64 link "lumen_list_remove"
+// Generic externs: one C symbol shared across T. Codegen handles
+// i32↔i64 widening at the FFI boundary so the Lumen-facing sig can
+// carry real T types.
+extern fn _new_raw<T>(elem_size: i32): List<T> link "lumen_list_new"
+extern fn len<T>(xs: List<T>): i32 link "lumen_list_len"
+extern fn _push_raw<T>(xs: List<T>, v: T): List<T> link "lumen_list_push"
+extern fn _get_raw<T>(xs: List<T>, i: i32): T link "lumen_list_get"
+extern fn _set_raw<T>(xs: List<T>, i: i32, v: T): List<T> link "lumen_list_set"
+extern fn remove<T>(xs: List<T>, i: i32): List<T> link "lumen_list_remove"
+
+fn new<T>(): List<T> {
+    return _new_raw(8)
+}
+
+fn push<T>(xs: List<T>, v: T): List<T> {
+    __rc_incr(v)
+    return _push_raw(xs, v)
+}
+
+fn get<T>(xs: List<T>, i: i32): T {
+    let v: T = _get_raw(xs, i)
+    __rc_incr(v)
+    return v
+}
+
+fn set<T>(xs: List<T>, i: i32, v: T): List<T> {
+    __rc_incr(v)
+    return _set_raw(xs, i, v)
+}
 
 // --- Generic utilities (in Lumen) ---------------------------------------
 
@@ -35,7 +58,7 @@ fn last<T>(xs: List<T>): Option<T> {
 
 // Apply `f` to each element, collecting the results in a new list.
 fn map<A, B>(xs: List<A>, f: fn(A): B): List<B> {
-    var out: List<B> = new(8)
+    var out: List<B> = new()
     let n: i32 = len(xs)
     for i in range(0, n) {
         out = push(out, f(get(xs, i)))
@@ -45,7 +68,7 @@ fn map<A, B>(xs: List<A>, f: fn(A): B): List<B> {
 
 // Keep only the elements for which `pred` returns true.
 fn filter<T>(xs: List<T>, pred: fn(T): bool): List<T> {
-    var out: List<T> = new(8)
+    var out: List<T> = new()
     let n: i32 = len(xs)
     for i in range(0, n) {
         let v: T = get(xs, i)
@@ -110,7 +133,7 @@ fn fold<A, B>(xs: List<A>, init: B, f: fn(B, A): B): B {
 }
 
 fn reverse<T>(xs: List<T>): List<T> {
-    var out: List<T> = new(8)
+    var out: List<T> = new()
     let n: i32 = len(xs)
     for i in range(0, n) {
         out = push(out, get(xs, n - 1 - i))
@@ -119,7 +142,7 @@ fn reverse<T>(xs: List<T>): List<T> {
 }
 
 fn concat<T>(xs: List<T>, ys: List<T>): List<T> {
-    var out: List<T> = new(8)
+    var out: List<T> = new()
     let nx: i32 = len(xs)
     let ny: i32 = len(ys)
     for i in range(0, nx) {
@@ -132,7 +155,7 @@ fn concat<T>(xs: List<T>, ys: List<T>): List<T> {
 }
 
 fn take<T>(xs: List<T>, n: i32): List<T> {
-    var out: List<T> = new(8)
+    var out: List<T> = new()
     let cap: i32 = len(xs)
     let stop: i32 = if n < cap { n } else { cap }
     for i in range(0, stop) {
@@ -142,7 +165,7 @@ fn take<T>(xs: List<T>, n: i32): List<T> {
 }
 
 fn drop<T>(xs: List<T>, n: i32): List<T> {
-    var out: List<T> = new(8)
+    var out: List<T> = new()
     let cap: i32 = len(xs)
     let start: i32 = if n < cap { n } else { cap }
     for i in range(start, cap) {

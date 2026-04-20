@@ -199,6 +199,12 @@ pub struct ModuleInfo {
     /// by default). Registered once during typecheck; codegen
     /// materializes them as static data slots.
     pub globals: HashMap<String, (Ty, bool)>,
+    /// Imported modules' top-level bindings. Kept internally so
+    /// Pass 4b (typechecking imported module bodies) can resolve
+    /// intra-module references like `std/test`'s `pass_count`.
+    /// NOT consulted when checking user-module code — globals
+    /// are private to their declaring module.
+    pub module_globals: HashMap<String, HashMap<String, (Ty, bool)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,13 +291,22 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         generic_type_args: HashMap::new(),
         call_resolutions: HashMap::new(),
         globals: HashMap::new(),
+        module_globals: HashMap::new(),
     };
 
     // Register imported module APIs.
     for imp in imported {
         let mut mod_fns = HashMap::new();
         let mut mod_links = HashMap::new();
+        let mut mod_globals: HashMap<String, (Ty, bool)> = HashMap::new();
         for item in &imp.module.items {
+            if let Item::GlobalLet(gl) = item {
+                if let Some(ty) = &gl.ty {
+                    if let Ok(t) = resolve_type(ty, &info.types) {
+                        mod_globals.insert(gl.name.clone(), (t, gl.mutable));
+                    }
+                }
+            }
             if let Item::ExternFn(ef) = item {
                 let params: Vec<(String, Ty)> = ef.params.iter().filter_map(|p| {
                     resolve_type_with_params(&p.ty, &info.types, &ef.type_params).ok().map(|t| (p.name.clone(), t))
@@ -322,6 +337,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         }
         info.modules.insert(imp.name.clone(), mod_fns);
         info.module_link_names.insert(imp.name.clone(), mod_links);
+        info.module_globals.insert(imp.name.clone(), mod_globals);
     }
 
     // Pass 1: register all type decl names so the next pass can resolve
@@ -670,6 +686,37 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
             }
             for (k, v) in call_res.drain() {
                 info.call_resolutions.insert(k, v);
+            }
+        }
+    }
+
+    // Pass 4b: check fn bodies inside imported modules. Populates
+    // call_resolutions + variant_resolutions for intra-stdlib call
+    // sites so the codegen has the same T-inference info for
+    // wrappers like `fn push<T>(xs: List<T>, v: T)` as it does for
+    // user-module generic calls.
+    for imp in imported {
+        for item in &imp.module.items {
+            if let Item::Fn(f) = item {
+                let sig = match info.modules.get(&imp.name).and_then(|m| m.get(&f.name)).cloned() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let mut variant_res;
+                let mut call_res;
+                {
+                    let mut checker = FnChecker::new(&mut info, &sig, &mut errors)
+                        .with_module(&imp.name);
+                    checker.check_fn(f);
+                    variant_res = std::mem::take(&mut checker.variant_resolutions);
+                    call_res = std::mem::take(&mut checker.call_resolutions);
+                }
+                for (k, v) in variant_res.drain() {
+                    info.variant_resolutions.insert(k, v);
+                }
+                for (k, v) in call_res.drain() {
+                    info.call_resolutions.insert(k, v);
+                }
             }
         }
     }
@@ -1177,6 +1224,12 @@ struct FnChecker<'a> {
     /// arguments from context (args + expected). Drained into
     /// ModuleInfo.call_resolutions after check_fn.
     call_resolutions: HashMap<u32, Vec<Ty>>,
+    /// When set, this fn is inside an imported module (e.g. "list"
+    /// for std/list.lm). Unqualified call/ident name resolution
+    /// consults `module.modules[current_module]` first so intra-module
+    /// calls resolve to that module's own fns, not user-module fns of
+    /// the same short name.
+    current_module: Option<String>,
 }
 
 #[derive(Default)]
@@ -1201,7 +1254,36 @@ impl<'a> FnChecker<'a> {
             lambda_scope_floor: None,
             variant_resolutions: HashMap::new(),
             call_resolutions: HashMap::new(),
+            current_module: None,
         }
+    }
+
+    fn with_module(mut self, name: &str) -> Self {
+        self.current_module = Some(name.to_string());
+        self
+    }
+
+    /// Resolve a fn name to its sig, consulting `current_module`'s
+    /// table first (for intra-imported-module calls) before falling
+    /// back to the user module. None if no fn by that name exists.
+    fn lookup_fn(&self, name: &str) -> Option<FnSig> {
+        if let Some(m) = &self.current_module {
+            if let Some(sig) = self.module.modules.get(m).and_then(|s| s.get(name)) {
+                return Some(sig.clone());
+            }
+        }
+        self.module.fns.get(name).cloned()
+    }
+
+    /// Resolve a module-level binding name to (Ty, mutable), checking
+    /// the current module (user's or an imported one in Pass 4b).
+    fn lookup_global(&self, name: &str) -> Option<(Ty, bool)> {
+        if let Some(m) = &self.current_module {
+            if let Some(entry) = self.module.module_globals.get(m).and_then(|g| g.get(name)) {
+                return Some(entry.clone());
+            }
+        }
+        self.module.globals.get(name).cloned()
     }
 
     /// Template-aware version of `unify_for_subs` — when both sides are
@@ -1291,7 +1373,10 @@ impl<'a> FnChecker<'a> {
     }
 
     fn resolve_or_error(&mut self, t: &Type) -> Ty {
-        match resolve_type(t, &self.module.types) {
+        // Thread the current fn's type params through resolution so
+        // `let v: T = ...` inside a generic fn's body recognizes T
+        // as Ty::Generic rather than an unknown user type.
+        match resolve_type_with_params(t, &self.module.types, &self.sig.type_params) {
             Ok(ty) => ty,
             Err(e) => { self.errors.push(e); Ty::Error }
         }
@@ -1412,8 +1497,9 @@ impl<'a> FnChecker<'a> {
             }
             StmtKind::Assign { name, value } => {
                 // Check for module-level bindings if no local scope
-                // entry is found.
-                let global_entry = self.module.globals.get(name).cloned();
+                // entry is found. Inside an imported module (Pass 4b),
+                // consult that module's own globals.
+                let global_entry = self.lookup_global(name);
                 match self.lookup(name).cloned() {
                     None => {
                         if let Some((ty, mutable)) = global_entry {
@@ -1585,10 +1671,10 @@ impl<'a> FnChecker<'a> {
                 }
             }
         }
-        // `map.new()` with an expected Map<K, V> annotation: record
-        // [K, V] in call_resolutions so the codegen can synthesize the
-        // `key_is_ptr` flag + the right K/V widths without re-walking
-        // the let-binding context.
+        // `map.new()` with an expected Map<K, V> annotation: map.new
+        // is a codegen special (no Lumen sig) so the generic-method
+        // handler below can't unify it. Record [K, V] in call_resolutions
+        // directly so the codegen can synthesize the key_is_ptr flag.
         if let ExprKind::MethodCall { receiver, method, args } = &expr.kind {
             if let ExprKind::Ident(mod_name) = &receiver.kind {
                 if mod_name == "map" && method == "new" && args.is_empty() {
@@ -1602,13 +1688,46 @@ impl<'a> FnChecker<'a> {
                 }
             }
         }
+        // Generic method call with an expected return type: let the
+        // expected type drive T inference. Mirrors the user-fn path
+        // below (for `fn nothing<T>(): Maybe<T>`) so imported-module
+        // generics like `list.new<T>(): List<T>` or `map.new<K,V>()`
+        // pick up their type args from context.
+        if let ExprKind::MethodCall { receiver, method, args } = &expr.kind {
+            if let ExprKind::Ident(mod_name) = &receiver.kind {
+                if let Some(sig) = self.module.modules.get(mod_name)
+                    .and_then(|m| m.get(method)).cloned()
+                {
+                    if !sig.type_params.is_empty() {
+                        self.check_effect(sig.effect, expr.span);
+                        self.check_generic_call(&sig, args, expr.span);
+                        let mut subs: HashMap<String, Ty> = HashMap::new();
+                        let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer_expr(&a.value)).collect();
+                        for (i, (_, pty)) in sig.params.iter().enumerate() {
+                            if let Some(at) = arg_tys.get(i) {
+                                self.unify_with_template_args(pty, at, &mut subs);
+                            }
+                        }
+                        self.unify_with_template_args(&sig.ret, expected, &mut subs);
+                        if sig.type_params.iter().all(|p| subs.contains_key(p)) {
+                            let type_args: Vec<Ty> = sig.type_params.iter()
+                                .map(|p| subs.get(p).cloned().unwrap())
+                                .collect();
+                            self.call_resolutions.insert(expr.span.start, type_args);
+                        }
+                        let subbed = substitute_generic(sig.ret.clone(), &subs);
+                        return self.concretize_ty(&subbed, &subs);
+                    }
+                }
+            }
+        }
 
         // Generic fn call — combine arg-driven and expected-driven
         // inference. Lets `let x: Maybe<i32> = nothing()` derive T=I32
         // even when there are no args to infer from.
         if let ExprKind::Call { callee, args } = &expr.kind {
             if let ExprKind::Ident(name) = &callee.kind {
-                let sig = self.module.fns.get(name).cloned();
+                let sig = self.lookup_fn(name);
                 if let Some(sig) = sig {
                     if !sig.type_params.is_empty() {
                         self.check_effect(sig.effect, expr.span);
@@ -1727,15 +1846,15 @@ impl<'a> FnChecker<'a> {
                         });
                         Ty::Error
                     }
-                } else if let Some(sig) = self.module.fns.get(name) {
+                } else if let Some(sig) = self.lookup_fn(name) {
                     // Top-level function referenced as a value → FnPtr.
                     Ty::FnPtr {
                         params: sig.params.iter().map(|(_, t)| t.clone()).collect(),
                         ret: Box::new(sig.ret.clone()),
                     }
-                } else if let Some((ty, _)) = self.module.globals.get(name) {
+                } else if let Some((ty, _)) = self.lookup_global(name) {
                     // Module-level let/var binding.
-                    ty.clone()
+                    ty
                 } else {
                     self.errors.push(TypeError {
                         span: expr.span,
@@ -2024,9 +2143,9 @@ impl<'a> FnChecker<'a> {
                 Ty::Bool
             }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                if !((lt.is_numeric() || matches!(lt, Ty::Error))
-                    && (rt.is_numeric() || matches!(rt, Ty::Error))
-                    && compatible(&lt, &rt))
+                // Numeric types + char compare by codepoint.
+                let ordered = |t: &Ty| t.is_numeric() || matches!(t, Ty::Char | Ty::Error);
+                if !(ordered(&lt) && ordered(&rt) && compatible(&lt, &rt))
                 {
                     self.errors.push(TypeError {
                         span,
@@ -2215,14 +2334,9 @@ impl<'a> FnChecker<'a> {
                 _ => {}
             }
 
-            // User fn call.
-            if let Some(sig) = self.module.fns.get(name).map(|s| FnSig {
-                params: s.params.clone(),
-                ret: s.ret.clone(),
-                effect: s.effect,
-                type_params: s.type_params.clone(),
-                is_extern: s.is_extern,
-            }) {
+            // User fn call (or intra-imported-module call when
+            // current_module is set).
+            if let Some(sig) = self.lookup_fn(name) {
                 self.check_effect(sig.effect, whole_span);
                 if !sig.type_params.is_empty() {
                     // Generic callee: unify-then-check. Doing the eager

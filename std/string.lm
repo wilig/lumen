@@ -121,8 +121,8 @@ fn trim(s: string): string {
     return substring(s, first, last - first)
 }
 
-fn split(s: string, sep: string): i64 {
-    var result = list.new()
+fn split(s: string, sep: string): List<string> {
+    var result: List<string> = list.new()
     let slen = len(s)
     let sep_len = len(sep)
     if sep_len == 0 { return list.push(result, s) }
