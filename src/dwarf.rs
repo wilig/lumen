@@ -58,6 +58,33 @@ pub struct LineRow {
     pub col: u32,
 }
 
+/// A resolved Lumen type, in the form we care about for DWARF. We
+/// only distinguish the shapes gdb needs to display values; everything
+/// that's a heap-allocated pointer at runtime collapses into
+/// `DwarfTy::Pointer` here.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DwarfTy {
+    I32,
+    I64,
+    U32,
+    U64,
+    F64,
+    Bool,
+    Char,
+    Unit,
+    /// Any heap-allocated value (strings, bytes, lists, structs,
+    /// sums, tuples, handles, fn ptrs — all one-word pointers in
+    /// Lumen's runtime representation).
+    Pointer,
+}
+
+/// A parameter captured for a function, for DW_TAG_formal_parameter.
+#[derive(Clone)]
+pub struct Param {
+    pub name: String,
+    pub ty: DwarfTy,
+}
+
 /// Per-function debug info. Populated as each Lumen fn is lowered; the
 /// FuncId is the handle cranelift-object gives us and maps one-to-one
 /// onto a symbol in the output ELF.
@@ -70,6 +97,8 @@ struct FunctionEntry {
     /// Index into DwarfBuilder::source_files. Default 0 = the user's
     /// main source; higher indices reference imported modules.
     file_index: usize,
+    params: Vec<Param>,
+    ret: DwarfTy,
 }
 
 struct SourceFile {
@@ -129,6 +158,8 @@ impl DwarfBuilder {
         decl_line: u32,
         line_rows: Vec<LineRow>,
         file_index: usize,
+        params: Vec<Param>,
+        ret: DwarfTy,
     ) {
         self.functions.push(FunctionEntry {
             name: name.to_string(),
@@ -137,6 +168,8 @@ impl DwarfBuilder {
             decl_line,
             line_rows,
             file_index,
+            params,
+            ret,
         });
     }
 
@@ -224,10 +257,22 @@ impl DwarfBuilder {
         root_die.set(gimli::DW_AT_ranges, AttributeValue::RangeListRef(range_list_id));
         root_die.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
 
-        // One DW_TAG_subprogram DIE per Lumen function, pointing at
-        // the source file its declaration lives in.
+        // Type DIE cache: each distinct DwarfTy gets one DIE per CU.
+        let mut type_cache: HashMap<DwarfTy, gimli::write::UnitEntryId> = HashMap::new();
+
+        // One DW_TAG_subprogram DIE per Lumen function. Attributes
+        // reference the source file it came from and its parameter /
+        // return types; nested DW_TAG_formal_parameter DIEs name
+        // each arg. DW_AT_location is deliberately absent for MVP —
+        // gdb reports "optimized out" for values but `info args`
+        // shows signatures correctly.
         for f in &self.functions {
             let file_id = file_ids[f.file_index];
+            let ret_ty_id = if f.ret == DwarfTy::Unit {
+                None
+            } else {
+                Some(get_or_build_type(&mut dwarf, root, &mut type_cache, &f.ret))
+            };
             let subp = dwarf.unit.add(root, gimli::DW_TAG_subprogram);
             let fname = dwarf.strings.add(f.name.clone());
             let die = dwarf.unit.get_mut(subp);
@@ -237,6 +282,50 @@ impl DwarfBuilder {
             die.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
             die.set(gimli::DW_AT_decl_line, AttributeValue::Udata(f.decl_line as u64));
             die.set(gimli::DW_AT_external, AttributeValue::Flag(true));
+            if let Some(rt) = ret_ty_id {
+                die.set(gimli::DW_AT_type, AttributeValue::UnitRef(rt));
+            }
+
+            // Formal parameters as children of the subprogram DIE.
+            // DW_AT_location uses the System V AMD64 ABI register
+            // assignment — int/ptr params in rdi/rsi/rdx/rcx/r8/r9,
+            // float params in xmm0..xmm7. Accurate at function entry;
+            // gdb may show stale values after the fn moves registers
+            // to stack slots (full range info is a follow-up).
+            let param_ty_ids: Vec<_> = f.params.iter()
+                .map(|p| get_or_build_type(&mut dwarf, root, &mut type_cache, &p.ty))
+                .collect();
+            let mut int_slot: usize = 0;
+            let mut float_slot: usize = 0;
+            // DWARF 5, section 3.4: x86-64 register numbering. Int
+            // ABI regs in order: rdi=5, rsi=4, rdx=1, rcx=2, r8=8, r9=9.
+            // Float ABI regs: xmm0=17 ... xmm7=24.
+            const INT_DWARF_REGS: [u8; 6] = [5, 4, 1, 2, 8, 9];
+            const FLOAT_DWARF_REGS: [u8; 8] = [17, 18, 19, 20, 21, 22, 23, 24];
+            for (p, &tid) in f.params.iter().zip(param_ty_ids.iter()) {
+                let param_die = dwarf.unit.add(subp, gimli::DW_TAG_formal_parameter);
+                let pname = dwarf.strings.add(p.name.clone());
+                let reg = if matches!(p.ty, DwarfTy::F64) {
+                    let r = FLOAT_DWARF_REGS.get(float_slot).copied();
+                    float_slot += 1;
+                    r
+                } else {
+                    let r = INT_DWARF_REGS.get(int_slot).copied();
+                    int_slot += 1;
+                    r
+                };
+                let d = dwarf.unit.get_mut(param_die);
+                d.set(gimli::DW_AT_name, AttributeValue::StringRef(pname));
+                d.set(gimli::DW_AT_type, AttributeValue::UnitRef(tid));
+                if let Some(r) = reg {
+                    // DW_OP_reg0..DW_OP_reg31 are single-byte opcodes
+                    // 0x50..0x6f. For regs >=32 we'd need DW_OP_regx
+                    // + ULEB — none of the ABI regs trigger that.
+                    let mut expr = gimli::write::Expression::new();
+                    expr.op_reg(gimli::Register(r as u16));
+                    d.set(gimli::DW_AT_location, AttributeValue::Exprloc(expr));
+                }
+            }
         }
 
         dwarf.unit.line_program = line_program;
@@ -492,6 +581,59 @@ fn add_debug_reloc(
         },
     )
     .unwrap();
+}
+
+/// Look up or build a DIE for a Lumen type, caching per CU so each
+/// shape is defined exactly once. Base types go directly under the
+/// compile unit root; `DwarfTy::Pointer` becomes a DW_TAG_pointer_type
+/// over a DW_TAG_unspecified_type (opaque `void *` — good enough for
+/// MVP, individual struct layouts are a follow-up ticket).
+fn get_or_build_type(
+    dwarf: &mut DwarfUnit,
+    root: gimli::write::UnitEntryId,
+    cache: &mut HashMap<DwarfTy, gimli::write::UnitEntryId>,
+    ty: &DwarfTy,
+) -> gimli::write::UnitEntryId {
+    if let Some(&id) = cache.get(ty) {
+        return id;
+    }
+    let id = match ty {
+        DwarfTy::I32 => build_base_type(dwarf, root, "i32", gimli::DW_ATE_signed, 4),
+        DwarfTy::I64 => build_base_type(dwarf, root, "i64", gimli::DW_ATE_signed, 8),
+        DwarfTy::U32 => build_base_type(dwarf, root, "u32", gimli::DW_ATE_unsigned, 4),
+        DwarfTy::U64 => build_base_type(dwarf, root, "u64", gimli::DW_ATE_unsigned, 8),
+        DwarfTy::F64 => build_base_type(dwarf, root, "f64", gimli::DW_ATE_float, 8),
+        DwarfTy::Bool => build_base_type(dwarf, root, "bool", gimli::DW_ATE_boolean, 4),
+        DwarfTy::Char => build_base_type(dwarf, root, "char", gimli::DW_ATE_UTF, 4),
+        DwarfTy::Unit => build_base_type(dwarf, root, "unit", gimli::DW_ATE_unsigned, 4),
+        DwarfTy::Pointer => {
+            let base = dwarf.unit.add(root, gimli::DW_TAG_unspecified_type);
+            let bname = dwarf.strings.add("<lumen>".to_string());
+            dwarf.unit.get_mut(base).set(gimli::DW_AT_name, AttributeValue::StringRef(bname));
+            let ptr = dwarf.unit.add(root, gimli::DW_TAG_pointer_type);
+            dwarf.unit.get_mut(ptr).set(gimli::DW_AT_byte_size, AttributeValue::Udata(8));
+            dwarf.unit.get_mut(ptr).set(gimli::DW_AT_type, AttributeValue::UnitRef(base));
+            ptr
+        }
+    };
+    cache.insert(ty.clone(), id);
+    id
+}
+
+fn build_base_type(
+    dwarf: &mut DwarfUnit,
+    root: gimli::write::UnitEntryId,
+    name: &str,
+    encoding: gimli::DwAte,
+    size: u64,
+) -> gimli::write::UnitEntryId {
+    let id = dwarf.unit.add(root, gimli::DW_TAG_base_type);
+    let name_str = dwarf.strings.add(name.to_string());
+    let die = dwarf.unit.get_mut(id);
+    die.set(gimli::DW_AT_name, AttributeValue::StringRef(name_str));
+    die.set(gimli::DW_AT_encoding, AttributeValue::Encoding(encoding));
+    die.set(gimli::DW_AT_byte_size, AttributeValue::Udata(size));
+    id
 }
 
 /// Split a source path into (file_name, directory). Canonicalizes if

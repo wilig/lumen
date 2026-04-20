@@ -1532,7 +1532,14 @@ impl<'a> NativeCodegen<'a> {
                     last = Some((line, col));
                     rows.push(crate::dwarf::LineRow { offset: sl.start, line, col });
                 }
-                self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index);
+                let params: Vec<crate::dwarf::Param> = sig.params.iter()
+                    .map(|(n, ty)| crate::dwarf::Param {
+                        name: n.clone(),
+                        ty: ty_to_dwarf(ty),
+                    })
+                    .collect();
+                let ret = ty_to_dwarf(&sig.ret);
+                self.dwarf.record_function(&f.name, func_id, size, f.span.line, rows, file_index, params, ret);
             }
         }
 
@@ -4638,6 +4645,25 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         Ty::Generic(_) => PTR,
         Ty::FnPtr { .. } => PTR,
         Ty::Error => cl_types::I32,
+    }
+}
+
+/// Map Lumen's internal Ty into the smaller DWARF-facing enum. Every
+/// heap-allocated shape (strings, bytes, lists, structs, sums, tuples,
+/// handles, fn ptrs) collapses to `Pointer` — gdb sees them as opaque
+/// addresses until ax3's follow-up wires full struct layouts.
+fn ty_to_dwarf(ty: &Ty) -> crate::dwarf::DwarfTy {
+    use crate::dwarf::DwarfTy;
+    match ty {
+        Ty::I32 => DwarfTy::I32,
+        Ty::I64 => DwarfTy::I64,
+        Ty::U32 => DwarfTy::U32,
+        Ty::U64 => DwarfTy::U64,
+        Ty::F64 => DwarfTy::F64,
+        Ty::Bool => DwarfTy::Bool,
+        Ty::Char => DwarfTy::Char,
+        Ty::Unit => DwarfTy::Unit,
+        _ => DwarfTy::Pointer,
     }
 }
 
