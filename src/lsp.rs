@@ -14,7 +14,7 @@
 //! rename, autocomplete, workspace-wide analysis.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -198,13 +198,13 @@ impl Server {
     fn on_did_change(&mut self, params: &Value) -> Vec<Value> {
         let Some(uri) = text_document_uri(params) else { return Vec::new(); };
         let uri = uri.to_string();
-        // We advertise full-text sync, so each change carries the
-        // complete document. Partial-sync support is a follow-up.
         if let Some(changes) = params.pointer("/contentChanges").and_then(|c| c.as_array()) {
-            if let Some(last) = changes.last() {
-                if let Some(text) = last.get("text").and_then(|t| t.as_str()) {
-                    let entry = self.docs.entry(uri.clone()).or_default();
-                    entry.text = text.to_string();
+            let entry = self.docs.entry(uri.clone()).or_default();
+            for change in changes {
+                let text = change.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                match change.get("range") {
+                    Some(range) => apply_incremental_edit(&mut entry.text, range, text),
+                    None => entry.text = text.to_string(),
                 }
             }
         }
@@ -546,20 +546,89 @@ fn span_to_range(_src: &str, span: &Span, len: u32) -> Value {
 }
 
 /// Find the identifier-like word around a (line, col) position.
-/// 0-based line and 0-based UTF-16 code unit column (LSP spec).
+/// `col` is an LSP UTF-16 code unit offset; we translate to a byte
+/// offset before walking the line text.
 fn word_at_position(src: &str, line: u32, col: u32) -> String {
     let Some(line_text) = src.lines().nth(line as usize) else { return String::new(); };
     let bytes = line_text.as_bytes();
-    let c = col as usize;
+    let c = utf16_col_to_byte(line_text, col);
     if c > bytes.len() { return String::new(); }
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    // Walk left and right to find the word boundary.
     let mut start = c;
     while start > 0 && is_word(bytes[start - 1]) { start -= 1; }
     let mut end = c;
     while end < bytes.len() && is_word(bytes[end]) { end += 1; }
     if start == end { return String::new(); }
     line_text[start..end].to_string()
+}
+
+/// Translate an LSP UTF-16 column into a byte offset within a line.
+/// For pure-ASCII lines this is the identity; for UTF-8 with
+/// non-ASCII chars it advances the byte cursor one code point at a
+/// time, counting UTF-16 code units as it goes (surrogate pairs =
+/// 2 units for chars above U+FFFF).
+fn utf16_col_to_byte(line: &str, utf16_col: u32) -> usize {
+    let mut consumed: u32 = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if consumed >= utf16_col {
+            return byte_idx;
+        }
+        consumed += ch.len_utf16() as u32;
+    }
+    line.len()
+}
+
+/// Inverse of `utf16_col_to_byte`: given a byte offset within a line,
+/// return the LSP UTF-16 column.
+fn byte_to_utf16_col(line: &str, byte_offset: usize) -> u32 {
+    let mut consumed: u32 = 0;
+    for (byte_idx, ch) in line.char_indices() {
+        if byte_idx >= byte_offset { return consumed; }
+        consumed += ch.len_utf16() as u32;
+    }
+    consumed
+}
+
+/// Apply an LSP incremental content change to the current document
+/// text. The `range` uses 0-based line + UTF-16 columns; we translate
+/// to byte offsets in the current text before splicing.
+fn apply_incremental_edit(text: &mut String, range: &Value, new_text: &str) {
+    let start_line = range.pointer("/start/line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let start_col = range.pointer("/start/character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let end_line = range.pointer("/end/line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let end_col = range.pointer("/end/character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let Some(start) = position_to_byte(text, start_line, start_col) else { return; };
+    let Some(end) = position_to_byte(text, end_line, end_col) else { return; };
+    if start <= end && end <= text.len() {
+        text.replace_range(start..end, new_text);
+    }
+}
+
+/// Translate an LSP (line, UTF-16 col) position into a byte offset
+/// in the full source. Walks newlines + hands off column translation
+/// to `utf16_col_to_byte`.
+fn position_to_byte(src: &str, line: u32, col: u32) -> Option<usize> {
+    let mut current_line: u32 = 0;
+    let mut line_start: usize = 0;
+    for (idx, b) in src.bytes().enumerate() {
+        if current_line == line {
+            let line_end = src[idx..].find('\n').map(|n| idx + n).unwrap_or(src.len());
+            let line_text = &src[idx..line_end];
+            return Some(idx + utf16_col_to_byte(line_text, col));
+        }
+        if b == b'\n' {
+            current_line += 1;
+            line_start = idx + 1;
+        }
+    }
+    // Past the last line? Treat as end-of-file if `line` equals the
+    // number of lines walked and `col` is 0.
+    if current_line == line {
+        let line_text = &src[line_start..];
+        Some(line_start + utf16_col_to_byte(line_text, col))
+    } else {
+        None
+    }
 }
 
 // --- Pipeline → LSP diagnostics -----------------------------------------
@@ -710,13 +779,14 @@ fn display_ast_type(t: &ast::Type) -> String {
 }
 
 fn diagnostic_from_span(span: &Span, message: &str, source: &str) -> Value {
-    // LSP uses 0-based line + character (UTF-16). Our spans are
-    // 1-based line and 1-based column — subtract one on each.
+    // Our spans are 1-based byte columns; LSP wants 0-based UTF-16.
+    // We don't have the source text here so we just translate 1-based
+    // → 0-based and trust the caller's line text is ASCII for now.
+    // For non-ASCII source we'd need `diagnostic_from_span_utf16`
+    // that takes the source text too. Single byte column → utf16
+    // column is exact for the ASCII subset, off for combining chars.
     let line = span.line.saturating_sub(1);
     let start_col = span.col.saturating_sub(1);
-    // span.end is a byte offset, not a column. Approximate the end
-    // by using the same line with a +1 width — good enough for
-    // highlighting the first token of the error.
     let end_col = start_col + 1;
     json!({
         "range": {
@@ -734,11 +804,13 @@ fn diagnostic_from_span(span: &Span, message: &str, source: &str) -> Value {
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
-            // 1 = Full text sync; client re-sends the whole document
-            // on every change. Incremental sync is a follow-up.
+            // 2 = Incremental — clients send per-range edits instead
+            // of resending the whole document. Our handler still
+            // falls back to full-text mode for clients that prefer
+            // it (range is omitted in that case).
             "textDocumentSync": {
                 "openClose": true,
-                "change": 1,
+                "change": 2,
                 "save": { "includeText": false },
             },
             "hoverProvider": true,

@@ -278,6 +278,53 @@ fn lsp_completion_after_module_dot() {
 }
 
 #[test]
+fn lsp_incremental_edit_updates_document() {
+    // Start with a clean doc (no diagnostics), then send an
+    // incremental edit that introduces a type error. The server
+    // must apply the partial edit in place and re-diagnose.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen lsp");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin.write_all(frame(init).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains(r#""change":2"#),
+        "initialize should advertise Incremental (2) sync:\n{resp}");
+
+    let src = r#"fn f(): i32 {\n    return 0\n}"#;
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///inc.lm","languageId":"lumen","version":1,"text":"{}"}}}}}}"#,
+        src,
+    );
+    stdin.write_all(frame(&did_open).as_bytes()).unwrap();
+    let diag = read_message(&mut reader);
+    assert!(diag.contains(r#""diagnostics":[]"#), "clean initial state, got:\n{diag}");
+
+    // Replace the `0` on line 1, cols 11..12, with `"oops"` — now
+    // the return type is wrong.
+    let edit = r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///inc.lm","version":2},"contentChanges":[{"range":{"start":{"line":1,"character":11},"end":{"line":1,"character":12}},"text":"\"oops\""}]}}"#;
+    stdin.write_all(frame(edit).as_bytes()).unwrap();
+    let diag2 = read_message(&mut reader);
+    assert!(diag2.contains("lumen-type"),
+        "incremental edit should produce a type error, got:\n{diag2}");
+
+    let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+    stdin.write_all(frame(shutdown).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+    stdin.write_all(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#).as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn lsp_clean_document_has_empty_diagnostics() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .arg("lsp")
