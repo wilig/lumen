@@ -118,6 +118,13 @@ impl Ty {
         )
     }
 
+    /// Types that can cross the `as` cast boundary. Includes the plain
+    /// numerics plus `char` (represented as i32 at runtime, so the
+    /// cast is a no-op — but it's semantically distinct).
+    fn is_castable(&self) -> bool {
+        self.is_numeric() || matches!(self, Ty::Char)
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1734,20 +1741,20 @@ impl<'a> FnChecker<'a> {
                 let from = self.infer_expr(inner);
                 let to_ty = self.resolve_or_error(to);
                 if matches!(to_ty, Ty::Error) { return Ty::Error; }
-                if !from.is_numeric() && !matches!(from, Ty::Error) {
+                if !from.is_castable() && !matches!(from, Ty::Error) {
                     self.errors.push(TypeError {
                         span: expr.span,
                         message: format!(
-                            "`as` cast requires a numeric source, found {}",
+                            "`as` cast requires a numeric or char source, found {}",
                             from.display()
                         ),
                     });
                 }
-                if !to_ty.is_numeric() {
+                if !to_ty.is_castable() {
                     self.errors.push(TypeError {
                         span: expr.span,
                         message: format!(
-                            "`as` cast requires a numeric target, found {}",
+                            "`as` cast requires a numeric or char target, found {}",
                             to_ty.display()
                         ),
                     });
@@ -3525,7 +3532,7 @@ mod tests {
     #[test]
     fn cast_requires_numeric() {
         let errs = tc_err("fn f(b: bool): i32 { return b as i32 }");
-        assert!(errs.iter().any(|e| e.message.contains("numeric source")));
+        assert!(errs.iter().any(|e| e.message.contains("numeric or char source")));
     }
 
     #[test]

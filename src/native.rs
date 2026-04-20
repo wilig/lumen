@@ -4352,6 +4352,11 @@ fn resolve_cast_target(ty: &ast::Type) -> Result<Ty, NativeError> {
             "u32" => Ok(Ty::U32),
             "u64" => Ok(Ty::U64),
             "f64" => Ok(Ty::F64),
+            // char is represented as i32 at runtime; allow the cast so
+            // users can convert an i32 codepoint (e.g. from a decoder)
+            // into a char. There's no validity check here — callers that
+            // need one should use a checked conversion helper.
+            "char" => Ok(Ty::Char),
             _ => Err(NativeError {
                 span: ty.span,
                 message: format!("`as` target must be numeric, got `{name}`"),

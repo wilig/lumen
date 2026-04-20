@@ -1,0 +1,21 @@
+// string.trim handles the Unicode White_Space property, not just
+// ASCII 0x09/0x0A/0x0D/0x20. Regression guard for the original
+// byte-scan version that silently did nothing for NBSP / CJK / LS.
+import std/io
+import std/string
+
+fn main(): i32 io {
+    let nbsp = string.from_char('\u{00A0}')
+    let cjk = string.from_char('\u{3000}')
+    let ls = string.from_char('\u{2028}')
+
+    io.println("ASCII:  '\{string.trim("  hi  ")}'")
+    io.println("NBSP:   '\{string.trim(nbsp + nbsp + "hi" + nbsp)}'")
+    io.println("CJK:    '\{string.trim(cjk + cjk + "hi" + cjk)}'")
+    io.println("Mixed:  '\{string.trim(nbsp + " \thello\t " + ls + " " + cjk)}'")
+    io.println("Empty:  '\{string.trim("")}'")
+    io.println("AllWS:  '\{string.trim("   " + cjk + "\t" + nbsp)}'")
+    io.println("NoWS:   '\{string.trim("abc")}'")
+    io.println("Center: '\{string.trim("  a b c  ")}'")
+    return 0
+}

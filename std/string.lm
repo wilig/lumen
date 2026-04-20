@@ -18,6 +18,16 @@ extern fn char_count(s: string): i32 link "lumen_string_char_count"
 // Make a one-character string from a Unicode scalar value.
 extern fn from_char(c: char): string link "lumen_string_from_char"
 
+// Decode the UTF-8 character at byte position `byte_i` into its
+// scalar value. Returns -1 if byte_i is out of range or points at a
+// continuation byte. Used by trim to walk UTF-8 without paying for a
+// full char-index walk per step.
+extern fn _decode_at(s: bytes, byte_i: i32): i32 link "lumen_utf8_decode_at"
+
+// UTF-8 width in bytes of the character starting at `byte_i` (1..=4,
+// or 0 on invalid position).
+extern fn _char_width(s: bytes, byte_i: i32): i32 link "lumen_utf8_char_width"
+
 fn substring(s: string, start: i32, count: i32): string {
     return from_bytes(bytes.slice(bytes.from_string(s), start, count))
 }
@@ -61,41 +71,54 @@ fn index_of(haystack: string, needle: string): i32 {
     return 0 - 1
 }
 
+// Whitespace test matching the Unicode White_Space property
+// (approximated): ASCII whitespace plus NEL, NBSP, Ogham space,
+// U+2000..U+200A width-specific spaces, Line/Paragraph Separator,
+// Narrow/Medium Mathematical spaces, and CJK Ideographic Space.
 fn is_space(c: char): i32 {
-    if c == ' ' { return 1 }
-    if c == '\t' { return 1 }
-    if c == '\n' { return 1 }
-    if c == '\r' { return 1 }
+    if c == ' ' { return 1 }                // U+0020
+    if c == '\t' { return 1 }               // U+0009
+    if c == '\n' { return 1 }               // U+000A
+    if c == '\r' { return 1 }               // U+000D
+    if c == '\u{000B}' { return 1 }         // vertical tab
+    if c == '\u{000C}' { return 1 }         // form feed
+    if c == '\u{0085}' { return 1 }         // NEL
+    if c == '\u{00A0}' { return 1 }         // NBSP
+    if c == '\u{1680}' { return 1 }         // Ogham space mark
+    if c == '\u{2028}' { return 1 }         // Line Separator
+    if c == '\u{2029}' { return 1 }         // Paragraph Separator
+    if c == '\u{202F}' { return 1 }         // Narrow No-Break Space
+    if c == '\u{205F}' { return 1 }         // Medium Mathematical Space
+    if c == '\u{3000}' { return 1 }         // CJK Ideographic Space
+    // U+2000..U+200A — various-width spaces in the General Punctuation block.
+    if c >= '\u{2000}' { if c <= '\u{200A}' { return 1 } }
     return 0
 }
 
-// Byte-level whitespace check used internally by trim. ASCII whitespace
-// bytes (0x09, 0x0A, 0x0D, 0x20) never appear as UTF-8 continuation
-// bytes, so a byte-level scan is correct even for non-ASCII input.
-fn is_space_byte(b: i32): i32 {
-    if b == 32 { return 1 }
-    if b == 9 { return 1 }
-    if b == 10 { return 1 }
-    if b == 13 { return 1 }
-    return 0
-}
-
+// Strip Unicode-whitespace characters from both ends. Single forward
+// pass: decode each UTF-8 char, track byte offsets of the first and
+// last non-whitespace positions, substring between them. O(n).
 fn trim(s: string): string {
     let slen = len(s)
     let b = bytes.from_string(s)
-    var start = 0
-    var end = slen
+    var first: i32 = 0 - 1      // byte index of first non-ws (sentinel -1)
+    var last: i32 = 0           // byte index just past last non-ws
+    var i: i32 = 0
+    // Upper-bounded by byte length; each iteration advances i by the
+    // UTF-8 width of the current char (1..=4), so we always halt.
     for _ in range(0, slen) {
-        if start < slen {
-            if is_space_byte(bytes.get(b, start)) == 1 { start += 1 }
+        if i < slen {
+            let cp = _decode_at(b, i)
+            let w = _char_width(b, i)
+            if is_space(cp as char) == 0 {
+                if first == 0 - 1 { first = i }
+                last = i + w
+            }
+            i = i + w
         }
     }
-    for _ in range(0, slen) {
-        if end > start {
-            if is_space_byte(bytes.get(b, end - 1)) == 1 { end -= 1 }
-        }
-    }
-    return substring(s, start, end - start)
+    if first == 0 - 1 { return "" }
+    return substring(s, first, last - first)
 }
 
 fn split(s: string, sep: string): i64 {

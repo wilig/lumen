@@ -1,0 +1,8 @@
+ASCII:  'hi'
+NBSP:   'hi'
+CJK:    'hi'
+Mixed:  'hello'
+Empty:  ''
+AllWS:  ''
+NoWS:   'abc'
+Center: 'a b c'
