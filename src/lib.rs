@@ -5,6 +5,7 @@
 
 pub mod ast;
 pub mod dwarf;
+pub mod imports;
 pub mod lexer;
 pub mod lsp;
 pub mod native;

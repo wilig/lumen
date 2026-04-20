@@ -105,47 +105,15 @@ fn compile_to_object(path: &str, debug: bool) -> Result<(Vec<u8>, String, Vec<St
         format_error(&src, path, "parse error", e.span.line, e.span.col, 0, &e.message)
     })?;
 
-    // Resolve imports from std/ and vendor/ directories, recursively
-    // following transitive imports.
+    // Resolve imports transitively. Any load/lex/parse failures get
+    // surfaced as top-level errors so the CLI stays strict.
     let base_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut imported = Vec::new();
-    let mut module_paths: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Queue: (import_path_segments, registered_name).
-    let mut queue: Vec<(Vec<String>, String)> = module.imports.iter()
-        .map(|imp| {
-            let file_name = imp.path.last().cloned().unwrap_or_default();
-            let reg_name = imp.alias.clone().unwrap_or_else(|| file_name.clone());
-            (imp.path.clone(), reg_name)
-        })
-        .collect();
-    while let Some((path_segs, reg_name)) = queue.pop() {
-        if loaded.contains(&reg_name) { continue; }
-        loaded.insert(reg_name.clone());
-        // Build file path: import std/http → std/http.lm, import vendor/raylib → vendor/raylib.lm
-        let file_name = path_segs.last().cloned().unwrap_or_default();
-        let mut mod_path = base_dir.to_path_buf();
-        for seg in &path_segs[..path_segs.len() - 1] {
-            mod_path = mod_path.join(seg);
-        }
-        mod_path = mod_path.join(format!("{file_name}.lm"));
-        if mod_path.exists() {
-            let mod_src = std::fs::read_to_string(&mod_path)
-                .map_err(|e| format!("read {}: {e}", mod_path.display()))?;
-            let mod_tokens = lumen::lexer::lex(&mod_src)
-                .map_err(|e| format!("lex error in {}: {e}", mod_path.display()))?;
-            let mod_ast = lumen::parser::parse(mod_tokens)
-                .map_err(|e| format!("parse error in {}: {e}", mod_path.display()))?;
-            // Queue transitive imports.
-            for imp in &mod_ast.imports {
-                let dep = imp.path.last().cloned().unwrap_or_default();
-                let dep_name = imp.alias.clone().unwrap_or_else(|| dep.clone());
-                if !loaded.contains(&dep_name) { queue.push((imp.path.clone(), dep_name)); }
-            }
-            module_paths.insert(reg_name.clone(), mod_path.to_string_lossy().into_owned());
-            imported.push(lumen::types::ParsedImport { name: reg_name, module: mod_ast });
-        }
+    let resolved = lumen::imports::resolve(&module, base_dir);
+    if let Some(first) = resolved.errors.first() {
+        return Err(first.clone());
     }
+    let imported = resolved.imported;
+    let module_paths = resolved.paths;
 
     let mut info = lumen::types::typecheck(&module, &imported).map_err(|errs| {
         errs.iter()

@@ -83,6 +83,51 @@ fn lsp_initialize_then_diagnostics_on_type_error() {
 }
 
 #[test]
+fn lsp_resolves_std_imports() {
+    // With workspace-wide import resolution, a document that imports
+    // std/io and calls io.println should typecheck cleanly. Without
+    // it, io would be unknown and the call would fail.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen lsp");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    // Initialize WITHOUT a rootUri — the server should fall back to
+    // the compiler source tree (CARGO_MANIFEST_DIR) so std/ is still
+    // visible.
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin.write_all(frame(init).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+
+    // `\n` must be a JSON-escaped newline inside the text string.
+    let src = r#"import std/io\n\nfn main(): i32 io {\n    io.println(\"hi\")\n    return 0\n}"#;
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///imp.lm","languageId":"lumen","version":1,"text":"{}"}}}}}}"#,
+        src,
+    );
+    stdin.write_all(frame(&did_open).as_bytes()).unwrap();
+
+    let diag = read_message(&mut reader);
+    assert!(diag.contains(r#""diagnostics":[]"#),
+        "std/io-using document should typecheck clean, got:\n{diag}");
+
+    let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+    stdin.write_all(frame(shutdown).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+    let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+    stdin.write_all(frame(exit).as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn lsp_clean_document_has_empty_diagnostics() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .arg("lsp")

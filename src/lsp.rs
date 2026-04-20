@@ -15,13 +15,15 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
+use crate::imports;
 use crate::lexer;
 use crate::parser;
 use crate::span::Span;
-use crate::types::{self, ParsedImport, TypeError};
+use crate::types::{self, TypeError};
 
 /// Run the LSP server on stdin/stdout until a shutdown+exit sequence
 /// arrives. Returns the process exit code the CLI should use.
@@ -97,6 +99,11 @@ fn write_message(out: &mut impl Write, v: &Value) -> io::Result<()> {
 struct Server {
     /// Most recent source text for each open document, keyed by URI.
     docs: HashMap<String, String>,
+    /// Workspace root discovered via the client's `rootUri` at
+    /// initialize time, falling back to the compiler source tree
+    /// (`CARGO_MANIFEST_DIR`) so the built-in `std/` modules always
+    /// resolve. Imports are loaded relative to this directory.
+    workspace_root: Option<PathBuf>,
     shutting_down: bool,
     exit_requested: bool,
 }
@@ -108,7 +115,14 @@ impl Server {
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         match method {
-            "initialize" => vec![respond(id, initialize_result())],
+            "initialize" => {
+                // Extract the workspace root from rootUri /
+                // workspaceFolders. Fall back to the compile tree's
+                // directory so the built-in std/* modules always
+                // resolve even for one-off files outside a project.
+                self.workspace_root = extract_workspace_root(&params);
+                vec![respond(id, initialize_result())]
+            }
             "initialized" => Vec::new(),
             "shutdown" => {
                 self.shutting_down = true;
@@ -197,7 +211,8 @@ impl Server {
     /// an empty list to clear prior errors).
     fn diagnostics_for(&self, uri: &str) -> Value {
         let src = self.docs.get(uri).cloned().unwrap_or_default();
-        let diags = run_pipeline(&src);
+        let root = self.resolve_root();
+        let diags = run_pipeline(&src, &root);
         json!({
             "jsonrpc": "2.0",
             "method": "textDocument/publishDiagnostics",
@@ -207,6 +222,43 @@ impl Server {
             }
         })
     }
+
+    fn resolve_root(&self) -> PathBuf {
+        self.workspace_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
+}
+
+/// Parse the workspace root out of LSP `initialize` params. Prefers
+/// `workspaceFolders[0].uri`, then `rootUri`, then `rootPath`.
+fn extract_workspace_root(params: &Value) -> Option<PathBuf> {
+    if let Some(folders) = params.pointer("/workspaceFolders").and_then(|v| v.as_array()) {
+        if let Some(uri) = folders.first().and_then(|f| f.get("uri")).and_then(|u| u.as_str()) {
+            if let Some(p) = uri_to_path(uri) { return Some(p); }
+        }
+    }
+    if let Some(uri) = params.pointer("/rootUri").and_then(|u| u.as_str()) {
+        if let Some(p) = uri_to_path(uri) { return Some(p); }
+    }
+    if let Some(path) = params.pointer("/rootPath").and_then(|u| u.as_str()) {
+        return Some(PathBuf::from(path));
+    }
+    None
+}
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    // file:///home/foo → /home/foo. Only the file:// scheme is useful.
+    let rest = uri.strip_prefix("file://")?;
+    // Some clients include a host (file://host/path); most use file:///path.
+    let path = if rest.starts_with('/') { rest.to_string() } else {
+        // file://host/path — drop host.
+        match rest.find('/') {
+            Some(i) => rest[i..].to_string(),
+            None => return None,
+        }
+    };
+    Some(PathBuf::from(path))
 }
 
 fn text_document_uri(params: &Value) -> Option<&str> {
@@ -233,7 +285,10 @@ fn word_at_position(src: &str, line: u32, col: u32) -> String {
 // --- Pipeline → LSP diagnostics -----------------------------------------
 
 /// Run lex/parse/typecheck on `src` and return LSP `Diagnostic` values.
-fn run_pipeline(src: &str) -> Vec<Value> {
+/// `workspace_root` scopes transitive import resolution — typically
+/// the client's rootUri, falling back to the compiler source tree so
+/// the built-in stdlib is always visible.
+fn run_pipeline(src: &str, workspace_root: &Path) -> Vec<Value> {
     let tokens = match lexer::lex(src) {
         Ok(t) => t,
         Err(e) => return vec![diagnostic_from_span(&e.span, &e.message, "lex")],
@@ -242,11 +297,8 @@ fn run_pipeline(src: &str) -> Vec<Value> {
         Ok(m) => m,
         Err(e) => return vec![diagnostic_from_span(&e.span, &e.message, "parse")],
     };
-    // Typecheck with no imports resolved — LSP mode is single-file
-    // for now. Full workspace resolution (walking imported modules
-    // from the filesystem) is a follow-up.
-    let imports: Vec<ParsedImport> = Vec::new();
-    match types::typecheck(&module, &imports) {
+    let resolved = imports::resolve(&module, workspace_root);
+    match types::typecheck(&module, &resolved.imported) {
         Ok(_) => Vec::new(),
         Err(errors) => errors.iter()
             .map(|e: &TypeError| diagnostic_from_span(&e.span, &e.message, "type"))
