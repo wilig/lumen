@@ -232,6 +232,52 @@ fn lsp_goto_def_and_references_and_rename() {
 }
 
 #[test]
+fn lsp_completion_after_module_dot() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen lsp");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin.write_all(frame(init).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains("completionProvider"),
+        "initialize should advertise completion:\n{resp}");
+
+    // Import std/io. Use a parseable document (io.println) so the
+    // typechecker's ModuleInfo is populated, then ask for completion
+    // at a position right after `io.` — the prefix detection only
+    // needs the text to the left of the cursor.
+    let src = r#"import std/io\n\nfn main(): i32 io {\n    io.println(\"x\")\n    return 0\n}"#;
+    let did_open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///c.lm","languageId":"lumen","version":1,"text":"{}"}}}}}}"#,
+        src,
+    );
+    stdin.write_all(frame(&did_open).as_bytes()).unwrap();
+    let _ = read_message(&mut reader); // diagnostics
+
+    // Cursor immediately after `io.` on line 3, character 7.
+    let complete = r#"{"jsonrpc":"2.0","id":30,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///c.lm"},"position":{"line":3,"character":7}}}"#;
+    stdin.write_all(frame(complete).as_bytes()).unwrap();
+    let resp = read_message(&mut reader);
+    assert!(resp.contains("println"),
+        "completion for `io.` should include println, got:\n{resp}");
+
+    let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+    stdin.write_all(frame(shutdown).as_bytes()).unwrap();
+    let _ = read_message(&mut reader);
+    stdin.write_all(frame(r#"{"jsonrpc":"2.0","method":"exit"}"#).as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait();
+}
+
+#[test]
 fn lsp_clean_document_has_empty_diagnostics() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
         .arg("lsp")

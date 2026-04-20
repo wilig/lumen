@@ -170,6 +170,10 @@ impl Server {
                 let result = self.on_rename(&params);
                 vec![respond(id, result)]
             }
+            "textDocument/completion" => {
+                let result = self.on_completion(&params);
+                vec![respond(id, result)]
+            }
             // Any request we don't handle gets a null result so the
             // client doesn't time out. Notifications we don't handle
             // are silently dropped.
@@ -253,6 +257,16 @@ impl Server {
             .map(|r| json!({ "uri": uri, "range": r }))
             .collect();
         Value::Array(result)
+    }
+
+    fn on_completion(&self, params: &Value) -> Value {
+        let Some(uri) = text_document_uri(params) else { return Value::Null; };
+        let Some(doc) = self.docs.get(uri) else { return Value::Null; };
+        let (line, col) = cursor(params);
+        let items = completion_items(&doc.text, line, col, doc.last_info.as_ref());
+        // Returning a flat array is LSP-spec-valid; clients accept
+        // either it or a `CompletionList` object.
+        Value::Array(items)
     }
 
     fn on_rename(&self, params: &Value) -> Value {
@@ -429,6 +443,94 @@ fn is_valid_identifier(s: &str) -> bool {
     let first = bytes[0];
     if !(first.is_ascii_alphabetic() || first == b'_') { return false; }
     bytes[1..].iter().all(|&b| is_word_byte(b))
+}
+
+/// Build the completion list for the cursor position.
+/// Current triggers:
+///   - After `<ident>.` → members of `ident` if it names an imported
+///     module (their signatures become the `detail` field).
+///   - Otherwise → top-level fns + imported module names + keywords.
+/// Position-aware in-scope param/local completion is a follow-up.
+fn completion_items(src: &str, line: u32, col: u32, info: Option<&ModuleInfo>) -> Vec<Value> {
+    let mut items = Vec::new();
+
+    // Detect "<ident>." just to the left of the cursor.
+    if let Some((module_name, _)) = dotted_prefix(src, line, col) {
+        if let Some(info) = info {
+            if let Some(mod_fns) = info.modules.get(&module_name) {
+                for (fname, sig) in mod_fns {
+                    items.push(json!({
+                        "label": fname,
+                        "kind": 2, // Method
+                        "detail": fn_detail(fname, sig),
+                    }));
+                }
+                return items;
+            }
+        }
+    }
+
+    // Fallback: generic completion. Top-level fn names, imported
+    // module names, and a small keyword list.
+    if let Some(info) = info {
+        for (fname, sig) in &info.fns {
+            items.push(json!({
+                "label": fname,
+                "kind": 3, // Function
+                "detail": fn_detail(fname, sig),
+            }));
+        }
+        for mod_name in info.modules.keys() {
+            items.push(json!({
+                "label": mod_name,
+                "kind": 9, // Module
+            }));
+        }
+    }
+    for kw in &[
+        "fn", "let", "var", "if", "else", "match", "return", "for", "in",
+        "type", "import", "extern", "as", "actor", "msg", "spawn", "send",
+        "ask", "arena", "true", "false", "unit", "io", "pure",
+    ] {
+        items.push(json!({ "label": kw, "kind": 14 })); // Keyword
+    }
+    items
+}
+
+fn fn_detail(name: &str, sig: &FnSig) -> String {
+    let params: Vec<String> = sig.params.iter()
+        .map(|(n, t)| format!("{n}: {}", t.display()))
+        .collect();
+    let generics = if sig.type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", sig.type_params.join(", "))
+    };
+    let effect = match sig.effect {
+        crate::ast::Effect::Io => " io",
+        crate::ast::Effect::Pure => "",
+    };
+    format!("fn {name}{generics}({}): {}{effect}",
+        params.join(", "),
+        sig.ret.display())
+}
+
+/// If the text just left of (line, col) matches `<ident>.`, return
+/// the ident string + the position of the dot. Used to detect
+/// trigger-character completions.
+fn dotted_prefix(src: &str, line: u32, col: u32) -> Option<(String, u32)> {
+    let line_text = src.lines().nth(line as usize)?;
+    let bytes = line_text.as_bytes();
+    let mut c = col as usize;
+    if c > bytes.len() { c = bytes.len(); }
+    // Need a `.` immediately before the cursor.
+    if c == 0 || bytes[c - 1] != b'.' { return None; }
+    let dot_idx = c - 1;
+    // Walk left from the dot while we see identifier bytes.
+    let mut start = dot_idx;
+    while start > 0 && is_word_byte(bytes[start - 1]) { start -= 1; }
+    if start == dot_idx { return None; }
+    Some((line_text[start..dot_idx].to_string(), dot_idx as u32))
 }
 
 /// Convert a compiler `Span` (1-based line/col + byte offsets) into
@@ -643,6 +745,10 @@ fn initialize_result() -> Value {
             "definitionProvider": true,
             "referencesProvider": true,
             "renameProvider": true,
+            "completionProvider": {
+                "triggerCharacters": ["."],
+                "resolveProvider": false,
+            },
         },
         "serverInfo": {
             "name": "lumen-lsp",
