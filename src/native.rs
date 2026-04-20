@@ -2544,6 +2544,190 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 self.builder.switch_to_block(merge_bb);
                 return Ok(self.builder.block_params(merge_bb)[0]);
             }
+            // map.merge(a, b): forward to lumen_map_merge with the
+            // value_is_ptr flag derived from V.
+            // map.get_or(m, k, default): narrow-V variant of map.get that
+            // returns either the looked-up value or the default. Avoids
+            // boxing into Option<V> when the caller already has a
+            // fallback in hand.
+            if mod_name == "map" && method == "get_or" {
+                let m = self.compile_expr(&args[0].value)?;
+                let k = self.compile_expr(&args[1].value)?;
+                let default = self.compile_expr(&args[2].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::I64 };
+
+                let get_fid = self.module_func("lumen_map_get");
+                let get_ref = self.cg.obj.declare_func_in_func(get_fid, self.builder.func);
+                let get_call = self.builder.ins().call(get_ref, &[m, k]);
+                let raw = self.builder.inst_results(get_call)[0];
+
+                let found_fid = self.module_func("lumen_map_get_found");
+                let found_ref = self.cg.obj.declare_func_in_func(found_fid, self.builder.func);
+                let found_call = self.builder.ins().call(found_ref, &[]);
+                let found = self.builder.inst_results(found_call)[0];
+
+                let got_bb = self.builder.create_block();
+                let default_bb = self.builder.create_block();
+                let merge_bb = self.builder.create_block();
+                self.builder.append_block_param(merge_bb, lumen_to_cl(&elem_ty));
+                self.builder.ins().brif(found, got_bb, &[], default_bb, &[]);
+
+                // Found: narrow i32 if needed, rc_incr for pointer types.
+                self.builder.switch_to_block(got_bb);
+                let got = if lumen_to_cl(&elem_ty) == cl_types::I32 {
+                    self.builder.ins().ireduce(cl_types::I32, raw)
+                } else { raw };
+                if !is_scalar(&elem_ty) {
+                    self.emit_rc_incr(got);
+                }
+                self.builder.ins().jump(merge_bb, &[BlockArg::Value(got)]);
+
+                // Not found: return default. If the default is a
+                // borrowed binding, the caller's scope-exit decr is
+                // balanced by an rc_incr here (same as a fresh
+                // allocation would be).
+                self.builder.switch_to_block(default_bb);
+                if !is_scalar(&elem_ty) {
+                    self.emit_rc_incr(default);
+                }
+                self.builder.ins().jump(merge_bb, &[BlockArg::Value(default)]);
+
+                self.builder.switch_to_block(merge_bb);
+                return Ok(self.builder.block_params(merge_bb)[0]);
+            }
+            if mod_name == "map" && method == "merge" {
+                let a = self.compile_expr(&args[0].value)?;
+                let b = self.compile_expr(&args[1].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                let value_is_ptr = !is_scalar(&val_ty);
+                let flag = self.builder.ins().iconst(cl_types::I32, if value_is_ptr { 1 } else { 0 });
+                let fid = self.module_func("lumen_map_merge");
+                let func_ref = self.cg.obj.declare_func_in_func(fid, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[a, b, flag]);
+                return Ok(self.builder.inst_results(call)[0]);
+            }
+            // map.values(m): build a new List<V> by iterating live
+            // entries. Inlined here (instead of written in std/map.lm)
+            // because the i64→V reinterpret for the value slot needs
+            // codegen-time knowledge of V.
+            if mod_name == "map" && method == "values" {
+                let m = self.compile_expr(&args[0].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+
+                // out = list.new(8)
+                let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
+                let list_new = self.module_func("lumen_list_new");
+                let list_new_ref = self.cg.obj.declare_func_in_func(list_new, self.builder.func);
+                let new_call = self.builder.ins().call(list_new_ref, &[elem_size]);
+                let out_var = self.fresh_var(cl_types::I64);
+                self.builder.def_var(out_var, self.builder.inst_results(new_call)[0]);
+
+                // n = lumen_map_len(m)
+                let len_fid = self.module_func("lumen_map_len");
+                let len_ref = self.cg.obj.declare_func_in_func(len_fid, self.builder.func);
+                let len_call = self.builder.ins().call(len_ref, &[m]);
+                let n = self.builder.inst_results(len_call)[0];
+
+                // for i in 0..n { out = list.push(out, live_value_at(m, i)) }
+                let i_var = self.fresh_var(cl_types::I32);
+                let zero = self.builder.ins().iconst(cl_types::I32, 0);
+                self.builder.def_var(i_var, zero);
+                let header = self.builder.create_block();
+                let body = self.builder.create_block();
+                let exit = self.builder.create_block();
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(header);
+                let i = self.builder.use_var(i_var);
+                let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, n);
+                self.builder.ins().brif(done, exit, &[], body, &[]);
+                self.builder.switch_to_block(body);
+                let val_fid = self.module_func("lumen_map_live_value_at");
+                let val_ref = self.cg.obj.declare_func_in_func(val_fid, self.builder.func);
+                let val_call = self.builder.ins().call(val_ref, &[m, i]);
+                let val64 = self.builder.inst_results(val_call)[0];
+                if !is_scalar(&val_ty) {
+                    self.emit_rc_incr(val64);
+                }
+                let push_fid = self.module_func("lumen_list_push");
+                let push_ref = self.cg.obj.declare_func_in_func(push_fid, self.builder.func);
+                let out_val = self.builder.use_var(out_var);
+                let push_call = self.builder.ins().call(push_ref, &[out_val, val64]);
+                self.builder.def_var(out_var, self.builder.inst_results(push_call)[0]);
+                let next_i = self.builder.ins().iadd_imm(i, 1);
+                self.builder.def_var(i_var, next_i);
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(exit);
+                return Ok(self.builder.use_var(out_var));
+            }
+            // map.entries(m): build List<(string, V)>. Similar to
+            // map.values, but allocates a 16-byte tuple per entry.
+            if mod_name == "map" && method == "entries" {
+                let m = self.compile_expr(&args[0].value)?;
+                let map_ty = self.infer_ty(&args[0].value)?;
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+
+                // out = list.new(8)
+                let elem_size = self.builder.ins().iconst(cl_types::I32, 8);
+                let list_new = self.module_func("lumen_list_new");
+                let list_new_ref = self.cg.obj.declare_func_in_func(list_new, self.builder.func);
+                let new_call = self.builder.ins().call(list_new_ref, &[elem_size]);
+                let out_var = self.fresh_var(cl_types::I64);
+                self.builder.def_var(out_var, self.builder.inst_results(new_call)[0]);
+
+                let len_fid = self.module_func("lumen_map_len");
+                let len_ref = self.cg.obj.declare_func_in_func(len_fid, self.builder.func);
+                let len_call = self.builder.ins().call(len_ref, &[m]);
+                let n = self.builder.inst_results(len_call)[0];
+
+                let i_var = self.fresh_var(cl_types::I32);
+                let zero = self.builder.ins().iconst(cl_types::I32, 0);
+                self.builder.def_var(i_var, zero);
+                let header = self.builder.create_block();
+                let body = self.builder.create_block();
+                let exit = self.builder.create_block();
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(header);
+                let i = self.builder.use_var(i_var);
+                let done = self.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, n);
+                self.builder.ins().brif(done, exit, &[], body, &[]);
+                self.builder.switch_to_block(body);
+
+                // Tuple layout: (string at +0, V at +8). Allocate
+                // 16 bytes regardless of V (all Ty::* are ≤ 8 bytes).
+                let tup = self.rc_alloc(16)?;
+                let key_fid = self.module_func("lumen_map_live_key_at");
+                let key_ref = self.cg.obj.declare_func_in_func(key_fid, self.builder.func);
+                let key_call = self.builder.ins().call(key_ref, &[m, i]);
+                let k = self.builder.inst_results(key_call)[0];
+                // Key is the live map slot's ptr; the tuple gains a new
+                // owner, so rc_incr.
+                self.emit_rc_incr(k);
+                self.builder.ins().store(MemFlags::new(), k, tup, 0);
+
+                let val_fid = self.module_func("lumen_map_live_value_at");
+                let val_ref = self.cg.obj.declare_func_in_func(val_fid, self.builder.func);
+                let val_call = self.builder.ins().call(val_ref, &[m, i]);
+                let val64 = self.builder.inst_results(val_call)[0];
+                if !is_scalar(&val_ty) {
+                    self.emit_rc_incr(val64);
+                }
+                self.builder.ins().store(MemFlags::new(), val64, tup, 8);
+
+                let push_fid = self.module_func("lumen_list_push");
+                let push_ref = self.cg.obj.declare_func_in_func(push_fid, self.builder.func);
+                let out_val = self.builder.use_var(out_var);
+                let push_call = self.builder.ins().call(push_ref, &[out_val, tup]);
+                self.builder.def_var(out_var, self.builder.inst_results(push_call)[0]);
+
+                let next_i = self.builder.ins().iadd_imm(i, 1);
+                self.builder.def_var(i_var, next_i);
+                self.builder.ins().jump(header, &[]);
+                self.builder.switch_to_block(exit);
+                return Ok(self.builder.use_var(out_var));
+            }
         }
         // Fall through to imported module lookup.
         if let ExprKind::Ident(mod_name) = &receiver.kind {
@@ -3968,6 +4152,30 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     if m == "map" && method == "len" {
                         return Ok(Ty::I32);
+                    }
+                    if m == "map" && method == "values" {
+                        let map_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?
+                            .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                        let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                        return Ok(Ty::List(Box::new(elem_ty)));
+                    }
+                    if m == "map" && method == "entries" {
+                        let map_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?
+                            .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                        let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                        return Ok(Ty::List(Box::new(Ty::Tuple(vec![Ty::String, elem_ty]))));
+                    }
+                    if m == "map" && method == "merge" {
+                        if let Some(first_arg) = args.first() {
+                            return self.infer_ty(&first_arg.value);
+                        }
+                        return Ok(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                    }
+                    if m == "map" && method == "get_or" {
+                        let map_ty = args.first().map(|a| self.infer_ty(&a.value)).transpose()?
+                            .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                        let elem_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                        return Ok(elem_ty);
                     }
                     // --- Raylib ---
                     if m == "rl" {

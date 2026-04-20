@@ -15,6 +15,8 @@
 // All mutation operations return the (possibly relocated) map pointer —
 // rebind with `m = map.set(m, ...)`, same convention as List.
 
+import std/list
+
 extern fn new(): i64 link "lumen_map_new"
 extern fn contains(m: i64, k: string): i32 link "lumen_map_contains"
 extern fn len(m: i64): i32 link "lumen_map_len"
@@ -29,3 +31,26 @@ extern fn remove(m: i64, k: string, value_is_ptr: i32): i64 link "lumen_map_remo
 // inferred from the map's element type; the raw extern is internal.
 extern fn _get(m: i64, k: string): i64 link "lumen_map_get"
 extern fn _get_found(): i32 link "lumen_map_get_found"
+
+// Live-entry iterators. Skip tombstones so indices are 0..len(m).
+extern fn _live_key_at(m: i64, i: i32): string link "lumen_map_live_key_at"
+extern fn _live_value_at(m: i64, i: i32): i64 link "lumen_map_live_value_at"
+
+// merge/values/entries are special-cased in the codegen so they can
+// handle V-dependent representation (value_is_ptr flag, i32 ireduce).
+// The raw extern for merge is internal.
+extern fn _merge_raw(a: i64, b: i64, vptr: i32): i64 link "lumen_map_merge"
+
+// Collect keys in insertion order. Non-generic (keys are always string).
+fn keys(m: i64): List<string> {
+    var out: List<string> = list.new()
+    let n = len(m)
+    for i in range(0, n) {
+        out = list.push(out, _live_key_at(m, i))
+    }
+    return out
+}
+
+// map.get_or(m, k, default) is a codegen special — see compile_method_call
+// in src/native.rs. Uses the raw _get extern + _get_found check, then
+// returns the value with proper i32 narrowing / pointer rc_incr.

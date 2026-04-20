@@ -2439,6 +2439,37 @@ impl<'a> FnChecker<'a> {
                 if let Some(a) = args.first() { self.infer_expr(&a.value); }
                 return Some(Ty::I32);
             }
+            ("map", "values") => {
+                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.values` expects 1 arg".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                return Some(Ty::List(Box::new(val_ty)));
+            }
+            ("map", "entries") => {
+                if args.len() != 1 { self.errors.push(TypeError { span, message: "`map.entries` expects 1 arg".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                let val_ty = match map_ty { Ty::Map(_, v) => *v, _ => Ty::Error };
+                return Some(Ty::List(Box::new(Ty::Tuple(vec![Ty::String, val_ty]))));
+            }
+            ("map", "merge") => {
+                if args.len() != 2 { self.errors.push(TypeError { span, message: "`map.merge` expects 2 args".into() }); }
+                let a_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                // Second arg should be same Map type.
+                if let Some(b) = args.get(1) { self.check_expr(&b.value, &a_ty); }
+                return Some(a_ty);
+            }
+            ("map", "get_or") => {
+                if args.len() != 3 { self.errors.push(TypeError { span, message: "`map.get_or` expects 3 args".into() }); }
+                let map_ty = args.first().map(|a| self.infer_expr(&a.value))
+                    .unwrap_or(Ty::Map(Box::new(Ty::String), Box::new(Ty::Error)));
+                if let Some(a) = args.get(1) { self.check_expr(&a.value, &Ty::String); }
+                let val_ty = match &map_ty { Ty::Map(_, v) => (**v).clone(), _ => Ty::Error };
+                if let Some(a) = args.get(2) { self.check_expr(&a.value, &val_ty); }
+                return Some(val_ty);
+            }
             (_unknown_mod, _) if !self.module.modules.contains_key(_unknown_mod) => {
                 return None;
             }

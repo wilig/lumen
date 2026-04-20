@@ -1355,6 +1355,57 @@ int32_t lumen_map_len(int64_t map_ptr) {
     return hdr->live_count;
 }
 
+// Walk entries[] skipping tombstones, return the key_ptr at the
+// `live_i`-th live position. Returns 0 if live_i is out of range.
+// Used by map.keys / map.values / map.entries to iterate insertion
+// order without exposing the tombstone layout to Lumen.
+int64_t lumen_map_live_key_at(int64_t map_ptr, int32_t live_i) {
+    if (map_ptr == 0 || live_i < 0) return 0;
+    LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
+    LumenMapEntry *entries = LUMEN_MAP_ENTRIES(hdr);
+    int32_t seen = 0;
+    for (int32_t i = 0; i < hdr->entry_count; i++) {
+        if (entries[i].key_ptr == 0) continue;  // tombstone
+        if (seen == live_i) return entries[i].key_ptr;
+        seen++;
+    }
+    return 0;
+}
+
+// Value at the live_i-th live entry. Undefined if out of range; callers
+// should bound `live_i` to `map_len(m)` first.
+int64_t lumen_map_live_value_at(int64_t map_ptr, int32_t live_i) {
+    if (map_ptr == 0 || live_i < 0) return 0;
+    LumenMapHeader *hdr = (LumenMapHeader *)(uintptr_t)map_ptr;
+    LumenMapEntry *entries = LUMEN_MAP_ENTRIES(hdr);
+    int32_t seen = 0;
+    for (int32_t i = 0; i < hdr->entry_count; i++) {
+        if (entries[i].key_ptr == 0) continue;
+        if (seen == live_i) return entries[i].value;
+        seen++;
+    }
+    return 0;
+}
+
+// Merge b's entries into a (last-write-wins). Returns the (possibly
+// reallocated) a pointer. value_is_ptr matches lumen_map_set's
+// contract: when 1, b's values are rc_incr'd on copy and any
+// displaced values in a are rc_decr'd.
+int64_t lumen_map_merge(int64_t a_ptr, int64_t b_ptr, int32_t value_is_ptr) {
+    if (b_ptr == 0) return a_ptr;
+    LumenMapHeader *b_hdr = (LumenMapHeader *)(uintptr_t)b_ptr;
+    LumenMapEntry *b_entries = LUMEN_MAP_ENTRIES(b_hdr);
+    int64_t out = a_ptr;
+    for (int32_t i = 0; i < b_hdr->entry_count; i++) {
+        if (b_entries[i].key_ptr == 0) continue;
+        // lumen_map_set rc_incrs the key and the value (when value_is_ptr).
+        // That balances b's ref we're sharing (neither side owns
+        // exclusively after the merge).
+        out = lumen_map_set(out, b_entries[i].key_ptr, b_entries[i].value, value_is_ptr);
+    }
+    return out;
+}
+
 int32_t lumen_fs_write(int64_t path_ptr, int64_t content_ptr) {
     char path[4096];
     if (lumen_fs_path_to_cstr(path_ptr, path, sizeof(path)) != 0) {

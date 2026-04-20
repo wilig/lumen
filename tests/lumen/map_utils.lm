@@ -1,0 +1,65 @@
+// std/map utility fns: keys, values, entries, get_or, merge.
+import std/test
+import std/map
+import std/list
+
+fn main(): i32 io {
+    var m: Map<string, i32> = map.new()
+    m = map.set(m, "alice", 30)
+    m = map.set(m, "bob", 25)
+    m = map.set(m, "carol", 42)
+
+    // keys: insertion order
+    let ks = map.keys(m)
+    test.eq(list.len(ks), 3, "keys len")
+    test.eq(list.get(ks, 0), "alice", "keys[0]")
+    test.eq(list.get(ks, 1), "bob", "keys[1]")
+    test.eq(list.get(ks, 2), "carol", "keys[2]")
+
+    // values: insertion order, V=i32 narrowed correctly
+    let vs: List<i32> = map.values(m)
+    test.eq(list.len(vs), 3, "values len")
+    test.eq(list.get(vs, 0), 30, "values[0]")
+    test.eq(list.get(vs, 1), 25, "values[1]")
+    test.eq(list.get(vs, 2), 42, "values[2]")
+
+    // get_or: present vs absent
+    test.eq(map.get_or(m, "alice", 0), 30, "get_or present")
+    test.eq(map.get_or(m, "nope", 99), 99, "get_or absent")
+
+    // merge: later keys overwrite, new keys added. Aliases like
+    // map.set does — the returned pointer reuses `a`'s storage when
+    // it doesn't need to grow, so rebind.
+    var extra: Map<string, i32> = map.new()
+    extra = map.set(extra, "dave", 20)
+    extra = map.set(extra, "bob", 26)   // overwrites bob=25
+    let merged = map.merge(m, extra)
+    test.eq(map.len(merged), 4, "merge size")
+    test.eq(map.get_or(merged, "alice", 0), 30, "merge alice preserved")
+    test.eq(map.get_or(merged, "bob", 0), 26, "merge bob overwritten")
+    test.eq(map.get_or(merged, "dave", 0), 20, "merge dave added")
+
+    // entries: returns List<(string, V)>
+    var s: Map<string, string> = map.new()
+    s = map.set(s, "k1", "v1")
+    s = map.set(s, "k2", "v2")
+    let es = map.entries(s)
+    test.eq(list.len(es), 2, "entries len")
+    let e0 = list.get(es, 0)
+    test.eq(e0.0, "k1", "entries[0] key")
+    test.eq(e0.1, "v1", "entries[0] val")
+
+    // After remove, live iteration skips tombstones. Using a fresh
+    // map (avoids the earlier merge's aliasing).
+    var r: Map<string, i32> = map.new()
+    r = map.set(r, "a", 1)
+    r = map.set(r, "b", 2)
+    r = map.set(r, "c", 3)
+    r = map.remove(r, "b")
+    let rks = map.keys(r)
+    test.eq(list.len(rks), 2, "keys after remove")
+    test.eq(list.get(rks, 0), "a", "keys[0] after remove")
+    test.eq(list.get(rks, 1), "c", "keys[1] after remove")
+
+    return test.summary()
+}
