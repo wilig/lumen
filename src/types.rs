@@ -195,15 +195,10 @@ pub struct ModuleInfo {
     pub call_resolutions: HashMap<u32, Vec<Ty>>,
     /// Module-level bindings declared with top-level `let` or `var`.
     /// name → (Ty, mutable). Visible inside every fn body of the
-    /// declaring module and (read-only) via `mod_name.binding` from
-    /// other modules. Registered once during typecheck; codegen
+    /// declaring module; not accessible from other modules (private
+    /// by default). Registered once during typecheck; codegen
     /// materializes them as static data slots.
     pub globals: HashMap<String, (Ty, bool)>,
-    /// Imported modules' top-level bindings:
-    /// module_name → (name → (Ty, mutable)). Mutability is recorded
-    /// but assignment across module boundaries is rejected by the
-    /// typechecker today.
-    pub module_globals: HashMap<String, HashMap<String, (Ty, bool)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,24 +280,13 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         generic_type_args: HashMap::new(),
         call_resolutions: HashMap::new(),
         globals: HashMap::new(),
-        module_globals: HashMap::new(),
     };
 
     // Register imported module APIs.
     for imp in imported {
         let mut mod_fns = HashMap::new();
         let mut mod_links = HashMap::new();
-        let mut mod_globals: HashMap<String, (Ty, bool)> = HashMap::new();
         for item in &imp.module.items {
-            if let Item::GlobalLet(gl) = item {
-                // MVP: require an explicit type annotation so cross-module
-                // access doesn't depend on inference across the initializer.
-                if let Some(ty) = &gl.ty {
-                    if let Ok(t) = resolve_type(ty, &info.types) {
-                        mod_globals.insert(gl.name.clone(), (t, gl.mutable));
-                    }
-                }
-            }
             if let Item::ExternFn(ef) = item {
                 let params: Vec<(String, Ty)> = ef.params.iter().filter_map(|p| {
                     resolve_type(&p.ty, &info.types).ok().map(|t| (p.name.clone(), t))
@@ -333,7 +317,6 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         }
         info.modules.insert(imp.name.clone(), mod_fns);
         info.module_link_names.insert(imp.name.clone(), mod_links);
-        info.module_globals.insert(imp.name.clone(), mod_globals);
     }
 
     // Pass 1: register all type decl names so the next pass can resolve
@@ -696,7 +679,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
 // Type resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeError> {
+pub fn resolve_type(t: &Type, types: &HashMap<String, TypeInfo>) -> Result<Ty, TypeError> {
     resolve_type_with_params(t, types, &[])
 }
 
@@ -1752,16 +1735,6 @@ impl<'a> FnChecker<'a> {
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
 
             ExprKind::Field { receiver, name } => {
-                // `module.name` without parens: check if it's a module
-                // qualifier for a top-level let/var binding in the
-                // imported module.
-                if let ExprKind::Ident(mod_name) = &receiver.kind {
-                    if let Some(mod_globals) = self.module.module_globals.get(mod_name) {
-                        if let Some((ty, _)) = mod_globals.get(name) {
-                            return ty.clone();
-                        }
-                    }
-                }
                 let recv = self.infer_expr(receiver);
                 self.check_field_access(&recv, name, expr.span)
             }

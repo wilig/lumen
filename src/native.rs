@@ -549,81 +549,75 @@ impl<'a> NativeCodegen<'a> {
         })
     }
 
-    /// Declare a DataId for every module-level let/var binding (user's
-    /// module + imports), define the user's with its initial-value
-    /// bytes, leave imports as Linkage::Import. Only scalar
-    /// initializers at MVP: i32/u32/i64/u64/f64/bool/char/unit.
+    /// Declare a DataId for every module-level let/var binding. We
+    /// have to walk both the user's module AND every imported
+    /// module — not because any of them are visible across module
+    /// boundaries (they aren't; globals are module-private), but
+    /// because an imported module's own fn bodies may reference its
+    /// own globals, and we compile all fn bodies in the same pass.
+    /// Symbols are namespaced per module so two modules can each
+    /// declare `var count: i32 = 0` without collision at the linker
+    /// level. Only scalar initializers at MVP.
     fn declare_globals(
         &mut self,
         module: &ast::Module,
         imported_modules: &[(&str, &ast::Module)],
     ) -> Result<(), NativeError> {
-        // Process imports first so the user module's definitions can
-        // override (no actual override path today, but consistent
-        // ordering).
         for &(mod_name, mod_ast) in imported_modules {
-            for item in &mod_ast.items {
-                if let Item::GlobalLet(gl) = item {
-                    let ty = match self.info.module_globals.get(mod_name)
-                        .and_then(|m| m.get(&gl.name))
-                    {
-                        Some((t, _)) => t.clone(),
-                        None => continue,
-                    };
-                    let symbol = global_symbol(mod_name, &gl.name);
-                    if self.global_data.contains_key(&gl.name) {
-                        continue;
-                    }
-                    let id = self.obj
-                        .declare_data(&symbol, Linkage::Export, gl.mutable, false)
-                        .map_err(|e| NativeError {
-                            span: gl.span,
-                            message: format!("declare global `{}`: {e}", gl.name),
-                        })?;
-                    let bytes = evaluate_const_initializer(&gl.value, &ty)
-                        .ok_or_else(|| NativeError {
-                            span: gl.value.span,
-                            message: "top-level let/var initializer must be a constant scalar (int/float/bool/char)".into(),
-                        })?;
-                    let mut desc = DataDescription::new();
-                    desc.define(bytes.into_boxed_slice());
-                    self.obj.define_data(id, &desc).map_err(|e| NativeError {
-                        span: gl.span,
-                        message: format!("define global `{}`: {e}", gl.name),
-                    })?;
-                    self.global_data.insert(gl.name.clone(), (id, ty));
-                }
-            }
+            self.declare_module_globals(mod_name, mod_ast)?;
         }
+        self.declare_module_globals("user", module)?;
+        Ok(())
+    }
+
+    fn declare_module_globals(
+        &mut self,
+        module_key: &str,
+        module: &ast::Module,
+    ) -> Result<(), NativeError> {
         for item in &module.items {
-            if let Item::GlobalLet(gl) = item {
-                let ty = match self.info.globals.get(&gl.name) {
-                    Some((t, _)) => t.clone(),
-                    None => continue,
-                };
-                if self.global_data.contains_key(&gl.name) {
-                    continue;
+            let Item::GlobalLet(gl) = item else { continue };
+            let ty = match self.info.globals.get(&gl.name) {
+                Some((t, _)) => t.clone(),
+                None => {
+                    // For imported modules we don't populate info.globals
+                    // (it holds only the user's module). Resolve the type
+                    // from the annotation directly — required at MVP.
+                    match &gl.ty {
+                        Some(t) => crate::types::resolve_type(t, &self.info.types)
+                            .map_err(|e| NativeError {
+                                span: gl.span,
+                                message: format!("resolve global `{}` type: {}", gl.name, e.message),
+                            })?,
+                        None => continue,
+                    }
                 }
-                let symbol = global_symbol("user", &gl.name);
-                let id = self.obj
-                    .declare_data(&symbol, Linkage::Export, gl.mutable, false)
-                    .map_err(|e| NativeError {
-                        span: gl.span,
-                        message: format!("declare global `{}`: {e}", gl.name),
-                    })?;
-                let bytes = evaluate_const_initializer(&gl.value, &ty)
-                    .ok_or_else(|| NativeError {
-                        span: gl.value.span,
-                        message: "top-level let/var initializer must be a constant scalar (int/float/bool/char)".into(),
-                    })?;
-                let mut desc = DataDescription::new();
-                desc.define(bytes.into_boxed_slice());
-                self.obj.define_data(id, &desc).map_err(|e| NativeError {
-                    span: gl.span,
-                    message: format!("define global `{}`: {e}", gl.name),
-                })?;
-                self.global_data.insert(gl.name.clone(), (id, ty));
+            };
+            let symbol = global_symbol(module_key, &gl.name);
+            // Per-module key to keep same-named globals in different
+            // modules distinct.
+            let map_key = format!("{module_key}::{}", gl.name);
+            if self.global_data.contains_key(&map_key) {
+                continue;
             }
+            let id = self.obj
+                .declare_data(&symbol, Linkage::Local, gl.mutable, false)
+                .map_err(|e| NativeError {
+                    span: gl.span,
+                    message: format!("declare global `{}`: {e}", gl.name),
+                })?;
+            let bytes = evaluate_const_initializer(&gl.value, &ty)
+                .ok_or_else(|| NativeError {
+                    span: gl.value.span,
+                    message: "top-level let/var initializer must be a constant scalar (int/float/bool/char)".into(),
+                })?;
+            let mut desc = DataDescription::new();
+            desc.define(bytes.into_boxed_slice());
+            self.obj.define_data(id, &desc).map_err(|e| NativeError {
+                span: gl.span,
+                message: format!("define global `{}`: {e}", gl.name),
+            })?;
+            self.global_data.insert(map_key, (id, ty));
         }
         Ok(())
     }
@@ -1666,7 +1660,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 // Assignment to a module-level `var`: compile the RHS
                 // and store into the static slot.
                 if !self.names.contains_key(name) {
-                    if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
+                    if let Some((id, ty)) = self.lookup_global(name).cloned() {
                         let val = self.compile_expr(value)?;
                         let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
                         let addr = self.builder.ins().global_value(PTR, gv);
@@ -1823,8 +1817,9 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     // A function name used as a value — emit its address as a PTR.
                     let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
                     Ok(self.builder.ins().func_addr(PTR, func_ref))
-                } else if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
-                    // Module-level let/var binding: load from the static slot.
+                } else if let Some((id, ty)) = self.lookup_global(name).cloned() {
+                    // Module-level let/var binding: load from the
+                    // static slot. Scoped to the current module.
                     let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
                     let addr = self.builder.ins().global_value(PTR, gv);
                     let cl_ty = lumen_to_cl(&ty);
@@ -1873,23 +1868,6 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 else_block,
             } => self.compile_if(cond, then_block, else_block, expr.span),
             ExprKind::Field { receiver, name } => {
-                // Cross-module global: `module.binding` — load from
-                // the imported module's static slot. We registered
-                // these under the same `global_data` keys as the
-                // user's own globals during declare_globals.
-                if let ExprKind::Ident(mod_name) = &receiver.kind {
-                    if self.cg.info.module_globals.get(mod_name)
-                        .map(|m| m.contains_key(name))
-                        .unwrap_or(false)
-                    {
-                        if let Some((id, ty)) = self.cg.global_data.get(name).cloned() {
-                            let gv = self.cg.obj.declare_data_in_func(id, self.builder.func);
-                            let addr = self.builder.ins().global_value(PTR, gv);
-                            let cl_ty = lumen_to_cl(&ty);
-                            return Ok(self.builder.ins().load(cl_ty, MemFlags::new(), addr, 0));
-                        }
-                    }
-                }
                 let ptr = self.compile_expr(receiver)?;
                 let recv_ty = self.infer_ty(receiver)?;
                 let type_name = match recv_ty {
@@ -3430,6 +3408,14 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
     }
 
 
+    /// Look up a module-level binding by its Lumen name, scoped to the
+    /// current module being compiled. Globals are private — no
+    /// cross-module access.
+    fn lookup_global(&self, name: &str) -> Option<&(DataId, Ty)> {
+        let module_key = self.current_module.as_deref().unwrap_or("user");
+        self.cg.global_data.get(&format!("{module_key}::{name}"))
+    }
+
     fn emit_rc_incr(&mut self, ptr: Value) {
         let func_ref = self
             .cg
@@ -4052,7 +4038,7 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     return Ok(Ty::FnPtr { params, ret: Box::new(sig.ret.clone()) });
                 }
                 // Module-level let/var binding.
-                if let Some((_, ty)) = self.cg.global_data.get(name) {
+                if let Some((_, ty)) = self.lookup_global(name) {
                     return Ok(ty.clone());
                 }
                 Ty::I32 // fallback
@@ -4382,14 +4368,6 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 Ty::User(resolved)
             }
             ExprKind::Field { receiver, name } => {
-                // Cross-module global read: `module.binding`.
-                if let ExprKind::Ident(mod_name) = &receiver.kind {
-                    if let Some(globals) = self.cg.info.module_globals.get(mod_name) {
-                        if let Some((ty, _)) = globals.get(name) {
-                            return Ok(ty.clone());
-                        }
-                    }
-                }
                 let recv_ty = self.infer_ty(receiver)?;
                 let type_name = if let Ty::User(tn) = recv_ty {
                     Some(tn)
