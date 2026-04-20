@@ -66,6 +66,11 @@ Alice is 30 years old
 sum = 6, product = 42
 not interpolated: \{name}
 
+=== string utilities ===
+parts: 3
+trim: 'hi'
+contains: 1
+
 === file io ===
 wrote ok
 read back: hello from kitchen sink

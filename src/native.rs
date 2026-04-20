@@ -2215,7 +2215,20 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
         let (effective_name, effective_sig) =
             match self.monomorphize_if_generic(&name, &arg_tys, type_args_override) {
                 Some(pair) => (pair.0, Some(pair.1)),
-                None => (name.clone(), self.cg.info.fns.get(&name).cloned()),
+                None => {
+                    // Look up the sig in the current module first (so that
+                    // intra-module unqualified calls inside an imported
+                    // module — e.g. `substring(s, ...)` inside std/string's
+                    // own `split` — find their sig and trigger rc_incr on
+                    // pointer args). Fall back to user-module fns.
+                    let sig = self.current_module
+                        .as_ref()
+                        .and_then(|m| self.cg.info.modules.get(m))
+                        .and_then(|m| m.get(&name))
+                        .cloned()
+                        .or_else(|| self.cg.info.fns.get(&name).cloned());
+                    (name.clone(), sig)
+                }
             };
 
         // Inside a module body, unqualified calls resolve via the
@@ -2378,6 +2391,14 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 let result = self.builder.inst_results(call)[0];
                 let list_ty = self.infer_ty(&args[0].value)?;
                 let elem_ty = match list_ty { Ty::List(inner) => *inner, _ => Ty::I64 };
+                // For pointer-typed elements, the list owns its slot's
+                // reference. The caller's binding (e.g. `let raw = list.get(...)`)
+                // adds a new owner — without rc_incr, scope-exit would
+                // decr the shared ptr to 0 and free a slot the list still
+                // holds (lumen-358 surfaced this via string elements).
+                if !is_scalar(&elem_ty) {
+                    self.emit_rc_incr(result);
+                }
                 return Ok(if lumen_to_cl(&elem_ty) == cl_types::I32 {
                     self.builder.ins().ireduce(cl_types::I32, result)
                 } else { result });
@@ -2539,8 +2560,35 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             // Check Lumen fn by mod_name:method key.
             let fn_key = format!("{mod_name}:{method}");
             if let Some(&func_id) = self.cg.module_fn_ids.get(&fn_key) {
-                return if is_void { self.call_builtin_void(func_id, args) }
-                       else { self.call_builtin(func_id, args) };
+                // Non-generic Lumen module fn (e.g. string.char_at).
+                // Compile args, rc_incr non-scalar ones (the callee's
+                // scope-exit will rc_decr its params; without the incr
+                // here the caller's pointer would get freed mid-use —
+                // which is exactly what was breaking string.char_at(text)
+                // and friends, see lumen-358).
+                let mut arg_vals = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(self.compile_expr(&a.value)?);
+                }
+                let sig = self.cg.info.modules.get(mod_name)
+                    .and_then(|m| m.get(method))
+                    .cloned();
+                if let Some(sig) = &sig {
+                    for (i, (_, pty)) in sig.params.iter().enumerate() {
+                        if !is_scalar(pty) {
+                            if let Some(&val) = arg_vals.get(i) {
+                                self.emit_rc_incr(val);
+                            }
+                        }
+                    }
+                }
+                let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &arg_vals);
+                let results = self.builder.inst_results(call);
+                if is_void || results.is_empty() {
+                    return Ok(self.builder.ins().iconst(cl_types::I32, 0));
+                }
+                return Ok(results[0]);
             }
         }
         Err(NativeError {

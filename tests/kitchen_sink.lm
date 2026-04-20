@@ -267,6 +267,15 @@ fn main(): i32 io {
     io.println("sum = \{1 + 2 + 3}, product = \{2 * 21}")
     io.println("not interpolated: \\{name}")
 
+    // string utilities — guards lumen-358 (rc-incr inside imported
+    // module bodies so callee scope-exit doesn't free caller pointers).
+    section("string utilities")
+    let csv: string = "alpha,beta,gamma"
+    let parts: i64 = string.split(csv, ",")
+    io.println("parts: \{list.len(parts)}")
+    io.println("trim: '\{string.trim("  hi  ")}'")
+    io.println("contains: \{string.contains("hello world", "world")}")
+
     // file_io (writes to a deterministic /tmp path; cleaned up by
     // the integration test wrapper before the next run)
     section("file io")
