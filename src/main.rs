@@ -60,6 +60,9 @@ fn main() -> ExitCode {
             ExitCode::from(lumen::lsp::run() as u8)
         }
         "fmt" => cmd_fmt(&args[1..]),
+        "repl" => {
+            ExitCode::from(lumen::repl::run() as u8)
+        }
         "--version" | "-V" => {
             println!("lumen {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -74,6 +77,7 @@ fn print_usage() {
     eprintln!("  lumen run   <path.lm>");
     eprintln!("  lumen lsp                                     # language server on stdin/stdout");
     eprintln!("  lumen fmt [--check] <path.lm>...              # canonical formatter");
+    eprintln!("  lumen repl                                    # interactive REPL");
     eprintln!("  lumen --version");
 }
 

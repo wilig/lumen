@@ -11,5 +11,6 @@ pub mod lexer;
 pub mod lsp;
 pub mod native;
 pub mod parser;
+pub mod repl;
 pub mod span;
 pub mod types;
