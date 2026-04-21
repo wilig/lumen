@@ -59,6 +59,7 @@ fn main() -> ExitCode {
             // `lumen lsp` as a subprocess.
             ExitCode::from(lumen::lsp::run() as u8)
         }
+        "fmt" => cmd_fmt(&args[1..]),
         "--version" | "-V" => {
             println!("lumen {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -72,7 +73,56 @@ fn print_usage() {
     eprintln!("  lumen build [--debug] <path.lm> [-lname] [-Lpath] [-framework name]");
     eprintln!("  lumen run   <path.lm>");
     eprintln!("  lumen lsp                                     # language server on stdin/stdout");
+    eprintln!("  lumen fmt [--check] <path.lm>...              # canonical formatter");
     eprintln!("  lumen --version");
+}
+
+/// `lumen fmt FILE.lm...` — rewrite each file in place. With
+/// `--check`, don't write; exit nonzero if any file isn't canonical.
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    let mut check = false;
+    let mut paths: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            "-h" | "--help" => {
+                eprintln!("lumen fmt [--check] <path.lm>...");
+                return ExitCode::SUCCESS;
+            }
+            other if !other.starts_with('-') => paths.push(other.to_string()),
+            other => {
+                eprintln!("unknown fmt option: {other}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if paths.is_empty() {
+        eprintln!("lumen fmt: no input files");
+        return ExitCode::from(1);
+    }
+    let mut any_bad = false;
+    for path in &paths {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("{path}: {e}"); any_bad = true; continue; }
+        };
+        let formatted = match lumen::fmt::format(&src) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("{path}: {e}"); any_bad = true; continue; }
+        };
+        if check {
+            if src != formatted {
+                eprintln!("{path}: not canonical");
+                any_bad = true;
+            }
+        } else if src != formatted {
+            if let Err(e) = std::fs::write(path, &formatted) {
+                eprintln!("{path}: {e}");
+                any_bad = true;
+            }
+        }
+    }
+    if any_bad { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
 /// Format an error with source context: the offending line + a caret.
