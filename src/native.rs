@@ -161,6 +161,11 @@ struct NativeCodegen<'a> {
 
     /// Lambda FuncIds keyed by source span (line, col).
     lambda_ids: HashMap<(u32, u32), FuncId>,
+    /// Closure bodies, keyed by their FuncId. The Vec is the captured
+    /// binding list (name + type) in env-struct order. `define_
+    /// function_with_sig` uses this to preload captures as locals
+    /// from the env pointer passed in as the first block param.
+    closure_captures: HashMap<FuncId, Vec<(String, Ty)>>,
     /// Lambda FnSigs (lambdas aren't in ModuleInfo, so we store sigs here).
     lambda_sigs: HashMap<String, crate::types::FnSig>,
 
@@ -581,6 +586,7 @@ impl<'a> NativeCodegen<'a> {
             global_data: HashMap::new(),
             lambda_ids: HashMap::new(),
             lambda_sigs: HashMap::new(),
+            closure_captures: HashMap::new(),
             module_fn_ids: {
                 let mut m = HashMap::new();
                 // Runtime allocator + arena functions (declared above
@@ -922,6 +928,18 @@ impl<'a> NativeCodegen<'a> {
         for (i, lam) in lambdas.iter().enumerate() {
             let lam_name = format!("__lambda_{i}");
             let mut sig = self.obj.make_signature();
+            // If the typechecker recorded captures for this lambda,
+            // the body takes an env_ptr as its first param (before
+            // the user-declared params). The env layout is
+            // [fn_ptr:8, cap0:8, cap1:8, ...] — all slots 8 bytes
+            // for uniformity regardless of capture type.
+            let captures = self.info.lambda_captures
+                .get(&lam.span.start)
+                .cloned()
+                .unwrap_or_default();
+            if !captures.is_empty() {
+                sig.params.push(AbiParam::new(PTR));
+            }
             for p in &lam.params {
                 let pty = resolve_type_to_ty(&p.ty);
                 sig.params.push(AbiParam::new(lumen_to_cl(&pty)));
@@ -934,6 +952,9 @@ impl<'a> NativeCodegen<'a> {
             }
             let func_id = self.obj.declare_function(&lam_name, Linkage::Local, &sig).unwrap();
             self.lambda_ids.insert((lam.span.line, lam.span.col), func_id);
+            if !captures.is_empty() {
+                self.closure_captures.insert(func_id, captures);
+            }
             let fn_sig = crate::types::FnSig {
                 params: lam.params.iter().map(|p| {
                     (p.name.clone(), resolve_type_to_ty(&p.ty))
@@ -1449,7 +1470,13 @@ impl<'a> NativeCodegen<'a> {
         active_subs: HashMap<String, Ty>,
         current_module: Option<String>,
     ) -> Result<(), NativeError> {
-        let cl_sig = self.build_sig_from(sig);
+        let mut cl_sig = self.build_sig_from(sig);
+        // Closure bodies prepend an env_ptr param — matches the
+        // sig registered at declaration time in compile_module.
+        let is_closure_body = self.closure_captures.contains_key(&func_id);
+        if is_closure_body {
+            cl_sig.params.insert(0, AbiParam::new(PTR));
+        }
 
         let mut ctx = self.obj.make_context();
         ctx.func.signature = cl_sig;
@@ -1477,12 +1504,35 @@ impl<'a> NativeCodegen<'a> {
             fb.active_subs = active_subs;
             fb.current_module = current_module;
 
+            // If this is a closure body, the first block param is
+            // env_ptr. Preload each capture into the names map so
+            // body-level references compile to env loads.
+            let closure_captures: Vec<(String, Ty)> = fb.cg.closure_captures
+                .get(&func_id)
+                .cloned()
+                .unwrap_or_default();
+            let env_offset = if closure_captures.is_empty() { 0 } else { 1 };
+            if env_offset == 1 {
+                let env_ptr = fb.builder.block_params(entry)[0];
+                // Captures live at offset 8 (fn_ptr is at 0), then
+                // 8-byte slots each.
+                for (cap_idx, (cap_name, cap_ty)) in closure_captures.iter().enumerate() {
+                    let offset = 8 + (cap_idx as i32) * 8;
+                    let cl_ty = lumen_to_cl(cap_ty);
+                    let loaded = fb.builder.ins().load(cl_ty, MemFlags::new(), env_ptr, offset);
+                    let var = fb.fresh_var(cl_ty);
+                    fb.builder.def_var(var, loaded);
+                    fb.names.insert(cap_name.clone(), var);
+                    fb.name_types.insert(cap_name.clone(), cap_ty.clone());
+                }
+            }
+
             // Declare params as variables. Pointer-typed params are
             // registered on the cleanup stack — the caller incr'd them
             // before the call, and our scope-exit decr balances it.
             for (i, (pname, pty)) in sig.params.iter().enumerate() {
                 let var = fb.fresh_var(lumen_to_cl(pty));
-                let val = fb.builder.block_params(entry)[i];
+                let val = fb.builder.block_params(entry)[i + env_offset];
                 fb.builder.def_var(var, val);
                 // Tag the incoming value so cranelift tracks it
                 // across register allocation / stack spills. The
@@ -2154,14 +2204,45 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                 }
             }
             ExprKind::Lambda { .. } => {
-                // Look up the pre-compiled lambda by its source span.
                 let key = (expr.span.line, expr.span.col);
                 let func_id = *self.cg.lambda_ids.get(&key).ok_or_else(|| NativeError {
                     span: expr.span,
                     message: "lambda not found (internal error)".into(),
                 })?;
                 let func_ref = self.cg.obj.declare_func_in_func(func_id, self.builder.func);
-                Ok(self.builder.ins().func_addr(PTR, func_ref))
+                let fn_addr = self.builder.ins().func_addr(PTR, func_ref);
+                // Non-capturing lambda → the bare code address is
+                // the Ty::FnPtr value, no env needed.
+                let captures = self.cg.closure_captures.get(&func_id).cloned();
+                let Some(captures) = captures else {
+                    return Ok(fn_addr);
+                };
+                // Capturing lambda → allocate an env struct
+                // [fn_ptr:8, cap0:8, cap1:8, ...]. The Closure value
+                // IS the env pointer.
+                let env_size = 8 + (captures.len() as i64) * 8;
+                let env = self.rc_alloc(env_size)?;
+                let flags = MemFlags::new();
+                self.builder.ins().store(flags, fn_addr, env, 0);
+                for (cap_idx, (cap_name, cap_ty)) in captures.iter().enumerate() {
+                    let offset = 8 + (cap_idx as i32) * 8;
+                    let var = *self.names.get(cap_name).ok_or_else(|| NativeError {
+                        span: expr.span,
+                        message: format!("closure capture `{cap_name}` not in scope"),
+                    })?;
+                    let val = self.builder.use_var(var);
+                    // Widen scalar captures to i64 so every env slot
+                    // is 8 bytes regardless of type.
+                    let stored = self.widen_to_i64(val, cap_ty);
+                    self.builder.ins().store(flags, stored, env, offset);
+                    // Pointer-typed captures gain a new owner (the env
+                    // struct); rc_incr to keep them alive while the
+                    // closure lives.
+                    if !is_scalar(cap_ty) {
+                        self.emit_rc_incr(val);
+                    }
+                }
+                Ok(env)
             }
             ExprKind::Interpolated(parts) => self.compile_interpolated(parts),
             ExprKind::Arena(block) => self.compile_arena_block(block),
@@ -2625,11 +2706,12 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             return self.build_sum_block(tag, Some(payload));
         }
 
-        // Indirect call through a local FnPtr or I64 variable.
+        // Indirect call through a local FnPtr / Closure / I64 variable.
         if let Some(&var) = self.names.get(&name) {
             let local_ty = self.name_types.get(&name).cloned();
             let func_ptr_val = self.builder.use_var(var);
             let mut sig = self.cg.obj.make_signature();
+            let mut is_closure = false;
             let indirect = match &local_ty {
                 Some(Ty::FnPtr { params, ret }) => {
                     for p in params {
@@ -2642,8 +2724,22 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     }
                     true
                 }
+                Some(Ty::Closure { params, ret }) => {
+                    // Closure ABI: (env_ptr, ...params) -> ret. env_ptr
+                    // is the closure value itself; fn_ptr is at env[0].
+                    is_closure = true;
+                    sig.params.push(AbiParam::new(PTR));
+                    for p in params {
+                        sig.params.push(AbiParam::new(lumen_to_cl(p)));
+                    }
+                    if **ret != Ty::Unit {
+                        sig.returns.push(AbiParam::new(lumen_to_cl(ret)));
+                    } else {
+                        sig.returns.push(AbiParam::new(cl_types::I32));
+                    }
+                    true
+                }
                 // Opaque i64 fn address: infer signature from call-site args.
-                // Return type assumed i32 (the most common case for MVPs).
                 Some(Ty::I64) => {
                     for a in args {
                         let arg_ty = self.infer_ty(&a.value)?;
@@ -2656,12 +2752,21 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
             };
             if indirect {
                 let mut arg_vals = Vec::new();
+                if is_closure {
+                    arg_vals.push(func_ptr_val);  // env_ptr as first arg
+                }
                 for a in args {
                     let val = self.compile_expr(&a.value)?;
                     arg_vals.push(val);
                 }
+                let target = if is_closure {
+                    // Load fn_ptr from env[0].
+                    self.builder.ins().load(PTR, MemFlags::new(), func_ptr_val, 0)
+                } else {
+                    func_ptr_val
+                };
                 let sig_ref = self.builder.import_signature(sig);
-                let call = self.builder.ins().call_indirect(sig_ref, func_ptr_val, &arg_vals);
+                let call = self.builder.ins().call_indirect(sig_ref, target, &arg_vals);
                 return Ok(self.builder.inst_results(call)[0]);
             }
         }
@@ -4349,10 +4454,14 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     if let Some(sum_name) = self.find_sum_for_variant(name) {
                         return Ok(Ty::User(sum_name));
                     }
-                    // Calling a local FnPtr variable — return its ret type.
-                    if let Some(Ty::FnPtr { ret, .. }) = self.name_types.get(name) {
-                        return Ok(*ret.clone());
-                    }
+                // Calling a local FnPtr or Closure variable — return
+                // its ret type.
+                if let Some(Ty::FnPtr { ret, .. }) = self.name_types.get(name) {
+                    return Ok(*ret.clone());
+                }
+                if let Some(Ty::Closure { ret, .. }) = self.name_types.get(name) {
+                    return Ok(*ret.clone());
+                }
                 }
                 Ty::I32
             }
@@ -4669,7 +4778,15 @@ impl<'a, 'b, 'c> FnEmitter<'a, 'b, 'c> {
                     .map(|p| resolve_type_to_ty(&p.ty))
                     .collect();
                 let ret = resolve_type_to_ty(return_type);
-                Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+                // Capturing lambdas get Closure type; the typechecker
+                // populates lambda_captures at the same span.start.
+                let has_captures = self.cg.info.lambda_captures
+                    .contains_key(&expr.span.start);
+                if has_captures {
+                    Ty::Closure { params: param_tys, ret: Box::new(ret) }
+                } else {
+                    Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+                }
             }
             _ => Ty::I32,
         })
@@ -4797,6 +4914,7 @@ fn lumen_to_cl(ty: &Ty) -> CLType {
         // If it leaks into codegen, treat as pointer-sized — safest default.
         Ty::Generic(_) => PTR,
         Ty::FnPtr { .. } => PTR,
+        Ty::Closure { .. } => PTR,
         Ty::Error => cl_types::I32,
     }
 }
@@ -4975,6 +5093,7 @@ fn mangle_ty(t: &Ty) -> String {
         Ty::Tuple(elems) => format!("T{}", elems.iter().map(mangle_ty).collect::<Vec<_>>().join("_")),
         Ty::User(n) => format!("U{}", n),
         Ty::FnPtr { .. } => "Fn".into(),
+        Ty::Closure { .. } => "Cl".into(),
         Ty::Generic(n) => format!("G{}", n),
         Ty::Error => "Err".into(),
     }
@@ -5007,6 +5126,7 @@ fn native_sizeof(ty: &Ty) -> i32 {
         Ty::String | Ty::Bytes | Ty::User(_) | Ty::Option(_) | Ty::Result(_, _) | Ty::List(_) | Ty::Map(_, _) | Ty::Handle(_) | Ty::Tuple(_) => 8, // pointer
         Ty::Generic(_) => 8, // see comment in lumen_to_cl
         Ty::FnPtr { .. } => 8,
+        Ty::Closure { .. } => 8,
         Ty::Error => 4,
     }
 }

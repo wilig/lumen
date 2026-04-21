@@ -67,6 +67,13 @@ pub enum Ty {
     User(String),
     /// Function pointer: a reference to a top-level function.
     FnPtr { params: Vec<Ty>, ret: Box<Ty> },
+    /// A captured-env closure. Runtime representation is a pointer
+    /// to an rc_alloc'd env struct; the first field is the function
+    /// pointer and subsequent fields are the captured values. Only
+    /// produced by capturing lambdas (non-capturing lambdas stay as
+    /// FnPtr). MVP limitation: can't be passed where FnPtr is
+    /// expected — the two are distinct types.
+    Closure { params: Vec<Ty>, ret: Box<Ty> },
     /// An actor handle.
     Handle(Box<Ty>),
     /// A generic type parameter, e.g. the `T` inside `fn first<T>(...)`.
@@ -104,6 +111,10 @@ impl Ty {
             Ty::FnPtr { params, ret } => {
                 let ps: Vec<String> = params.iter().map(|t| t.display()).collect();
                 format!("fn({}): {}", ps.join(", "), ret.display())
+            }
+            Ty::Closure { params, ret } => {
+                let ps: Vec<String> = params.iter().map(|t| t.display()).collect();
+                format!("closure({}): {}", ps.join(", "), ret.display())
             }
             Ty::Handle(inner) => format!("Handle<{}>", inner.display()),
             Ty::Generic(name) => name.clone(),
@@ -193,6 +204,12 @@ pub struct ModuleInfo {
     /// called as `let x: Maybe<i32> = nothing()`, where T can only be
     /// derived from the let annotation.
     pub call_resolutions: HashMap<u32, Vec<Ty>>,
+    /// Captured bindings per closure, keyed on the lambda expression's
+    /// span.start. Populated when a lambda body references a name
+    /// declared in an enclosing scope (outside the lambda's own
+    /// params). Codegen uses this to build the closure's env struct
+    /// at creation + load captures inside the body.
+    pub lambda_captures: HashMap<u32, Vec<(String, Ty)>>,
     /// Module-level bindings declared with top-level `let` or `var`.
     /// name → (Ty, mutable). Visible inside every fn body of the
     /// declaring module; not accessible from other modules (private
@@ -290,6 +307,7 @@ pub fn typecheck(module: &Module, imported: &[ParsedImport]) -> Result<ModuleInf
         variant_resolutions: HashMap::new(),
         generic_type_args: HashMap::new(),
         call_resolutions: HashMap::new(),
+        lambda_captures: HashMap::new(),
         globals: HashMap::new(),
         module_globals: HashMap::new(),
     };
@@ -1004,6 +1022,7 @@ fn mangle_ty_for_type_inst(t: &Ty) -> String {
         Ty::Tuple(elems) => format!("T{}", elems.iter().map(mangle_ty_for_type_inst).collect::<Vec<_>>().join("_")),
         Ty::User(n) => format!("U{}", n),
         Ty::FnPtr { .. } => "Fn".into(),
+        Ty::Closure { .. } => "Cl".into(),
         Ty::Generic(n) => format!("G{}", n),
         Ty::Error => "Err".into(),
     }
@@ -1212,8 +1231,19 @@ struct FnChecker<'a> {
     scopes: Vec<Scope>,
     errors: &'a mut Vec<TypeError>,
     /// When inside a lambda, the scope depth at which the lambda starts.
-    /// `lookup` will not search scopes below this depth, preventing capture.
+    /// Lookup still searches scopes below the floor to find captures —
+    /// when it does, the referenced binding is recorded in
+    /// `lambda_capture_stack`.
     lambda_scope_floor: Option<usize>,
+    /// Stack of capture sets, one per nested lambda currently being
+    /// checked. Each entry holds `(name, Ty)` for every outer-scope
+    /// binding the lambda body referenced. Popped + drained into
+    /// ModuleInfo.lambda_captures when the lambda exits.
+    lambda_capture_stack: Vec<(u32, Vec<(String, Ty)>)>,
+    /// Stack of "current return type" one per lambda being checked.
+    /// `return` inside a lambda checks against the lambda's return
+    /// type (top of stack), not the enclosing fn's.
+    lambda_return_stack: Vec<Ty>,
     /// Variant-constructor expressions resolved against an expected
     /// type during this fn's body check, keyed by `expr.span.start`.
     /// Drained into ModuleInfo.variant_resolutions after check_fn so
@@ -1252,6 +1282,8 @@ impl<'a> FnChecker<'a> {
             scopes: Vec::new(),
             errors,
             lambda_scope_floor: None,
+            lambda_capture_stack: Vec::new(),
+            lambda_return_stack: Vec::new(),
             variant_resolutions: HashMap::new(),
             call_resolutions: HashMap::new(),
             current_module: None,
@@ -1413,11 +1445,29 @@ impl<'a> FnChecker<'a> {
         );
     }
 
-    fn lookup(&self, name: &str) -> Option<&Binding> {
+    fn lookup(&mut self, name: &str) -> Option<Binding> {
         let floor = self.lambda_scope_floor.unwrap_or(0);
+        // First: above the lambda floor (the lambda's own params + any
+        // inner lets). No capture needed.
         for scope in self.scopes[floor..].iter().rev() {
             if let Some(b) = scope.bindings.get(name) {
-                return Some(b);
+                return Some(b.clone());
+            }
+        }
+        // Then: below the floor — this is a capture. Record it so
+        // codegen knows to build the env struct at closure creation.
+        if floor > 0 {
+            for scope in self.scopes[..floor].iter().rev() {
+                if let Some(b) = scope.bindings.get(name) {
+                    let cloned = b.clone();
+                    if let Some(top) = self.lambda_capture_stack.last_mut() {
+                        let exists = top.1.iter().any(|(n, _)| n == name);
+                        if !exists {
+                            top.1.push((name.to_string(), cloned.ty.clone()));
+                        }
+                    }
+                    return Some(cloned);
+                }
             }
         }
         None
@@ -1500,7 +1550,7 @@ impl<'a> FnChecker<'a> {
                 // entry is found. Inside an imported module (Pass 4b),
                 // consult that module's own globals.
                 let global_entry = self.lookup_global(name);
-                match self.lookup(name).cloned() {
+                match self.lookup(name) {
                     None => {
                         if let Some((ty, mutable)) = global_entry {
                             if !mutable {
@@ -1612,23 +1662,30 @@ impl<'a> FnChecker<'a> {
                     }
                 }
             }
-            StmtKind::Return(value) => match value {
-                None => {
-                    if !compatible(&Ty::Unit, &self.sig.ret) {
-                        self.errors.push(TypeError {
-                            span: stmt.span,
-                            message: format!(
-                                "`return` without a value in a function returning {}",
-                                self.sig.ret.display()
-                            ),
-                        });
+            StmtKind::Return(value) => {
+                // Inside a lambda body, `return` checks against the
+                // lambda's return type (top of the stack), not the
+                // enclosing fn's.
+                let expected = self.lambda_return_stack.last()
+                    .cloned()
+                    .unwrap_or_else(|| self.sig.ret.clone());
+                match value {
+                    None => {
+                        if !compatible(&Ty::Unit, &expected) {
+                            self.errors.push(TypeError {
+                                span: stmt.span,
+                                message: format!(
+                                    "`return` without a value in a function returning {}",
+                                    expected.display()
+                                ),
+                            });
+                        }
+                    }
+                    Some(e) => {
+                        self.check_expr(e, &expected);
                     }
                 }
-                Some(e) => {
-                    let ret = self.sig.ret.clone();
-                    self.check_expr(e, &ret);
-                }
-            },
+            }
         }
     }
 
@@ -2083,11 +2140,14 @@ impl<'a> FnChecker<'a> {
 
             ExprKind::Lambda { params, return_type, body } => {
                 let ret = self.resolve_or_error(return_type);
-                // Set scope floor to prevent lambda from capturing outer
-                // variables — lookup will only see this scope and above.
+                // Push a scope floor so `lookup` treats references to
+                // outer-scope bindings as captures (recorded in the
+                // capture stack), not unresolved names.
                 let old_floor = self.lambda_scope_floor;
                 self.push_scope();
                 self.lambda_scope_floor = Some(self.scopes.len() - 1);
+                self.lambda_capture_stack.push((expr.span.start, Vec::new()));
+                self.lambda_return_stack.push(ret.clone());
                 let mut param_tys = Vec::new();
                 for p in params {
                     let pty = self.resolve_or_error(&p.ty);
@@ -2097,7 +2157,18 @@ impl<'a> FnChecker<'a> {
                 self.check_block(body, Some(&ret));
                 self.pop_scope();
                 self.lambda_scope_floor = old_floor;
-                Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+                self.lambda_return_stack.pop();
+                let (span_start, captures) = self.lambda_capture_stack.pop()
+                    .expect("capture stack desync");
+                let has_captures = !captures.is_empty();
+                if has_captures {
+                    self.module.lambda_captures.insert(span_start, captures);
+                }
+                if has_captures {
+                    Ty::Closure { params: param_tys, ret: Box::new(ret) }
+                } else {
+                    Ty::FnPtr { params: param_tys, ret: Box::new(ret) }
+                }
             }
         }
     }
@@ -2396,11 +2467,12 @@ impl<'a> FnChecker<'a> {
                 return self.check_variant_call(&ty_name, variant, args, whole_span);
             }
 
-            // Check if `name` is a local variable of FnPtr or I64 type
-            // (indirect call through a variable that holds a function address).
+            // Check if `name` is a local variable of FnPtr / Closure
+            // / I64 type (indirect call through a variable that holds
+            // a function address).
             if let Some(binding) = self.lookup(name) {
                 match binding.ty.clone() {
-                    Ty::FnPtr { params, ret } => {
+                    Ty::FnPtr { params, ret } | Ty::Closure { params, ret } => {
                         let param_pairs: Vec<(String, Ty)> = params
                             .iter()
                             .enumerate()
@@ -3789,15 +3861,21 @@ mod tests {
     }
 
     #[test]
-    fn lambda_cannot_capture_outer_variables() {
-        let errs = tc_err(
-            r#"fn f(): i32 {
+    fn lambda_captures_outer_variables() {
+        // Closures can reference bindings from the enclosing scope;
+        // the typechecker records these in ModuleInfo.lambda_captures
+        // for the codegen to turn into an env struct.
+        let src = r#"fn f(): i32 {
                 let outer = 42
                 let g = fn(x: i32): i32 { return x + outer }
                 return g(1)
-            }"#,
-        );
-        assert!(errs.iter().any(|e| e.message.contains("outer")));
+            }"#;
+        tc_ok(src);
+        let info = tc(src).unwrap();
+        let (_span, caps) = info.lambda_captures.iter().next()
+            .expect("expected one lambda with captures");
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].0, "outer");
     }
 
     #[test]

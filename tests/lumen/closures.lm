@@ -1,0 +1,27 @@
+// Closures capture bindings from their enclosing scope.
+import std/test
+
+fn main(): i32 io {
+    // Single scalar capture.
+    let base: i32 = 10
+    let add_base = fn(x: i32): i32 { return x + base }
+    test.eq(add_base(5), 15, "single i32 capture")
+    test.eq(add_base(32), 42, "closure called twice")
+
+    // Multi-capture.
+    let a: i32 = 3
+    let b: i32 = 7
+    let sum = fn(x: i32): i32 { return x + a + b }
+    test.eq(sum(100), 110, "two scalar captures")
+
+    // String capture — pointer-typed, rc_incr'd on env creation.
+    let greeting: string = "hello"
+    let greet = fn(name: string): string { return greeting + ", " + name }
+    test.eq(greet("world"), "hello, world", "string capture + concat")
+
+    // Closure that doesn't capture anything — remains a raw fn ptr.
+    let id = fn(x: i32): i32 { return x }
+    test.eq(id(7), 7, "non-capturing lambda still works")
+
+    return test.summary()
+}
